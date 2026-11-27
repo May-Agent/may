@@ -396,9 +396,9 @@ jobs:
       run-tests: ${{ steps.build.outputs.run-tests }}
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Dependencies keep Cargo's default debuginfo (`2`) so they match
-      # stow's public prebuilt cache; ./.github/actions/build-tests disables
-      # and strips debuginfo only on workspace packages via
+      # Dependencies keep Cargo's default profile settings so they match stow's
+      # public prebuilt cache; ./.github/actions/build-tests sets debug=0,
+      # strip="debuginfo", and codegen-units=16 only on workspace packages via
       # ${CARGO_HOME}/config.toml.
       CARGO_INCREMENTAL: '0'
     steps:
@@ -444,7 +444,9 @@ jobs:
           total-shards: 4
 
   # Pull requests skip macOS jobs; the merge queue runs them on the tree that
-  # lands on main, using one archive build -> unit + 4 E2E shards.
+  # lands on main, using one archive build -> unit + 2 E2E shards (keeping peak
+  # concurrent macOS runners at 3 to avoid runner-pool queuing delays while both
+  # E2E shards finish under `test-unit`'s wall time).
   build-tests-macos:
     name: build-tests (macos-latest)
     needs: scope
@@ -482,7 +484,7 @@ jobs:
           filter: 'not package(may-agent)'
 
   test-macos-e2e:
-    name: test-e2e (macos-latest, ${{ matrix.shard }}/4)
+    name: test-e2e (macos-latest, ${{ matrix.shard }}/2)
     needs: [scope, build-tests-macos]
     if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-tests-macos.result == 'success' && needs.build-tests-macos.outputs.run-tests == 'true' }}
     runs-on: macos-latest
@@ -490,7 +492,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -499,7 +501,7 @@ jobs:
         with:
           filter: 'package(may-agent)'
           shard: ${{ matrix.shard }}
-          total-shards: 4
+          total-shards: 2
 
   # Starts as soon as `container-image` and `build-tests-ubuntu` finish,
   # running in parallel with `test-ubuntu-unit` and all 4 `test-ubuntu-e2e`

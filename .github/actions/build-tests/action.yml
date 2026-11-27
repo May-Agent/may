@@ -60,18 +60,19 @@ runs:
         shared-key: ci-build
         local-crates-io-max-bytes: '1610612736'
     # Cargo ignores CARGO_PROFILE_*_PACKAGE_* env vars, so configure per-package
-    # debug=0 and strip="debuginfo" for workspace crates in $CARGO_HOME/config.toml.
-    # Leaving dependencies at default debuginfo=2 preserves stow's public cache
-    # hits, while per-package strip="debuginfo" strips linked dependency DWARF
-    # from the final workspace binaries and test executables (keeping symbol
-    # tables intact for backtraces).
-    - name: Disable and strip debuginfo for workspace packages
+    # debug=0, strip="debuginfo", and codegen-units=16 for workspace crates in
+    # $CARGO_HOME/config.toml. Leaving dependencies at default settings preserves
+    # stow's public cache hits, while per-package strip="debuginfo" strips linked
+    # dependency DWARF from the final workspace binaries and test executables
+    # (keeping symbol tables intact for backtraces) and codegen-units=16 trims
+    # per-crate LLVM/link overhead on 3-4 core CI runners.
+    - name: Configure workspace package build settings
       shell: bash
       run: |
         cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
         mkdir -p "${cargo_home}"
         for pkg in may-agent may-agent-core may-client may-command-policy may-config may-container-image may-daemon may-db may-git-forge may-harness may-media may-patch may-protocol may-providers may-repo-search may-tasks may-tool-dist may-tui; do
-          printf '[profile.dev.package.%s]\ndebug = 0\nstrip = "debuginfo"\n[profile.test.package.%s]\ndebug = 0\nstrip = "debuginfo"\n' "$pkg" "$pkg" >> "${cargo_home}/config.toml"
+          printf '[profile.dev.package.%s]\ndebug = 0\nstrip = "debuginfo"\ncodegen-units = 16\n[profile.test.package.%s]\ndebug = 0\nstrip = "debuginfo"\ncodegen-units = 16\n' "$pkg" "$pkg" >> "${cargo_home}/config.toml"
         done
     # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
@@ -107,6 +108,17 @@ runs:
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
+        # Standard 3-vCPU / 7 GiB macOS runners thrash swap when Cargo pipelining
+        # overlaps `may-agent-core` (~3 GiB RSS) and both `may-daemon` lib/test
+        # targets (~3.4 GiB RSS each). Cap build concurrency on <= 8 GiB macOS
+        # VMs while keeping full parallelism on larger macOS and Linux runners.
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+          if [ "${mem_bytes}" -gt 0 ] && [ "${mem_bytes}" -le 8589934592 ]; then
+            export CARGO_BUILD_JOBS=2
+            export CARGO_BUILD_PIPELINING=false
+          fi
+        fi
         cargo nextest archive --locked ${{ inputs.cargo-flags }} \
           --archive-file "${{ runner.temp }}/tests-archive.tar.zst" --timings
     - name: cargo nextest (unit-only)
@@ -136,16 +148,18 @@ runs:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
         path: ${{ runner.temp }}/may-debug.tar.gz
         retention-days: 90
-    # Verify baseline tools (~6s) directly from target/debug before uploading
-    # the archive and fanning out, avoiding an unnecessary local unpack of the
-    # archive on the build runner.
+    # Verify baseline tools (~14-18s) directly from the stripped archive before
+    # uploading and fanning out. Using `--archive-file` avoids invoking Cargo
+    # again (whose target/feature graph differs from `cargo nextest archive` and
+    # triggers multi-minute workspace recompiles) and also validates the archive.
     - name: Verify baseline tools
       if: inputs.e2e == 'true' && steps.decide.outputs.run-tests == 'true'
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
         cargo nextest run \
-          --locked ${{ inputs.cargo-flags }} \
+          --archive-file "${{ runner.temp }}/tests-archive.tar.zst" \
+          --workspace-remap . \
           --run-ignored ignored-only \
           --no-capture \
           -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
