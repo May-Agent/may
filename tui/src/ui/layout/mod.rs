@@ -3216,6 +3216,7 @@ mod tests {
             output_path: None,
             timeout: None,
             pty: false,
+            file_monitor: false,
         }
     }
 

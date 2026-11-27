@@ -23,6 +23,7 @@ pub mod computer_tool;
 mod environment;
 pub mod explore_tool;
 mod hooks;
+mod host_command_alerts;
 #[cfg(test)]
 mod host_load_tests;
 #[cfg(any(test, feature = "testing"))]

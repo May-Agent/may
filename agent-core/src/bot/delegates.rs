@@ -500,6 +500,7 @@ where
                 policies: crate::command_policy::PolicySet {
                     managed_bash: false,
                     refused: crate::command_policy::RefusedReads::default(),
+                    host_command_notices: crate::command_policy::HostCommandNotices::default(),
                     read_epochs: crate::command_policy::FileReadEpochs::default(),
                     checkout_reads: None,
                     write_lease: None,

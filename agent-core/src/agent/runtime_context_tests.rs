@@ -93,7 +93,7 @@ fn a_memory_change_before_any_request_rewrites_the_block_silently() {
 #[test]
 fn instruction_blocks_reconcile_as_rendered() {
     let (_dir, memory_path) = test_memory_file();
-    let identity = super::build_identity();
+    let identity = super::build_identity(false);
     let runtime_context = RuntimeSystemContext::new(memory_path, String::new())
         .with_instruction(tag::IDENTITY, identity.clone());
     let mut context = test_context();
@@ -290,12 +290,12 @@ fn the_pr_landing_rule_is_rendered_only_for_a_session_with_a_clone() {
         name: "may",
         repository: None,
     };
-    let with_clone = build_work(&issues, true);
+    let with_clone = build_work(&issues, true, true, false);
     assert!(
         with_clone.contains("Land code with the `pr` command"),
         "{with_clone}"
     );
-    let direct = build_work(&issues, false);
+    let direct = build_work(&issues, false, true, false);
     assert!(!direct.contains("Land code with"), "{direct}");
     assert!(!direct.contains("source checkout"), "{direct}");
 }
@@ -308,6 +308,8 @@ fn the_work_section_names_the_issue_backend() {
             repository: None,
         },
         false,
+        true,
+        false,
     );
     assert!(work.contains("`issue` command (may backend)"), "{work}");
 
@@ -315,7 +317,7 @@ fn the_work_section_names_the_issue_backend() {
         name: "github",
         repository: Some("May-Agent/may".to_string()),
     };
-    let work = build_work(&github, false);
+    let work = build_work(&github, false, true, false);
     assert!(work.contains("`issue` command (github backend)"), "{work}");
     assert!(!work.contains("May-Agent/may"), "{work}");
 
@@ -451,9 +453,9 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         "{terminal}"
     );
     assert_eq!(
-        terminal.contains("`grep`, `awk` and `find` fail in scripts"),
+        terminal.contains("Prefer `rg`, `python3` or `jq`, and `fd` over `grep`, `awk` and `find`"),
         cfg!(not(windows)),
-        "only the managed bash refuses them: {terminal}"
+        "only the managed bash prefers them: {terminal}"
     );
 }
 
@@ -619,7 +621,7 @@ fn the_capabilities_section_carries_each_core_commands_usage() {
 
 #[test]
 fn a_blocked_step_runs_in_unsafe_mode_without_asking_first() {
-    let prompt = super::build_permissions(&AgentEnvironment::Local, Vec::new(), None);
+    let prompt = super::build_permissions(&AgentEnvironment::Local, false, Vec::new(), None);
     assert!(
         prompt
             .contains("When the sandbox blocks a step of the work, run that step in `unsafe` mode"),
@@ -634,6 +636,36 @@ fn a_blocked_step_runs_in_unsafe_mode_without_asking_first() {
         harness.contains("Get past it as the permissions section says"),
         "{harness}"
     );
+}
+
+#[test]
+fn non_interactive_and_memory_off_omit_unsafe_approval_and_memory_instructions() {
+    let permissions = super::build_permissions(&AgentEnvironment::Local, true, Vec::new(), None);
+    assert!(permissions.contains("non-interactive"), "{permissions}");
+    assert!(
+        permissions.contains("`unsafe` mode is unavailable"),
+        "{permissions}"
+    );
+    assert!(
+        !permissions.contains("run that step in `unsafe` mode"),
+        "{permissions}"
+    );
+
+    let identity = super::build_identity(true);
+    assert!(identity.contains("non-interactive mode"), "{identity}");
+    assert!(
+        !identity.contains("Every question to the user goes through the `ask_user` command"),
+        "{identity}"
+    );
+
+    let issues = crate::issue::IssueBackendInfo {
+        name: "may",
+        repository: None,
+    };
+    let work = build_work(&issues, true, false, true);
+    assert!(!work.contains("MEMORY.md"), "{work}");
+    assert!(!work.contains("~/.may/memories/"), "{work}");
+    assert!(!work.contains("request_workspace"), "{work}");
 }
 
 /// The instruction blocks of a session in prompt order, as the model reads
@@ -659,7 +691,7 @@ fn rendered_instructions(
     )
     .expect("a clone renders a block");
     let runtime_context = RuntimeSystemContext::new(memory_path, String::new())
-        .with_instruction(tag::IDENTITY, super::build_identity())
+        .with_instruction(tag::IDENTITY, super::build_identity(false))
         .with_instruction(tag::HARNESS, super::build_harness())
         .with_instruction(tag::EVIDENCE, super::build_evidence())
         .with_instruction(
@@ -671,7 +703,7 @@ fn rendered_instructions(
             super::build_terminal(&AgentEnvironment::Local, false),
         )
         .with_instruction(tag::EFFICIENCY, build_efficiency(&[], false))
-        .with_instruction(tag::WORK, build_work(&issues, true))
+        .with_instruction(tag::WORK, build_work(&issues, true, true, false))
         .with_instruction(
             tag::SESSION,
             super::build_session(
@@ -905,7 +937,7 @@ fn fusion_mode_templates_cover_lead_and_sidekick_contracts() {
 fn fusion_mode_and_plan_mode_reconcile_orthogonally_without_touching_static_prefix() {
     let (_dir, memory_path) = test_memory_file();
     let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
-        .with_instruction(tag::IDENTITY, super::build_identity());
+        .with_instruction(tag::IDENTITY, super::build_identity(false));
     let mut context = test_context();
     runtime_context.reconcile(&mut context);
 

@@ -37,6 +37,23 @@ pub struct CacheObservation {
     pub chain: PrefixChain,
 }
 
+/// How the route's cache block size is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheBlock {
+    /// Documented by the provider (for example `OpenAI`'s 128-token increment).
+    Published(NonZeroU64),
+    /// Inferred from the greatest common divisor of observed nonzero cache reads
+    /// on a provider that reports no write counts.
+    Observed(NonZeroU64),
+}
+
+/// Minimum trailing-boundary margin reserved when crediting an inferred block
+/// size on a provider that reports no `cache_write_tokens`: the final turn's
+/// framing tokens are not guaranteed to land inside the next request's shared
+/// prefix, so crediting right up to `floor(prompt / gcd) * gcd` produces a
+/// one-block false miss on healthy turns.
+const MIN_OBSERVED_TAIL_MARGIN: u64 = 64;
+
 impl CacheObservation {
     /// The observation of a request whose usage arrived at `at_ms`.
     #[must_use]
@@ -57,11 +74,15 @@ impl CacheObservation {
     /// a block, and the next request is held to at least what this one read.
     /// With no known block size nothing is credited beyond what was read.
     #[must_use]
-    pub fn cached_tokens(&self, block: Option<NonZeroU64>) -> u64 {
+    pub fn cached_tokens(&self, block: Option<CacheBlock>) -> u64 {
         self.cache_write_tokens.map_or_else(
             || {
-                let whole_blocks =
-                    block.map_or(0, |block| self.prompt_tokens / block * block.get());
+                let whole_blocks = match block {
+                    Some(CacheBlock::Published(size) | CacheBlock::Observed(size)) => {
+                        self.prompt_tokens / size * size.get()
+                    }
+                    None => 0,
+                };
                 whole_blocks.max(self.cache_read_tokens)
             },
             |written| self.cache_read_tokens + written,
@@ -197,7 +218,7 @@ pub fn detect_cache_miss(
     current: &CacheObservation,
     since: SincePrevious,
     lifetime: CacheLifetime,
-    block: Option<NonZeroU64>,
+    block: Option<CacheBlock>,
 ) -> Option<CacheMiss> {
     let missed_tokens = previous
         .cached_tokens(block)
@@ -208,6 +229,17 @@ pub fn detect_cache_miss(
     );
     let expired = lifetime.expired_after(gap);
     let diverged = current.chain.first_divergence(&previous.chain);
+    // On an unpublished route that reports no `cache_write_tokens`, a tiny
+    // shortfall within one trailing boundary margin on an unchanged prefix is
+    // normal turn-framing / page-alignment rounding rather than a drop.
+    if previous.cache_write_tokens.is_none()
+        && current.cache_read_tokens > 0
+        && diverged.is_none()
+        && let Some(CacheBlock::Observed(size)) = block
+        && missed_tokens <= size.get().max(MIN_OBSERVED_TAIL_MARGIN)
+    {
+        return None;
+    }
     let cause = match diverged {
         Some(PrefixBlock::Tools) => CacheMissCause::ToolsChanged,
         _ if since.rewrites.compacted => CacheMissCause::Compaction,
@@ -458,8 +490,12 @@ mod tests {
         assert_eq!(miss.cause, CacheMissCause::PrefixChanged);
     }
 
-    fn block(tokens: u64) -> Option<NonZeroU64> {
-        NonZeroU64::new(tokens)
+    fn block(tokens: u64) -> Option<CacheBlock> {
+        NonZeroU64::new(tokens).map(CacheBlock::Published)
+    }
+
+    fn observed(tokens: u64) -> Option<CacheBlock> {
+        NonZeroU64::new(tokens).map(CacheBlock::Observed)
     }
 
     /// A request on a provider that reports no cache writes.
@@ -561,13 +597,60 @@ mod tests {
     #[test]
     fn the_observed_block_is_the_gcd_of_the_nonzero_reads() {
         assert_eq!(observed_block(None, 0), None);
-        assert_eq!(observed_block(None, 11_968), block(11_968));
-        assert_eq!(observed_block(block(11_968), 0), block(11_968));
+        assert_eq!(observed_block(None, 11_968), NonZeroU64::new(11_968));
+        assert_eq!(
+            observed_block(NonZeroU64::new(11_968), 0),
+            NonZeroU64::new(11_968)
+        );
         let mut inferred = None;
         for read in [11_968, 12_224, 12_544, 13_824, 14_080] {
             inferred = observed_block(inferred, read);
         }
-        assert_eq!(inferred, block(64));
+        assert_eq!(inferred, NonZeroU64::new(64));
+    }
+
+    /// On an unpublished route whose reads imply 32-token pages, normal
+    /// trailing-boundary shortfalls (34..60 tokens) record no miss while a
+    /// real drop still records `provider_dropped`.
+    #[test]
+    fn observed_small_block_ignores_trailing_boundary_rounding_but_catches_real_drops() {
+        let healthy = [
+            (8_170, 8_128),
+            (8_923, 8_864),
+            (11_740, 11_680),
+            (13_073, 13_024),
+            (13_525, 13_472),
+            (14_306, 14_272),
+            (15_203, 15_168),
+        ];
+        for (previous_prompt, next_read) in healthy {
+            let previous = unwritten(0, previous_prompt, 0, 2);
+            let current = unwritten(1_000, previous_prompt + 800, next_read, 3);
+            assert_eq!(
+                detect_cache_miss(
+                    &previous,
+                    &current,
+                    SincePrevious::default(),
+                    one_hour(),
+                    observed(32),
+                ),
+                None,
+                "prompt {previous_prompt} -> read {next_read}"
+            );
+        }
+
+        let previous = unwritten(0, 14_140, 0, 2);
+        let current = unwritten(1_000, 14_500, 12_800, 3);
+        let miss = detect_cache_miss(
+            &previous,
+            &current,
+            SincePrevious::default(),
+            one_hour(),
+            observed(32),
+        )
+        .expect("a real drop still records a miss");
+        assert_eq!(miss.cause, CacheMissCause::ProviderDropped);
+        assert!(miss.missed_tokens >= 1_200, "{}", miss.missed_tokens);
     }
 
     /// A request that read all of the previous prompt is no miss, with or

@@ -137,6 +137,7 @@ impl TestTerminal {
             policies: may_command_policy::PolicySet {
                 managed_bash: may_command_policy::runs_managed_bash(false),
                 refused: may_command_policy::RefusedReads::default(),
+                host_command_notices: may_command_policy::HostCommandNotices::default(),
                 read_epochs: may_command_policy::FileReadEpochs::default(),
                 checkout_reads: None,
                 write_lease: None,

@@ -380,6 +380,7 @@ impl SessionParts {
             profile_persona: None,
             profile_memories: self.profile_memories.clone(),
             memory_off: self.memory_off,
+            non_interactive: false,
             plan_state: SessionPlanState::default(),
             execution_mode: crate::session::ExecutionMode::Standard,
             location: None,

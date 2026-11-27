@@ -364,5 +364,10 @@ mod tests {
         );
         let unknown = MayShellWording.monitor_refusal(&MonitorRefusal::UnknownJob { pid: 777 });
         assert!(unknown.contains("777"), "{unknown}");
+        let missing_stop = MayShellWording.monitor_refusal(&MonitorRefusal::MissingStopCondition);
+        assert!(
+            missing_stop.contains("stop_on") && missing_stop.contains("\"pid\""),
+            "{missing_stop}"
+        );
     }
 }

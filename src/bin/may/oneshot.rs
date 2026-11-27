@@ -24,20 +24,52 @@ mod render;
 
 use render::OneShotOutput;
 
+/// Retries an idempotent daemon GET on transient unix-socket transport errors
+/// (such as `Connection reset by peer` under burst load) with short backoff.
+async fn retry_daemon_get<T, F, Fut>(mut request: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, may_agent::client::DaemonClientError>>,
+{
+    const BACKOFFS_MS: [u64; 3] = [100, 250, 500];
+    let mut attempt = 0usize;
+    loop {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < BACKOFFS_MS.len()
+                    && matches!(
+                        error,
+                        may_agent::client::DaemonClientError::Http(_)
+                            | may_agent::client::DaemonClientError::Unreachable { .. }
+                    ) =>
+            {
+                let delay_ms = BACKOFFS_MS[attempt];
+                attempt += 1;
+                tracing::warn!(
+                    attempt,
+                    delay_ms,
+                    %error,
+                    "transient daemon poll failure; retrying"
+                );
+                async_io::Timer::after(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// The session's runtime snapshot as the daemon reports it; oneshot polls it
 /// for the prompts a remote run waits on.
 async fn session_runtime(
     runtime_deps: &RuntimeDeps,
     session_id: &may_agent::session::SessionId,
 ) -> anyhow::Result<may_agent::client::SessionRuntimeSnapshot> {
-    Ok(runtime_deps
+    let daemon = runtime_deps
         .daemon()
-        .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
-        .get::<may_agent::client::SessionRuntimeSnapshot>(&format!(
-            "/api/sessions/{}/runtime",
-            session_id.as_str()
-        ))
-        .await?)
+        .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?;
+    let path = format!("/api/sessions/{}/runtime", session_id.as_str());
+    retry_daemon_get(|| daemon.get::<may_agent::client::SessionRuntimeSnapshot>(&path)).await
 }
 
 /// Prompt for the questions the daemon's run waits on and commit the answers.
@@ -96,13 +128,15 @@ async fn next_resumed_turn(
         .background()
         .ok_or_else(|| anyhow::anyhow!("the one-shot worker has no daemon background"))?;
     loop {
-        let (will_resume, runtime) = futures_lite::future::zip(
-            background.will_resume(),
+        let (bg_snapshot, runtime) = futures_lite::future::zip(
+            retry_daemon_get(|| background.full_snapshot()),
             session_runtime(runtime_deps, session_id),
         )
         .await;
-        let resumes =
-            will_resume? || runtime?.state != may_agent::session::SessionRuntimeState::Idle;
+        let bg_snapshot = bg_snapshot?;
+        let runtime = runtime?;
+        let resumes = bg_snapshot.will_resume_non_monitor()
+            || runtime.state != may_agent::session::SessionRuntimeState::Idle;
         // A turn already announced wins over the state read above, which
         // may postdate its end.
         let announced = if resumes {
@@ -132,7 +166,21 @@ async fn next_resumed_turn(
             }
             Some(None) => anyhow::bail!("the session's event stream closed"),
             None if resumes => {}
-            None => return Ok(None),
+            None => {
+                if !bg_snapshot.running_file_monitor_pids().is_empty()
+                    && let Some(daemon) = runtime_deps.daemon()
+                {
+                    let stop_path = format!("/api/sessions/{}/turns/current", session_id.as_str());
+                    if let Err(error) = daemon.delete::<serde_json::Value>(&stop_path).await {
+                        tracing::warn!(
+                            session_id = %session_id.as_str(),
+                            %error,
+                            "failed to stop lingering file monitors after oneshot completion"
+                        );
+                    }
+                }
+                return Ok(None);
+            }
         }
     }
 }

@@ -8009,6 +8009,7 @@ mod tests {
             place: aither_sandbox::JobPlace::Host,
             timeout: None,
             pty: false,
+            file_monitor: false,
         }
     }
 

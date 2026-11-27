@@ -19,8 +19,8 @@ use super::{
 };
 use may_protocol::cache_lifetime::CacheLifetime;
 use may_protocol::cache_miss::{
-    CacheMiss, CacheObservation, SincePrevious, block_index, block_kind, detect_cache_miss,
-    observed_block,
+    CacheBlock, CacheMiss, CacheObservation, SincePrevious, block_index, block_kind,
+    detect_cache_miss, observed_block,
 };
 
 /// One provider request's prompt prefix and the usage it reported.
@@ -86,7 +86,10 @@ impl ChatDb {
                     agent_rebuilt: request.prefix.first_request,
                     model_switched: latest.is_some_and(|latest| !is_this_route(latest)),
                 };
-                let block = request.published_block.or(observed);
+                let block = request
+                    .published_block
+                    .map(CacheBlock::Published)
+                    .or_else(|| observed.map(CacheBlock::Observed));
                 detect_cache_miss(&previous, &current, since, request.lifetime, block)
             }
             None => None,
