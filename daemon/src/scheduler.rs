@@ -54,7 +54,7 @@ pub struct TaskRuntime {
     notifier: Option<Arc<NotificationService>>,
     ui_event_bus: Option<UiEventBus>,
     may_dir: PathBuf,
-    container_manager: Option<Arc<ContainerManager>>,
+    container_manager: Arc<arc_swap::ArcSwapOption<ContainerManager>>,
     /// Baseline tool distribution prepared for every task terminal.
     tool_distribution: Arc<crate::tools::ToolDistribution>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
@@ -438,7 +438,7 @@ impl TaskRuntime {
             ui_event_bus: None,
             secrets: crate::secrets::SecretStore::new(&may_dir),
             may_dir,
-            container_manager: None,
+            container_manager: Arc::new(arc_swap::ArcSwapOption::empty()),
             tool_distribution,
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
@@ -501,8 +501,19 @@ impl TaskRuntime {
 
     /// Attach container manager for container-profile task execution.
     #[must_use]
-    pub fn with_container_manager(mut self, container_manager: Arc<ContainerManager>) -> Self {
-        self.container_manager = Some(container_manager);
+    pub fn with_container_manager(self, container_manager: Arc<ContainerManager>) -> Self {
+        self.container_manager.store(Some(container_manager));
+        self
+    }
+
+    /// Share the daemon's live container manager slot so background or lazy
+    /// runtime detection becomes visible to scheduled container tasks.
+    #[must_use]
+    pub fn with_shared_container_manager(
+        mut self,
+        container_manager: Arc<arc_swap::ArcSwapOption<ContainerManager>>,
+    ) -> Self {
+        self.container_manager = container_manager;
         self
     }
 
@@ -1474,9 +1485,22 @@ impl TaskRuntime {
         ),
         String,
     > {
-        let container_manager = self.container_manager.clone().ok_or_else(|| {
-            "container profile task cannot run: container runtime unavailable".to_string()
-        })?;
+        let container_manager = if let Some(manager) = self.container_manager.load_full() {
+            manager
+        } else {
+            let runtime = crate::container::ContainerRuntime::detect()
+                .await
+                .map_err(|_| {
+                    "container profile task cannot run: container runtime unavailable".to_string()
+                })?;
+            let manager = Arc::new(ContainerManager::new(
+                Arc::new(runtime),
+                self.may_dir.clone(),
+            ));
+            let _auto_stop = manager.spawn_auto_stop_task();
+            self.container_manager.store(Some(manager.clone()));
+            manager
+        };
         let container_preferences = self
             .db
             .load_container_profile_preferences(profile)

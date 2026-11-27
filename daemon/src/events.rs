@@ -403,12 +403,14 @@ async fn coverage_worktree(
     session_id: Option<&str>,
     cwd: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    if let Some(session_id) = session_id {
+    let dir = if let Some(session_id) = session_id {
         let session = state.db().get_session(session_id).await.ok()??;
         let directory = crate::session::SessionDirectory::of(&session, &state.may_dir);
-        return crate::repo_search::worktree_root(directory.checkout()?);
-    }
-    crate::repo_search::worktree_root(std::path::Path::new(cwd?))
+        directory.checkout()?.to_path_buf()
+    } else {
+        std::path::PathBuf::from(cwd?)
+    };
+    blocking::unblock(move || crate::repo_search::worktree_root(&dir)).await
 }
 
 /// Coverage of `worktree` when repo-search answers its status.

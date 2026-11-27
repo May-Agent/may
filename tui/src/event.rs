@@ -36,6 +36,31 @@ pub struct PushedConfig {
     pub timezone: String,
 }
 
+/// Data resolved off the UI thread to open the `/permission` dialog.
+#[derive(Debug)]
+pub enum PermissionGateData {
+    /// Inside a git worktree: open the repo-trust sheet.
+    RepoTrust {
+        /// Canonical git worktree root.
+        worktree: std::path::PathBuf,
+        /// Detected repository kind (forge or local).
+        kind: may_config::repo_kind::RepoKind,
+        /// Currently persisted trust level, if any.
+        current: Option<may_client::trust::TrustLevel>,
+        /// `workspace.toml` path to write the updated decision to.
+        config_path: std::path::PathBuf,
+    },
+    /// Outside a git worktree: open the launch-directory grant dialog.
+    LaunchGrant {
+        /// Launch directory path.
+        path: std::path::PathBuf,
+        /// `workspace.toml` path to write the updated decision to.
+        config_path: std::path::PathBuf,
+        /// Whether `path` currently has write access.
+        has_write_access: bool,
+    },
+}
+
 /// Application events.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -328,6 +353,24 @@ pub enum AppEvent {
         /// Store outcome.
         result: Result<(), String>,
     },
+    /// Reloaded keychain + config secrets snapshot from a background worker.
+    SecretsLoaded(Result<may_config::secrets::Secrets, may_config::secrets::SecretError>),
+    /// Resolved workspace config + worktree trust for initializing the
+    /// session's file-diff tracker off the UI thread.
+    FileDiffsPrepared {
+        /// Session the prepared file-diff config belongs to.
+        session_id: String,
+        /// Filebase storage directory under the session root.
+        filebase_dir: std::path::PathBuf,
+        /// Roots to track when direct-checkout mode is active.
+        roots: Vec<may_protocol::file_tracker::TrackedRootSpec>,
+        /// Whether the session clones work instead of editing the checkout.
+        clones_work: bool,
+    },
+    /// Resolved worktree/workspace state for opening the `/permission` sheet.
+    PermissionGateLoaded(Result<PermissionGateData, String>),
+    /// `/bug` snapshot dump finished off the UI thread.
+    BugSnapshotWritten(Result<std::path::PathBuf, String>),
 
     /// Opening the session sandbox directory failed.
     SandboxOpenFailed(String),
@@ -401,6 +444,10 @@ impl AppEvent {
             Self::ProgressFailed(_) => "progress_failed",
             Self::BashFinished(_) => "bash_finished",
             Self::SecretStored { .. } => "secret_stored",
+            Self::SecretsLoaded(_) => "secrets_loaded",
+            Self::FileDiffsPrepared { .. } => "file_diffs_prepared",
+            Self::PermissionGateLoaded(_) => "permission_gate_loaded",
+            Self::BugSnapshotWritten(_) => "bug_snapshot_written",
             Self::SandboxOpenFailed(_) => "sandbox_open_failed",
         }
     }

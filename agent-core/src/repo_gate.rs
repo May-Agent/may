@@ -136,10 +136,14 @@ impl<P: ForgeProbe + Sync> RepoGate<'_, P> {
         let demoted = {
             let (dir, config_path) = (cwd.clone(), self.config_path.to_path_buf());
             blocking::unblock(move || {
-                if !crate::trust::has_non_forge_project(&config_path)? {
+                let config = crate::workspace::WorkspaceConfig::load(&config_path)?;
+                if !crate::trust::has_non_forge_project_in(&config) {
                     return Ok(None);
                 }
-                crate::trust::persisted_level(Path::new(&dir), &config_path)
+                let Ok(repo_key) = crate::issue::repository_identity(Path::new(&dir)) else {
+                    return Ok(None);
+                };
+                Ok::<_, WorkspaceConfigError>(crate::trust::persisted_for(&config, &repo_key))
             })
             .await?
         }

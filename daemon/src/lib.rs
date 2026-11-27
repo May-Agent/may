@@ -642,9 +642,16 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         .tcp_listeners
         .reconcile_config(&config.daemon, &state)
         .await;
-    crate::sync_remote_access(&state).await?;
     tokio::spawn(serve::serve_unix(unix_listener, socket_router));
     tokio::spawn(serve::serve_tcp(remote_listener, remote_router));
+    {
+        let remote_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::sync_remote_access(&remote_state).await {
+                tracing::warn!(%error, "failed to sync initial remote access state");
+            }
+        });
+    }
     let bound = state.tcp_listeners.bound_addrs().await;
     tracing::info!(?bound, socket = %paths.socket().display(), "May daemon listening");
     eprintln!("May daemon listening on {}", paths.socket().display());

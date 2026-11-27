@@ -387,10 +387,14 @@ pub async fn initialize_session_persistence(
     let store = initialize_session_dirs(may_dir).await?;
     let db = ChatDb::open(&home_paths_db(may_dir)).await?;
     let default_profile_id = db.ensure_default_profiles().await?;
-    for profile in db.list_profiles().await? {
-        store.sync_profile_scoped_resources(&profile.id).await?;
-    }
-    reconcile_container_profile_sessions(&store, &db).await?;
+    let profiles = db.list_profiles().await?;
+    futures_util::future::try_join_all(
+        profiles
+            .iter()
+            .map(|profile| store.sync_profile_scoped_resources(&profile.id)),
+    )
+    .await?;
+    reconcile_container_profile_sessions_for(&store, &db, &profiles, true).await?;
     Ok((store, db, default_profile_id))
 }
 
@@ -398,7 +402,10 @@ fn home_paths_db(may_dir: &Path) -> std::path::PathBuf {
     MayHomePaths::new(may_dir.to_path_buf()).db_file()
 }
 
-/// Reconcile container mount-point layout for sessions whose profiles run in containers.
+/// Reconcile container mount-point layout for active sessions whose profiles run in containers.
+///
+/// Archived sessions are skipped at startup because container launch reconciles
+/// mount points on demand before starting any session.
 ///
 /// # Errors
 /// Returns [`SessionError`] on storage failure or when a session's layout cannot be reconciled.
@@ -407,27 +414,41 @@ pub async fn reconcile_container_profile_sessions(
     db: &ChatDb,
 ) -> Result<(), SessionError> {
     let profiles = db.list_profiles().await?;
-    let container_profiles = profiles
+    reconcile_container_profile_sessions_for(store, db, &profiles, false).await
+}
+
+async fn reconcile_container_profile_sessions_for(
+    store: &SessionStore,
+    db: &ChatDb,
+    profiles: &[may_db::entity::profiles::Model],
+    profiles_already_seeded: bool,
+) -> Result<(), SessionError> {
+    let container_profiles: Vec<_> = profiles
         .iter()
         .filter(|profile| profile.environment.as_str() == "container")
-        .count();
+        .collect();
     tracing::info!(
-        container_profiles,
+        container_profiles = container_profiles.len(),
         "Reconciling container session mount points"
     );
-    for profile in profiles
-        .iter()
-        .filter(|profile| profile.environment.as_str() == "container")
-    {
-        let sessions = db.list_sessions_for_profile(&profile.id).await?;
+    for profile in container_profiles {
+        if !profiles_already_seeded {
+            store.sync_profile_scoped_resources(&profile.id).await?;
+        }
+        let active_sessions: Vec<_> = db
+            .list_sessions_for_profile(&profile.id)
+            .await?
+            .into_iter()
+            .filter(|session| !session.archived)
+            .collect();
         tracing::info!(
             profile_id = %profile.id,
-            session_count = sessions.len(),
-            "Reconciling sessions for container profile"
+            session_count = active_sessions.len(),
+            "Reconciling active sessions for container profile"
         );
-        for session in sessions {
+        for session in active_sessions {
             store
-                .reconcile_container_mount_points(&session.id, Some(profile.id.as_str()))
+                .reconcile_container_mount_points_preseeded(&session.id, Some(profile.id.as_str()))
                 .await?;
         }
     }

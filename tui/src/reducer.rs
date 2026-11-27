@@ -713,15 +713,19 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         AppEvent::SecretStored { key, result } => {
             match result {
                 Ok(()) => {
-                    // Refresh the in-memory snapshot so new bash runs mask
-                    // and inject the secret just stored.
-                    app.secrets = may_config::secrets::Secrets::load(
-                        &may_config::secrets::SecretStore::new(app.session_manager.may_dir()),
-                        &app.config,
-                    );
-                    if let Err(error) = &app.secrets {
-                        app.chat.push_error(&error.to_string());
-                    }
+                    // Refresh the in-memory snapshot off the UI loop so new
+                    // bash runs mask and inject the secret just stored.
+                    let may_dir = app.session_manager.may_dir().to_path_buf();
+                    let config = app.config.clone();
+                    let tx = app.event_tx.clone();
+                    blocking::unblock(move || {
+                        let loaded = may_config::secrets::Secrets::load(
+                            &may_config::secrets::SecretStore::new(&may_dir),
+                            &config,
+                        );
+                        let _ = tx.try_send(AppEvent::SecretsLoaded(loaded));
+                    })
+                    .detach();
                     app.chat.push_notice(&format!(
                         "Secret {key} stored in the OS keychain — injected into shell environments"
                     ));
@@ -729,6 +733,37 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 Err(error) => app
                     .chat
                     .push_error(&format!("Failed to store secret: {error}")),
+            }
+            Ok(None)
+        }
+        AppEvent::SecretsLoaded(result) => {
+            app.secrets = result;
+            if let Err(error) = &app.secrets {
+                app.chat.push_error(&error.to_string());
+            }
+            Ok(None)
+        }
+        AppEvent::FileDiffsPrepared {
+            session_id,
+            filebase_dir,
+            roots,
+            clones_work,
+        } => {
+            app.apply_file_diffs_prepared(&session_id, filebase_dir, roots, clones_work);
+            Ok(None)
+        }
+        AppEvent::PermissionGateLoaded(result) => {
+            app.apply_permission_gate(result);
+            Ok(None)
+        }
+        AppEvent::BugSnapshotWritten(result) => {
+            match result {
+                Ok(path) => app
+                    .chat
+                    .push_notice(&format!("Bug snapshot saved to {}", path.display())),
+                Err(error) => app
+                    .chat
+                    .push_error(&format!("Failed to save bug snapshot: {error}")),
             }
             Ok(None)
         }

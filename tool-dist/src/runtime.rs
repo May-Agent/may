@@ -902,49 +902,108 @@ impl ToolBundle {
     clippy::disallowed_methods,
     reason = "synchronous cache verification runs inside blocking::unblock"
 )]
+fn verify_one_binary(
+    target: &ToolTarget,
+    bin_dir: &Path,
+    binary: &PreparedBinarySpec,
+) -> Result<(), ToolRuntimeError> {
+    let path = bin_dir.join(binary.tool.executable_name(target));
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|error| cache_entry_error(&path, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(ToolRuntimeError::InvalidCache(path));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| cache_entry_error(&path, error))?;
+    if digest(&bytes) != binary.sha256 {
+        return Err(ToolRuntimeError::Integrity {
+            tool: binary.tool.into(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o222 != 0 || mode & 0o111 == 0 {
+            return Err(ToolRuntimeError::InvalidCache(path));
+        }
+    }
+    #[cfg(not(unix))]
+    if !metadata.permissions().readonly() {
+        return Err(ToolRuntimeError::InvalidCache(path));
+    }
+    for alias in binary.tool.aliases() {
+        let alias = bin_dir.join(alias);
+        let link_target =
+            std::fs::read_link(&alias).map_err(|error| alias_entry_error(&alias, error))?;
+        if link_target != Path::new(binary.tool.command()) {
+            return Err(ToolRuntimeError::InvalidCache(alias));
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous cache verification runs inside blocking::unblock"
+)]
 pub fn verify_prepared_specs(
     target: &ToolTarget,
     binaries: &[PreparedBinarySpec],
     python: Option<&PythonRuntime>,
     destination: &Path,
 ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let bin_dir = destination.join("bin");
-    for binary in binaries {
-        let path = bin_dir.join(binary.tool.executable_name(target));
-        let metadata =
-            std::fs::symlink_metadata(&path).map_err(|error| cache_entry_error(&path, error))?;
-        if !metadata.file_type().is_file() {
-            return Err(ToolRuntimeError::InvalidCache(path));
+    let total_tasks = binaries.len() + usize::from(python.is_some());
+    let worker_count = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(total_tasks.max(1));
+    if worker_count <= 1 {
+        for binary in binaries {
+            verify_one_binary(target, &bin_dir, binary)?;
         }
-        let bytes = std::fs::read(&path).map_err(|error| cache_entry_error(&path, error))?;
-        if digest(&bytes) != binary.sha256 {
-            return Err(ToolRuntimeError::Integrity {
-                tool: binary.tool.into(),
-            });
+        if let Some(python) = python {
+            python.verify(target, &bin_dir)?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = metadata.permissions().mode();
-            if mode & 0o222 != 0 || mode & 0o111 == 0 {
-                return Err(ToolRuntimeError::InvalidCache(path));
+    } else {
+        let next = AtomicUsize::new(0);
+        let results: Vec<Mutex<Option<Result<(), ToolRuntimeError>>>> =
+            (0..total_tasks).map(|_| Mutex::new(None)).collect();
+        let bin_dir_ref = bin_dir.as_path();
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let next = &next;
+                let results = &results;
+                scope.spawn(move || {
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        if idx >= total_tasks {
+                            break;
+                        }
+                        let outcome = if idx < binaries.len() {
+                            verify_one_binary(target, bin_dir_ref, &binaries[idx])
+                        } else if let Some(python) = python {
+                            python.verify(target, bin_dir_ref)
+                        } else {
+                            Ok(())
+                        };
+                        *results[idx]
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+                    }
+                });
+            }
+        });
+        for slot in results {
+            if let Some(outcome) = slot
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                outcome?;
             }
         }
-        #[cfg(not(unix))]
-        if !metadata.permissions().readonly() {
-            return Err(ToolRuntimeError::InvalidCache(path));
-        }
-        for alias in binary.tool.aliases() {
-            let alias = bin_dir.join(alias);
-            let link_target =
-                std::fs::read_link(&alias).map_err(|error| alias_entry_error(&alias, error))?;
-            if link_target != Path::new(binary.tool.command()) {
-                return Err(ToolRuntimeError::InvalidCache(alias));
-            }
-        }
-    }
-    if let Some(python) = python {
-        python.verify(target, &bin_dir)?;
     }
     let catalog = ToolCatalog {
         tools: binaries

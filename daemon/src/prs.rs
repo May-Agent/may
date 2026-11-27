@@ -47,8 +47,10 @@ pub async fn build_api_prs(
 ) -> Result<Vec<ApiPr>, ChatDbError> {
     let workspace_path =
         crate::session::MayHomePaths::new(state.may_dir.clone()).workspace_config();
-    let workspace_config =
-        crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default();
+    let workspace_config = blocking::unblock(move || {
+        crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default()
+    })
+    .await;
     let mut prs = Vec::with_capacity(rows.len());
     for row in rows {
         let (checks, checks_error) = match state.pr_checks.get(row.id) {
@@ -165,7 +167,7 @@ pub async fn merge_pr(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiPr>> {
     let pr_id = parse_pr_id(&params)?;
-    let context = host_pr_context(&state);
+    let context = host_pr_context(&state).await;
     crate::pr::user_merge_pr(&context, pr_id)
         .await
         .map_err(|e| map_pr_error(&e))?;
@@ -178,7 +180,7 @@ pub async fn close_pr(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiPr>> {
     let pr_id = parse_pr_id(&params)?;
-    let context = host_pr_context(&state);
+    let context = host_pr_context(&state).await;
     crate::pr::user_close_pr(&context, pr_id)
         .await
         .map_err(|e| map_pr_error(&e))?;
@@ -239,17 +241,24 @@ async fn session_repo_key(
         return Ok(Some(binding.clone_key()));
     }
     let directory = crate::session::SessionDirectory::of(&session, &state.may_dir);
-    if let Some(checkout) = directory.checkout() {
+    if let Some(checkout) = directory.checkout().map(std::path::Path::to_path_buf) {
         let workspace_path =
             crate::session::MayHomePaths::new(state.may_dir.clone()).workspace_config();
-        let workspace_config =
-            crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default();
-        if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
-            checkout,
-            &workspace_config,
-            &crate::config::MayConfig::default(),
-        ) {
-            return Ok(Some(source.key()));
+        let source_key = blocking::unblock(move || {
+            let workspace_config =
+                crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default();
+            crate::repo_clone::CloneSource::of(
+                &checkout,
+                &workspace_config,
+                &crate::config::MayConfig::default(),
+            )
+            .ok()
+            .flatten()
+            .map(|source| source.key())
+        })
+        .await;
+        if let Some(key) = source_key {
+            return Ok(Some(key));
         }
     }
     let clones = state.db().list_repo_clones(session_id).await?;
@@ -303,11 +312,13 @@ fn parse_pr_id(params: &Params) -> SkyResult<i64> {
         .map_err(|_| bad_request_error(format!("invalid PR id {raw:?}")))
 }
 
-fn host_pr_context(state: &DaemonState) -> crate::pr::PrContext {
+async fn host_pr_context(state: &DaemonState) -> crate::pr::PrContext {
     let workspace_path =
         crate::session::MayHomePaths::new(state.may_dir.clone()).workspace_config();
-    let workspace_config =
-        crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default();
+    let workspace_config = blocking::unblock(move || {
+        crate::workspace::WorkspaceConfig::load(&workspace_path).unwrap_or_default()
+    })
+    .await;
     let host_git = crate::host_git::HostGit::inherit();
     crate::pr::PrContext {
         db: Some(state.db.clone()),

@@ -6,6 +6,7 @@ use may_protocol::profile::{
     ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences,
 };
 use may_protocol::profile::{HomeEnvironment, ProfileEnvironment, ProfileInfo};
+use may_protocol::session_plan::SessionPlanState;
 use may_protocol::session_runtime::SessionRuntimeState;
 
 use super::common::{
@@ -900,8 +901,8 @@ impl ChatDb {
         &self,
         cutoff: &str,
     ) -> Result<Vec<sessions::Model>, ChatDbError> {
-        // A runtime that changed since the cutoff is not idle long enough; an
-        // open `ask_user` question is not a reason to keep the session.
+        // A runtime that changed since the cutoff or holds a draft plan is
+        // excluded; an open `ask_user` question is not a reason to keep the session.
         let mut active_session_ids = query!(
             self.db,
             "SELECT session_id FROM session_runtimes WHERE state NOT IN (?, ?) OR updated_at >= ?",
@@ -914,6 +915,17 @@ impl ChatDb {
         .into_iter()
         .map(|row| row.session_id)
         .collect::<std::collections::BTreeSet<_>>();
+        active_session_ids.extend(
+            query!(
+                self.db,
+                "SELECT session_id FROM session_plans WHERE plan_state = ?",
+                SessionPlanState::Draft.as_str()
+            )
+            .fetch_all::<SessionIdRow>()
+            .await?
+            .into_iter()
+            .map(|row| row.session_id),
+        );
         active_session_ids.extend(
             query!(
                 self.db,

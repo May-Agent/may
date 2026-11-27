@@ -416,6 +416,9 @@ pub struct App {
     pub hosted_tool_calls: std::collections::HashMap<String, String>,
     /// Last time file-diff previews were requested for running calls.
     pub diff_preview_at: Option<std::time::Instant>,
+    /// Session id whose file-diff configuration is currently being resolved
+    /// off the UI thread, so repeated calls do not spawn duplicate work.
+    file_diffs_loading_session: Option<String>,
     /// Loaded secret values for bash-mode masking and env injection, or why
     /// they could not be read: bash mode then refuses to run.
     pub secrets: Result<may_config::secrets::Secrets, may_config::secrets::SecretError>,
@@ -679,12 +682,25 @@ impl App {
             ))
         };
 
+        let secrets = {
+            let may_dir = session_manager.may_dir().to_path_buf();
+            let config_for_secrets = config.clone();
+            unblock(move || {
+                may_config::secrets::Secrets::load(
+                    &may_config::secrets::SecretStore::new(&may_dir),
+                    &config_for_secrets,
+                )
+            })
+            .await
+        };
+
         Ok(Self::with_parts(
             config,
             session_manager,
             event_tx,
             image_support,
             status,
+            secrets,
         ))
     }
 
@@ -697,6 +713,7 @@ impl App {
         event_tx: EventSender,
         image_support: Option<super::ui::image::TerminalImageSupport>,
         status: Option<StatusNotice>,
+        secrets: Result<may_config::secrets::Secrets, may_config::secrets::SecretError>,
     ) -> Self {
         let needs_setup = !config.is_configured();
         let tunnel_base = tunnel_base(
@@ -724,10 +741,6 @@ impl App {
         // Get current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let secrets = may_config::secrets::Secrets::load(
-            &may_config::secrets::SecretStore::new(session_manager.may_dir()),
-            &config,
-        );
         let current_model = config.last_model.as_ref().map(ToString::to_string);
 
         Self {
@@ -867,6 +880,7 @@ impl App {
             pending_tool_calls: std::collections::HashMap::new(),
             hosted_tool_calls: std::collections::HashMap::new(),
             diff_preview_at: None,
+            file_diffs_loading_session: None,
             secrets,
             open_question_count: 0,
             session_runtime: may_client::client::SessionRuntimeSnapshot::default(),
@@ -1179,6 +1193,7 @@ impl App {
             .filter(|session| session.persisted)
         else {
             self.file_diffs = None;
+            self.file_diffs_loading_session = None;
             self.file_status.clear();
             return;
         };
@@ -1187,6 +1202,7 @@ impl App {
             .file_diffs
             .as_ref()
             .is_some_and(|handle| handle.session_id() == session_id)
+            || self.file_diffs_loading_session.as_deref() == Some(session_id.as_str())
         {
             return;
         }
@@ -1204,62 +1220,95 @@ impl App {
             });
         if is_container {
             self.file_diffs = None;
+            self.file_diffs_loading_session = None;
             self.file_status.clear();
             return;
         }
 
-        let session_paths =
-            may_protocol::session_layout::SessionPaths::new(session.sandbox_dir.clone());
-        let config =
-            may_client::workspace::WorkspaceConfig::load(&session_paths.workspace_config()).ok();
-        // Inside a worktree the effective trust decides: only an explicit
-        // `local` decision writes the checkout directly.
-        let clones_work = may_client::repo_search::worktree_root(&self.cwd)
-            .and_then(|worktree| may_client::issue::repository_identity(&worktree).ok())
-            .is_some_and(|key| {
-                config.as_ref().is_none_or(|config| {
-                    may_client::trust::effective_for(config, &key).clones_work()
-                })
-            });
-        self.sidebar_file_changes = !clones_work;
-        // With clones, the daemon's registry names the roots; they join
-        // tracking when its answer arrives.
-        let mut roots = Vec::new();
-        if !clones_work {
-            if let Some(config) = &config {
-                if !config.has_write_access(&self.cwd) {
-                    roots.push(may_protocol::file_tracker::TrackedRootSpec::checkout(
-                        self.cwd.clone(),
-                    ));
+        self.file_diffs_loading_session = Some(session_id.clone());
+        let sandbox_dir = session.sandbox_dir.clone();
+        let cwd = self.cwd.clone();
+        let tx = self.event_tx.clone();
+        unblock(move || {
+            let session_paths = may_protocol::session_layout::SessionPaths::new(sandbox_dir);
+            let config =
+                may_client::workspace::WorkspaceConfig::load(&session_paths.workspace_config())
+                    .ok();
+            // Inside a worktree the effective trust decides: only an explicit
+            // `local` decision writes the checkout directly.
+            let clones_work = may_client::repo_search::worktree_root(&cwd)
+                .and_then(|worktree| may_client::issue::repository_identity(&worktree).ok())
+                .is_some_and(|key| {
+                    config.as_ref().is_none_or(|config| {
+                        may_client::trust::effective_for(config, &key).clones_work()
+                    })
+                });
+            // With clones, the daemon's registry names the roots; they join
+            // tracking when its answer arrives.
+            let mut roots = Vec::new();
+            if !clones_work {
+                if let Some(config) = &config {
+                    if !config.has_write_access(&cwd) {
+                        roots.push(may_protocol::file_tracker::TrackedRootSpec::checkout(
+                            cwd.clone(),
+                        ));
+                    }
+                    roots.extend(
+                        config
+                            .workdirs
+                            .iter()
+                            .filter(|dir| {
+                                dir.permission == may_client::workspace::Permission::ReadWrite
+                            })
+                            .map(|dir| {
+                                may_protocol::file_tracker::TrackedRootSpec::checkout(
+                                    dir.path.clone(),
+                                )
+                            }),
+                    );
+                } else {
+                    roots.push(may_protocol::file_tracker::TrackedRootSpec::checkout(cwd));
                 }
-                roots.extend(
-                    config
-                        .workdirs
-                        .iter()
-                        .filter(|dir| {
-                            dir.permission == may_client::workspace::Permission::ReadWrite
-                        })
-                        .map(|dir| {
-                            may_protocol::file_tracker::TrackedRootSpec::checkout(dir.path.clone())
-                        }),
-                );
-            } else {
-                roots.push(may_protocol::file_tracker::TrackedRootSpec::checkout(
-                    self.cwd.clone(),
-                ));
             }
+            let filebase_dir = session_paths.root().join("filebase");
+            let _ = tx.try_send(AppEvent::FileDiffsPrepared {
+                session_id,
+                filebase_dir,
+                roots,
+                clones_work,
+            });
+        })
+        .detach();
+    }
+
+    /// Install the file-diff worker once its workspace config and worktree
+    /// trust finish resolving off the UI thread.
+    pub(super) fn apply_file_diffs_prepared(
+        &mut self,
+        session_id: &str,
+        filebase_dir: PathBuf,
+        roots: Vec<may_protocol::file_tracker::TrackedRootSpec>,
+        clones_work: bool,
+    ) {
+        if self.file_diffs_loading_session.as_deref() == Some(session_id) {
+            self.file_diffs_loading_session = None;
         }
+        let still_current = self
+            .session_manager
+            .current()
+            .filter(|session| session.persisted)
+            .is_some_and(|session| session.id.as_str() == session_id);
+        if !still_current {
+            return;
+        }
+        self.sidebar_file_changes = !clones_work;
         self.file_status.clear();
-        self.file_diffs = FileDiffHandle::start(
-            session_id.clone(),
-            session_paths.root().join("filebase"),
-            roots,
-        );
+        self.file_diffs = FileDiffHandle::start(session_id.to_string(), filebase_dir, roots);
         if let Some(handle) = &self.file_diffs {
             handle.request_status();
         }
         if clones_work {
-            self.request_clone_roots(&session_id);
+            self.request_clone_roots(session_id);
         }
     }
 
@@ -2747,7 +2796,7 @@ impl App {
     /// repo-trust sheet inside a worktree, the write-grant outside one.
     /// The repo-trust sheet opens on the persisted level, so it shows what
     /// is in force; the answer overwrites it.
-    fn open_permission_gate(&mut self) {
+    fn open_permission_gate(&self) {
         let home = may_protocol::session_layout::MayHomePaths::new(
             self.session_manager.may_dir().to_path_buf(),
         );
@@ -2755,52 +2804,89 @@ impl App {
             || home.workspace_config(),
             |id| home.profile_home(id).workspace_config(),
         );
-        if let Some(worktree) = may_client::repo_search::worktree_root(&self.cwd) {
-            let current = match may_client::trust::persisted_level(&worktree, &config_path) {
-                Ok(current) => current,
-                Err(error) => {
-                    self.chat.push_error(&format!(
+        let cwd = self.cwd.clone();
+        let tx = self.event_tx.clone();
+        unblock(move || {
+            let result = if let Some(worktree) = may_client::repo_search::worktree_root(&cwd) {
+                match may_client::trust::persisted_level(&worktree, &config_path) {
+                    Ok(current) => {
+                        let kind = may_config::repo_kind::repo_kind(&worktree);
+                        Ok(super::event::PermissionGateData::RepoTrust {
+                            worktree,
+                            kind,
+                            current,
+                            config_path,
+                        })
+                    }
+                    Err(error) => Err(format!(
                         "Cannot read repository trust from {}: {error}",
                         config_path.display()
-                    ));
-                    return;
+                    )),
                 }
-            };
-            let kind = may_config::repo_kind::repo_kind(&worktree);
-            let mut ask =
-                AskUserState::for_open_question(may_client::trust::question_for(&kind, &worktree));
-            if let Some(cursor) = current.and_then(|level| {
-                ask.questions[0]
-                    .option
-                    .iter()
-                    .position(|option| may_client::trust::option_level(option) == Some(level))
-            }) {
-                ask.question_states[0].cursor = cursor;
-            }
-            self.mode = AppMode::RepoTrust(crate::state::RepoTrustState {
-                ask,
-                worktree,
-                kind,
-                config_path,
-            });
-        } else {
-            let config = match may_client::workspace::WorkspaceConfig::load(&config_path) {
-                Ok(config) => config,
-                Err(error) => {
-                    self.chat.push_error(&format!(
+            } else {
+                match may_client::workspace::WorkspaceConfig::load(&config_path) {
+                    Ok(config) => Ok(super::event::PermissionGateData::LaunchGrant {
+                        has_write_access: config.has_write_access(&cwd),
+                        path: cwd,
+                        config_path,
+                    }),
+                    Err(error) => Err(format!(
                         "Cannot read workspace config from {}: {error}",
                         config_path.display()
-                    ));
-                    return;
+                    )),
                 }
             };
-            // Writable directories open on the grant option, read-only ones
-            // on "keep it read-only".
-            self.mode = AppMode::LaunchGrant(crate::state::LaunchGrantState {
-                path: self.cwd.clone(),
+            let _ = tx.try_send(AppEvent::PermissionGateLoaded(result));
+        })
+        .detach();
+    }
+
+    /// Apply the `/permission` sheet data resolved off the UI thread.
+    pub(super) fn apply_permission_gate(
+        &mut self,
+        result: Result<super::event::PermissionGateData, String>,
+    ) {
+        match result {
+            Ok(super::event::PermissionGateData::RepoTrust {
+                worktree,
+                kind,
+                current,
                 config_path,
-                selected: usize::from(!config.has_write_access(&self.cwd)),
-            });
+            }) => {
+                let mut ask = AskUserState::for_open_question(may_client::trust::question_for(
+                    &kind, &worktree,
+                ));
+                if let Some(cursor) = current.and_then(|level| {
+                    ask.questions[0]
+                        .option
+                        .iter()
+                        .position(|option| may_client::trust::option_level(option) == Some(level))
+                }) {
+                    ask.question_states[0].cursor = cursor;
+                }
+                self.mode = AppMode::RepoTrust(crate::state::RepoTrustState {
+                    ask,
+                    worktree,
+                    kind,
+                    config_path,
+                });
+            }
+            Ok(super::event::PermissionGateData::LaunchGrant {
+                path,
+                config_path,
+                has_write_access,
+            }) => {
+                // Writable directories open on the grant option, read-only ones
+                // on "keep it read-only".
+                self.mode = AppMode::LaunchGrant(crate::state::LaunchGrantState {
+                    path,
+                    config_path,
+                    selected: usize::from(!has_write_access),
+                });
+            }
+            Err(error) => {
+                self.chat.push_error(&error);
+            }
         }
     }
 
@@ -6071,7 +6157,11 @@ mod tests {
                 "anthropic",
                 "claude-test",
             ));
-        let app = App::with_parts(config, sessions, tx, None, None);
+        let secrets = may_config::secrets::Secrets::load(
+            &may_config::secrets::SecretStore::new(sessions.may_dir()),
+            &config,
+        );
+        let app = App::with_parts(config, sessions, tx, None, None, secrets);
         (app, id)
     }
 
@@ -6578,7 +6668,11 @@ mod tests {
             .expect("session");
         let (tx, _rx) = async_channel::unbounded();
         // Deliberately unconfigured: no provider, no model.
-        let mut app = App::with_parts(MayConfig::default(), sessions, tx, None, None);
+        let secrets = may_config::secrets::Secrets::load(
+            &may_config::secrets::SecretStore::new(sessions.may_dir()),
+            &MayConfig::default(),
+        );
+        let mut app = App::with_parts(MayConfig::default(), sessions, tx, None, None, secrets);
         app.input = "hello".to_string();
         app.cursor = app.input.len();
 
@@ -6721,7 +6815,11 @@ mod tests {
         may_client::trust::persist(&config_path, repo.path(), Some(&kind), TrustLevel::Local)
             .expect("persist");
 
+        let (tx, rx) = async_channel::unbounded();
+        app.event_tx = tx;
         app.open_permission_gate();
+        let event = rx.recv().await.expect("permission gate loaded event");
+        app.handle_event(event).expect("handle permission gate");
         let super::AppMode::RepoTrust(state) = &app.mode else {
             panic!("/permission inside a repository opens the repo-trust sheet");
         };

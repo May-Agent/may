@@ -3965,7 +3965,28 @@ async fn gate_session_repo(
     }
     .run(session_id.as_str())
     .await
-    .map_err(UiChatPreparationError::RepoGate)
+    .map_err(UiChatPreparationError::RepoGate)?;
+    let (workspace_bytes, post_row) = futures_util::join!(
+        async {
+            match async_fs::read(&config_path).await {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            }
+        },
+        db.get_session(session_id.as_str()),
+    );
+    if let (Ok(workspace_bytes), Ok(Some(post_row))) = (workspace_bytes, post_row) {
+        state.record_repo_gate(
+            session_id.as_str(),
+            super::state::RepoGateStamp {
+                config_path,
+                workspace_bytes,
+                repo_binding: post_row.repo,
+            },
+        );
+    }
+    Ok(())
 }
 
 impl UiChatPreparationError {
@@ -4081,6 +4102,32 @@ pub async fn resolve_session_context(
     use_persisted_context_snapshot: bool,
     turn_boundary: Option<i32>,
 ) -> Result<SessionContext, UiChatPreparationError> {
+    resolve_session_context_inner(
+        state,
+        req,
+        fence,
+        persist_user_message,
+        use_persisted_context_snapshot,
+        turn_boundary,
+        true,
+        super::state::RepoGateFreshness::Stale,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_session_context_inner(
+    state: &Arc<DaemonState>,
+    req: &ChatRequest,
+    fence: &RunFence,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
+    turn_boundary: Option<i32>,
+    load_cold_replay: bool,
+    expected_repo_binding: super::state::RepoGateFreshness,
+    stages: Option<&async_channel::Sender<crate::client::TurnStage>>,
+) -> Result<SessionContext, UiChatPreparationError> {
     let session_id = SessionId::from_string(req.session_id.clone());
 
     if is_takeover_active_for_session(state, &session_id).await {
@@ -4092,49 +4139,88 @@ pub async fn resolve_session_context(
         .pending_transcripts
         .flush_session(&db, session_id.as_str())
         .await;
-    let (session_row, mut history, runtime_opt, raw_transcript, raw_snapshot) =
-        futures_util::future::try_join5(
+    let (session_row, mut history, runtime_opt, raw_transcript, raw_snapshot) = if load_cold_replay
+    {
+        let (session_row, mut history, runtime_opt, raw_transcript, raw_snapshot) =
+            futures_util::future::try_join5(
+                async {
+                    db.get_session(session_id.as_str())
+                        .await
+                        .map_err(UiChatPreparationError::LoadSession)
+                },
+                async {
+                    crate::session::load_history_from_db(&db, session_id.as_str())
+                        .await
+                        .map_err(UiChatPreparationError::LoadHistory)
+                },
+                async {
+                    db.get_session_runtime(session_id.as_str())
+                        .await
+                        .map_err(UiChatPreparationError::LoadRuntime)
+                },
+                async {
+                    db.transcript_entries_after(session_id.as_str(), -1)
+                        .await
+                        .map_err(UiChatPreparationError::LoadContextSnapshot)
+                },
+                async {
+                    if use_persisted_context_snapshot {
+                        db.get_session_context_snapshot(session_id.as_str())
+                            .await
+                            .map_err(UiChatPreparationError::LoadContextSnapshot)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )
+            .await?;
+        if let Some(boundary) = turn_boundary {
+            // A resubmitted prompt attempt rebuilds context from before the
+            // turn: its own rows were persisted by attempt 0 and the prompt
+            // carries the user message, so replaying them too would double
+            // the input.
+            history
+                .messages_mut()
+                .retain(|message| message.id.is_none_or(|id| id <= boundary));
+        }
+        (
+            session_row,
+            Some(history),
+            runtime_opt,
+            raw_transcript,
+            raw_snapshot,
+        )
+    } else {
+        let (session_row, runtime_opt) = futures_util::future::try_join(
             async {
                 db.get_session(session_id.as_str())
                     .await
                     .map_err(UiChatPreparationError::LoadSession)
             },
             async {
-                crate::session::load_history_from_db(&db, session_id.as_str())
-                    .await
-                    .map_err(UiChatPreparationError::LoadHistory)
-            },
-            async {
                 db.get_session_runtime(session_id.as_str())
                     .await
                     .map_err(UiChatPreparationError::LoadRuntime)
             },
-            async {
-                db.transcript_entries_after(session_id.as_str(), -1)
-                    .await
-                    .map_err(UiChatPreparationError::LoadContextSnapshot)
-            },
-            async {
-                if use_persisted_context_snapshot {
-                    db.get_session_context_snapshot(session_id.as_str())
-                        .await
-                        .map_err(UiChatPreparationError::LoadContextSnapshot)
-                } else {
-                    Ok(None)
-                }
-            },
         )
         .await?;
-    let session =
+        (session_row, None, runtime_opt, Vec::new(), None)
+    };
+    let mut session =
         session_row.ok_or_else(|| UiChatPreparationError::SessionNotFound(session_id.clone()))?;
-    if let Some(boundary) = turn_boundary {
-        // A resubmitted prompt attempt rebuilds context from before the
-        // turn: its own rows were persisted by attempt 0 and the prompt
-        // carries the user message, so replaying them too would double
-        // the input.
-        history
-            .messages_mut()
-            .retain(|message| message.id.is_none_or(|id| id <= boundary));
+    // If we skipped `gate_session_repo` on the warm path, verify the DB repo
+    // binding still matches what was gated; if not, run the gate now.
+    if let super::state::RepoGateFreshness::Fresh(expected_binding) = expected_repo_binding
+        && session.repo != expected_binding
+    {
+        emit_turn_stage(stages, crate::client::TurnStage::CheckingRepo);
+        gate_session_repo(state, session_id.as_str()).await?;
+        session = db
+            .get_session(session_id.as_str())
+            .await
+            .map_err(UiChatPreparationError::LoadSession)?
+            .ok_or_else(|| UiChatPreparationError::SessionNotFound(session_id.clone()))?;
+        emit_turn_stage(stages, crate::client::TurnStage::LoadingContext);
     }
 
     let session_model = session.model.clone();
@@ -4190,46 +4276,13 @@ pub async fn resolve_session_context(
         None => None,
     };
 
-    let mut transcript = Vec::<(i64, LlmMessage)>::new();
-    for entry in raw_transcript {
-        let message: LlmMessage = rmp_serde::from_slice(&entry.message_blob).map_err(|error| {
-            UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(format!(
-                "failed to decode transcript entry {}: {error}",
-                entry.seq
-            )))
-        })?;
-        transcript.push((entry.seq, message));
-    }
-    // One-time migration: a session with only UI history feeds it to the
-    // fresh agent once; `build_session_agent` then persists the agent's own
-    // checkpoint, so every transcript seq is one aither assigned.
-    let seed_messages = if transcript.is_empty() {
-        history
-            .to_aither_messages_async()
-            .await
-            .map_err(UiChatPreparationError::HistoryReplay)?
+    let (transcript, seed_messages, context_snapshot, uncheckpointed_input) = if load_cold_replay {
+        let history_ref = history
+            .as_ref()
+            .expect("cold replay loads session history upfront");
+        decode_cold_replay_context(raw_transcript, raw_snapshot, history_ref).await?
     } else {
-        Vec::new()
-    };
-    let context_snapshot = raw_snapshot.map(crate::session::parse_persisted_context_snapshot);
-    // `history` holds the rows stored before this turn's own: a user message
-    // the previous run stored but never checkpointed is among them.
-    let uncheckpointed_input = match context_snapshot.as_ref() {
-        Some(snapshot) => {
-            let written = snapshot
-                .updated_at
-                .parse::<jiff::Timestamp>()
-                .map_err(|error| {
-                    UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(
-                        format!("invalid context snapshot timestamp: {error}"),
-                    ))
-                })?;
-            history
-                .input_messages_after_async(written)
-                .await
-                .map_err(UiChatPreparationError::HistoryReplay)?
-        }
-        None => Vec::new(),
+        (Vec::new(), Vec::new(), None, Vec::new())
     };
 
     let mut hidden_context_parts = Vec::<String>::new();
@@ -4243,7 +4296,9 @@ pub async fn resolve_session_context(
         && let Err(error) = push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             disk_alert.clone(),
             persist_user_message,
@@ -4251,7 +4306,9 @@ pub async fn resolve_session_context(
         )
         .await
     {
-        if let Some(cause) = error.disk_exhaustion_cause() {
+        if let UiChatPreparationError::PersistHiddenContext(ref db_error) = error
+            && let Some(cause) = db_error.disk_exhaustion_cause()
+        {
             state.pending_transcripts.defer_messages(
                 session_id.as_str(),
                 vec![ChatMessage::hidden_context(disk_alert.clone())],
@@ -4261,7 +4318,7 @@ pub async fn resolve_session_context(
                 hidden_context_parts.push(disk_alert);
             }
         } else {
-            return Err(UiChatPreparationError::PersistHiddenContext(error));
+            return Err(error);
         }
     }
     let takeover_alert_consumed =
@@ -4270,14 +4327,15 @@ pub async fn resolve_session_context(
         push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             browser_takeover_alert(),
             persist_user_message,
             &mut hidden_commit_entry,
         )
-        .await
-        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+        .await?;
     }
     let daemon_exit_alert_consumed = persist_user_message
         && db
@@ -4288,14 +4346,15 @@ pub async fn resolve_session_context(
         push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             daemon_exit_alert(),
             persist_user_message,
             &mut hidden_commit_entry,
         )
-        .await
-        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+        .await?;
     }
     let rewind_alert_consumed = persist_user_message
         && db
@@ -4310,14 +4369,15 @@ pub async fn resolve_session_context(
         push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             rewind_alert(&prs),
             persist_user_message,
             &mut hidden_commit_entry,
         )
-        .await
-        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+        .await?;
     }
 
     if let Some(hidden_context_xml) = req
@@ -4329,14 +4389,15 @@ pub async fn resolve_session_context(
         push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             hidden_context_xml.to_string(),
             persist_user_message,
             &mut hidden_commit_entry,
         )
-        .await
-        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+        .await?;
     }
 
     if let Some(session_mentions_xml) = prompt_mentions::build_session_mentions(&db, &req.content)
@@ -4346,14 +4407,15 @@ pub async fn resolve_session_context(
         push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             session_mentions_xml,
             persist_user_message,
             &mut hidden_commit_entry,
         )
-        .await
-        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+        .await?;
     }
 
     let session_paths =
@@ -4374,14 +4436,15 @@ pub async fn resolve_session_context(
         push_hidden_context_part(
             &db,
             fence,
-            &history,
+            session_id.as_str(),
+            turn_boundary,
+            &mut history,
             &mut hidden_context_parts,
             file_mentions_xml,
             persist_user_message,
             &mut hidden_commit_entry,
         )
-        .await
-        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+        .await?;
     }
 
     if let Some(entry_id) = hidden_commit_entry.take() {
@@ -4540,35 +4603,167 @@ fn session_paths_for_session(
     )
 }
 
+type ColdReplayContext = (
+    Vec<(i64, LlmMessage)>,
+    Vec<LlmMessage>,
+    Option<crate::session::PersistedContextSnapshot>,
+    Vec<LlmMessage>,
+);
+
+async fn decode_cold_replay_context(
+    raw_transcript: Vec<crate::db::TranscriptEntry>,
+    raw_snapshot: Option<crate::db::StoredSessionContextSnapshot>,
+    history: &ChatHistory,
+) -> Result<ColdReplayContext, UiChatPreparationError> {
+    let mut transcript = Vec::<(i64, LlmMessage)>::with_capacity(raw_transcript.len());
+    for entry in raw_transcript {
+        let message: LlmMessage = rmp_serde::from_slice(&entry.message_blob).map_err(|error| {
+            UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(format!(
+                "failed to decode transcript entry {}: {error}",
+                entry.seq
+            )))
+        })?;
+        transcript.push((entry.seq, message));
+    }
+    // One-time migration: a session with only UI history feeds it to the
+    // fresh agent once; `build_session_agent` then persists the agent's own
+    // checkpoint, so every transcript seq is one aither assigned.
+    let seed_messages = if transcript.is_empty() {
+        history
+            .to_aither_messages_async()
+            .await
+            .map_err(UiChatPreparationError::HistoryReplay)?
+    } else {
+        Vec::new()
+    };
+    let context_snapshot = raw_snapshot.map(crate::session::parse_persisted_context_snapshot);
+    // `history` holds the rows stored before this turn's own: a user message
+    // the previous run stored but never checkpointed is among them.
+    let uncheckpointed_input = match context_snapshot.as_ref() {
+        Some(snapshot) => {
+            let written = snapshot
+                .updated_at
+                .parse::<jiff::Timestamp>()
+                .map_err(|error| {
+                    UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(
+                        format!("invalid context snapshot timestamp: {error}"),
+                    ))
+                })?;
+            history
+                .input_messages_after_async(written)
+                .await
+                .map_err(UiChatPreparationError::HistoryReplay)?
+        }
+        None => Vec::new(),
+    };
+    Ok((
+        transcript,
+        seed_messages,
+        context_snapshot,
+        uncheckpointed_input,
+    ))
+}
+
+async fn populate_cold_replay_context(
+    state: &Arc<DaemonState>,
+    ctx: &mut SessionContext,
+    use_persisted_context_snapshot: bool,
+    turn_boundary: Option<i32>,
+) -> Result<(), UiChatPreparationError> {
+    let db = state.db();
+    let sid = ctx.session_id.as_str();
+    let (mut history, raw_transcript, raw_snapshot) = futures_util::future::try_join3(
+        async {
+            crate::session::load_history_from_db(&db, sid)
+                .await
+                .map_err(UiChatPreparationError::LoadHistory)
+        },
+        async {
+            db.transcript_entries_after(sid, -1)
+                .await
+                .map_err(UiChatPreparationError::LoadContextSnapshot)
+        },
+        async {
+            if use_persisted_context_snapshot {
+                db.get_session_context_snapshot(sid)
+                    .await
+                    .map_err(UiChatPreparationError::LoadContextSnapshot)
+            } else {
+                Ok(None)
+            }
+        },
+    )
+    .await?;
+    // Exclude the user message this turn may already have persisted (and any
+    // rows past `turn_boundary`) so cold replay does not duplicate the current
+    // prompt.
+    let max_id = match (turn_boundary, ctx.user_message_id) {
+        (Some(boundary), Some(user_id)) => Some(boundary.min(user_id.saturating_sub(1))),
+        (Some(boundary), None) => Some(boundary),
+        (None, Some(user_id)) => Some(user_id.saturating_sub(1)),
+        (None, None) => None,
+    };
+    if let Some(boundary) = max_id {
+        history
+            .messages_mut()
+            .retain(|message| message.id.is_none_or(|id| id <= boundary));
+    }
+    let (transcript, seed_messages, context_snapshot, uncheckpointed_input) =
+        decode_cold_replay_context(raw_transcript, raw_snapshot, &history).await?;
+    ctx.transcript = transcript;
+    ctx.seed_messages = seed_messages;
+    ctx.context_snapshot = context_snapshot;
+    ctx.uncheckpointed_input = uncheckpointed_input;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn push_hidden_context_part(
     db: &crate::db::ChatDb,
     fence: &RunFence,
-    history: &ChatHistory,
+    session_id: &str,
+    turn_boundary: Option<i32>,
+    history: &mut Option<ChatHistory>,
     hidden_context_parts: &mut Vec<String>,
     content: String,
     persist_user_message: bool,
     commit_entry: &mut Option<i64>,
-) -> Result<(), crate::db::ChatDbError> {
+) -> Result<(), UiChatPreparationError> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Ok(());
     }
 
     let already_queued = hidden_context_parts.iter().any(|part| part == trimmed);
-    if persist_user_message
-        && !already_queued
-        && !history.messages().iter().any(|message| {
-            matches!(message.role, MessageRole::HiddenContext) && message.content == trimmed
-        })
-    {
-        let message = ChatMessage::hidden_context(trimmed.to_string());
-        match commit_entry.take() {
-            Some(entry_id) => {
-                db.append_chat_message_as_run_and_commit_pending(fence, entry_id, &message)
-                    .await?;
+    if persist_user_message && !already_queued {
+        let loaded_history = if let Some(loaded) = history {
+            loaded
+        } else {
+            let mut loaded = crate::session::load_history_from_db(db, session_id)
+                .await
+                .map_err(UiChatPreparationError::LoadHistory)?;
+            if let Some(boundary) = turn_boundary {
+                loaded
+                    .messages_mut()
+                    .retain(|message| message.id.is_none_or(|id| id <= boundary));
             }
-            None => {
-                db.append_chat_message_as_run(fence, &message).await?;
+            history.insert(loaded)
+        };
+        if !loaded_history.messages().iter().any(|message| {
+            matches!(message.role, MessageRole::HiddenContext) && message.content == trimmed
+        }) {
+            let message = ChatMessage::hidden_context(trimmed.to_string());
+            match commit_entry.take() {
+                Some(entry_id) => {
+                    db.append_chat_message_as_run_and_commit_pending(fence, entry_id, &message)
+                        .await
+                        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+                }
+                None => {
+                    db.append_chat_message_as_run(fence, &message)
+                        .await
+                        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+                }
             }
         }
     }
@@ -5008,33 +5203,69 @@ fn prepare_agent_for_request_with_stages<'a>(
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
         let take_prewarm = attempt.retained_agent.is_none() && attempt.provider_attempt == 0;
+        let has_warm_agent = attempt.retained_agent.is_some()
+            || (attempt.provider_attempt == 0 && state.parked_agents.contains(&req.session_id));
+        let load_cold_replay = !has_warm_agent;
         let stage_ref = stages.as_ref();
+        let prewarm_done = std::sync::atomic::AtomicBool::new(!take_prewarm);
+        let prewarm_done_ref = &prewarm_done;
         let (prewarmed_agent, ctx_res) = futures_util::join!(
             async {
-                if take_prewarm {
+                let agent = if take_prewarm {
                     state.session_prewarms.take(&req.session_id).await
                 } else {
                     None
-                }
+                };
+                prewarm_done_ref.store(true, std::sync::atomic::Ordering::Release);
+                agent
             },
             async {
-                if !kind.is_resume() {
+                let expected_repo_binding = if kind.is_resume() {
+                    super::state::RepoGateFreshness::Stale
+                } else if has_warm_agent {
+                    match state.fresh_repo_gate_binding(&req.session_id).await {
+                        fresh @ super::state::RepoGateFreshness::Fresh(_) => fresh,
+                        super::state::RepoGateFreshness::Stale => {
+                            emit_turn_stage(stage_ref, crate::client::TurnStage::CheckingRepo);
+                            gate_session_repo(state, &req.session_id).await?;
+                            super::state::RepoGateFreshness::Stale
+                        }
+                    }
+                } else {
                     emit_turn_stage(stage_ref, crate::client::TurnStage::CheckingRepo);
                     gate_session_repo(state, &req.session_id).await?;
-                }
+                    super::state::RepoGateFreshness::Stale
+                };
                 emit_turn_stage(stage_ref, crate::client::TurnStage::LoadingContext);
-                Box::pin(resolve_session_context(
+                let ctx = Box::pin(resolve_session_context_inner(
                     state,
                     req,
                     fence,
                     persist_user_message,
                     use_persisted_context_snapshot,
                     attempt.turn_boundary,
+                    load_cold_replay,
+                    expected_repo_binding,
+                    stage_ref,
                 ))
-                .await
+                .await?;
+                // Context is loaded; if we are still waiting on an in-flight
+                // session pre-warm, transition out of `LoadingContext` now.
+                if !prewarm_done_ref.load(std::sync::atomic::Ordering::Acquire) {
+                    let turn_stage = if matches!(
+                        ctx.profile_environment.as_ref(),
+                        Some(crate::profile::ProfileEnvironment::Container { .. })
+                    ) {
+                        crate::client::TurnStage::StartingContainer
+                    } else {
+                        crate::client::TurnStage::PreparingAgent
+                    };
+                    emit_turn_stage(stage_ref, turn_stage);
+                }
+                Ok::<_, UiChatPreparationError>(ctx)
             },
         );
-        let ctx = ctx_res?;
+        let mut ctx = ctx_res?;
         let config = state.config_snapshot();
         let wants_container = matches!(
             ctx.profile_environment.as_ref(),
@@ -5097,6 +5328,15 @@ fn prepare_agent_for_request_with_stages<'a>(
             }
             None if kind.is_resume() => return Err(UiChatPreparationError::NothingToResume),
             None => {
+                if !load_cold_replay {
+                    populate_cold_replay_context(
+                        state,
+                        &mut ctx,
+                        use_persisted_context_snapshot,
+                        attempt.turn_boundary,
+                    )
+                    .await?;
+                }
                 let turn_stage = if wants_container {
                     crate::client::TurnStage::StartingContainer
                 } else {
@@ -8571,6 +8811,150 @@ mod tests {
                 .expect("agent either coalesced from prewarm or already parked"),
         };
         assert_eq!(agent.provider_id(), "a");
+    }
+
+    #[tokio::test]
+    async fn warm_turn_skips_checking_repo_until_workspace_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stub = stub_provider(vec![sse_text("one"), sse_text("two"), sse_text("three")]).await;
+        let state = failover_state(tmp.path(), &stub, &stub).await;
+        let session_id = "warm-stage-test";
+        state
+            .db()
+            .create_session(session_id, Some("warm"), Some("a::gpt-4o"))
+            .await
+            .expect("create session");
+
+        // Turn 1: cold build gates the repo and parks the agent.
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire(session_id)
+                .await
+                .expect("acquire turn 1");
+            let req = ChatRequest {
+                session_id: session_id.to_string(),
+                content: "first".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            let mut sink = TestSink::default();
+            run_agent_loop(
+                &state,
+                &req,
+                &mut sink,
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            )
+            .await
+            .expect("turn 1");
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish 1");
+        }
+        assert!(state.parked_agents.contains(session_id));
+
+        // Turn 2: workspace.toml unchanged -> warm prep skips CheckingRepo.
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire(session_id)
+                .await
+                .expect("acquire turn 2");
+            let req = ChatRequest {
+                session_id: session_id.to_string(),
+                content: "second".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            let (stage_tx, stage_rx) = async_channel::unbounded();
+            let prepared = super::prepare_agent_for_request_with_stages(
+                &state,
+                &req,
+                guard.fence(),
+                true,
+                true,
+                super::TurnAttempt {
+                    provider_attempt: 0,
+                    turn_boundary: None,
+                    retained_agent: None,
+                },
+                &TurnKind::Prompt,
+                Some(stage_tx),
+            )
+            .await
+            .expect("prepare turn 2");
+            let stages: Vec<_> = std::iter::from_fn(|| stage_rx.try_recv().ok()).collect();
+            assert!(
+                !stages.contains(&crate::client::TurnStage::CheckingRepo),
+                "warm turn with unchanged workspace.toml should skip CheckingRepo: {stages:?}"
+            );
+            state
+                .parked_agents
+                .park(&state, session_id, prepared.agent, guard.released());
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish 2");
+        }
+
+        // Modify workspace.toml -> next warm turn must re-run CheckingRepo.
+        let ws_path = tmp.path().join("workspace.toml");
+        std::fs::write(&ws_path, "# modified\n").expect("write workspace.toml");
+        {
+            let guard = state
+                .runtime_service
+                .runs()
+                .acquire(session_id)
+                .await
+                .expect("acquire turn 3");
+            let req = ChatRequest {
+                session_id: session_id.to_string(),
+                content: "third".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            };
+            let (stage_tx, stage_rx) = async_channel::unbounded();
+            let prepared = super::prepare_agent_for_request_with_stages(
+                &state,
+                &req,
+                guard.fence(),
+                true,
+                true,
+                super::TurnAttempt {
+                    provider_attempt: 0,
+                    turn_boundary: None,
+                    retained_agent: None,
+                },
+                &TurnKind::Prompt,
+                Some(stage_tx),
+            )
+            .await
+            .expect("prepare turn 3");
+            let stages: Vec<_> = std::iter::from_fn(|| stage_rx.try_recv().ok()).collect();
+            assert!(
+                stages.contains(&crate::client::TurnStage::CheckingRepo),
+                "warm turn after workspace.toml edit must re-run CheckingRepo: {stages:?}"
+            );
+            state
+                .parked_agents
+                .park(&state, session_id, prepared.agent, guard.released());
+            guard
+                .finish_idle(crate::session::RunOutcome::Completed)
+                .await
+                .expect("finish 3");
+        }
     }
 }
 

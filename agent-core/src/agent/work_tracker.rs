@@ -149,7 +149,7 @@ impl MayWorkTracker {
                     cwd.filter(|forge| crate::issue::repository_matches(repository, forge))
                 {
                     keys.push(forge);
-                    keys.push(self.cwd_identity(reference)?);
+                    keys.push(self.cwd_identity(reference).await?);
                 }
                 keys
             }
@@ -158,7 +158,7 @@ impl MayWorkTracker {
                 if let Some(repo) = self.our_repository() {
                     candidates.push(repo);
                 }
-                if let Ok(id) = self.cwd_identity(reference) {
+                if let Ok(id) = self.cwd_identity(reference).await {
                     candidates.push(id);
                 }
                 if candidates.is_empty() {
@@ -191,8 +191,10 @@ impl MayWorkTracker {
 
     /// The working directory's repository identity, the key `pr` records
     /// its PRs under when it is cloned locally.
-    fn cwd_identity(&self, reference: &WorkRef) -> Result<String, WorkTrackerError> {
-        crate::issue::repository_identity(&self.cwd)
+    async fn cwd_identity(&self, reference: &WorkRef) -> Result<String, WorkTrackerError> {
+        let cwd = self.cwd.clone();
+        blocking::unblock(move || crate::issue::repository_identity(&cwd))
+            .await
             .map(|identity| identity.display().to_string())
             .map_err(|error| unavailable(reference, &error.to_string()))
     }

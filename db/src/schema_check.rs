@@ -70,7 +70,7 @@ impl fmt::Display for Affinity {
 
 /// What a column is declared as.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Declared {
+pub struct Declared {
     column_type: String,
     not_null: bool,
     primary_key: bool,
@@ -256,14 +256,23 @@ fn compare(expected: &Columns, live: &Columns) -> Vec<SchemaProblem> {
 }
 
 impl ChatDb {
+    /// Build the expected column inventory from an in-memory reference schema.
+    pub(super) async fn expected_schema_columns() -> Result<Columns, ChatDbError> {
+        let reference = SkyDb::connect_sqlite_memory().await?;
+        Self::apply_schema(&reference).await?;
+        columns(&reference).await
+    }
+
     /// Refuse a database whose tables cannot serve this build's statements.
     ///
     /// Runs after the schema was applied, so a table that was missing is
     /// already there and only a table left over from another build can fail.
-    pub(super) async fn check_schema(db: &SkyDb, db_path: &Path) -> Result<(), ChatDbError> {
-        let reference = SkyDb::connect_sqlite_memory().await?;
-        Self::apply_schema(&reference).await?;
-        let problems = compare(&columns(&reference).await?, &columns(db).await?);
+    pub(super) async fn check_schema_against(
+        db: &SkyDb,
+        db_path: &Path,
+        expected: &Columns,
+    ) -> Result<(), ChatDbError> {
+        let problems = compare(expected, &columns(db).await?);
         if problems.is_empty() {
             return Ok(());
         }

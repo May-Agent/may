@@ -76,15 +76,34 @@ struct BugReportHeader<'a> {
     mode: &'a str,
 }
 
+/// Copy an optional device code to the system clipboard and open `url` in the
+/// user's browser off the UI event loop.
+fn open_url_in_background(url: String, clipboard_code: Option<String>) {
+    blocking::unblock(move || {
+        if let Some(code) = clipboard_code
+            && !code.is_empty()
+            && let Ok(mut clipboard) = arboard::Clipboard::new()
+            && let Err(e) = clipboard.set_text(&code)
+        {
+            tracing::warn!("Failed to copy code to clipboard: {e}");
+        }
+        if let Err(e) = open::that(&url) {
+            tracing::warn!("Failed to open URL in browser: {e}");
+        }
+    })
+    .detach();
+}
+
 /// `/bug`: dump the session context and the recent log ring to a new file
-/// under `~/.may/bugs`, returning where it landed.
-fn write_bug_snapshot(
+/// under `~/.may/bugs` off the UI event loop, reporting completion via `AppEvent`.
+fn spawn_bug_snapshot(
     app: &App,
-    log_ring: &may_agent::log_ring::LogRingHandle,
-) -> anyhow::Result<std::path::PathBuf> {
+    log_ring: may_agent::log_ring::LogRingHandle,
+    event_tx: may_agent::tui::event::EventSender,
+) {
     let bugs_dir = app.session_manager.may_dir().join("bugs");
     let timestamp = jiff::Timestamp::now().to_string();
-    let header = BugReportHeader {
+    let header_res = BugReportHeader {
         version: env!("CARGO_PKG_VERSION"),
         timestamp: timestamp.as_str(),
         os: std::env::consts::OS,
@@ -96,11 +115,22 @@ fn write_bug_snapshot(
         mode: app.mode.name(),
     }
     .render()
-    .context("Failed to render the bug report header")?;
+    .context("Failed to render the bug report header");
     let path = bugs_dir.join(format!("bug-{}.log", jiff::Timestamp::now().as_second()));
-    log_ring.dump_to(&path, &header)?;
-    tracing::info!(path = %path.display(), "bug snapshot written");
-    Ok(path)
+    blocking::unblock(move || {
+        let result = match header_res {
+            Ok(header) => log_ring
+                .dump_to(&path, &header)
+                .map(|()| {
+                    tracing::info!(path = %path.display(), "bug snapshot written");
+                    path
+                })
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = event_tx.try_send(AppEvent::BugSnapshotWritten(result));
+    })
+    .detach();
 }
 
 /// Stack every tokio worker gets. Spawned threads default to the pthread
@@ -525,7 +555,12 @@ where
     app.set_status("Connecting to the May daemon…");
     terminal.draw(|frame| ui::render(frame, &mut app))?;
     let paths = may_agent::daemon::DaemonPaths::user()?;
-    let runtime_deps = match may_agent::daemon::lifecycle::ensure_running(&paths, |_| {}).await {
+    let runtime_deps = match may_agent::daemon::lifecycle::ensure_running(&paths, |message| {
+        app.set_status(message);
+        let _ = terminal.draw(|frame| ui::render(frame, &mut app));
+    })
+    .await
+    {
         Ok(client) => {
             app.set_status("Loading profiles…");
             terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -540,11 +575,11 @@ where
             );
             app.session_manager.attach_daemon(client.clone());
             app.index_loading = true;
-            may_agent::tui::remote::spawn_index_coverage(
+            let pre_session_index = Some(may_agent::tui::remote::spawn_index_coverage(
                 client.clone(),
                 app.cwd.clone(),
                 events.sender(),
-            );
+            ));
             if let Ok(profiles) = client
                 .get::<Vec<may_agent::profile::ProfileInfo>>("/api/profiles")
                 .await
@@ -562,12 +597,13 @@ where
                 }
                 app.profiles = profiles;
             }
-            runtime_deps.with_daemon(client)
+            (runtime_deps.with_daemon(client), pre_session_index)
         }
         Err(error) => {
             return Err(anyhow::anyhow!("the May daemon is unavailable: {error}"));
         }
     };
+    let (runtime_deps, pre_session_index) = runtime_deps;
 
     // The session `may resume` names, or the most recently active one when
     // `may resume` stands alone.
@@ -616,6 +652,7 @@ where
         &mut app,
         &mut worker,
         worker_build,
+        pre_session_index,
         &mut events,
         terminal,
         runtime_deps,
@@ -739,6 +776,7 @@ async fn main_event_loop<B: Backend>(
     app: &mut App,
     worker: &mut Option<AgentWorker>,
     mut worker_build: Option<WorkerBuild>,
+    mut pre_session_index: Option<executor_core::AnyExecutorTask<()>>,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
     runtime_deps: RuntimeDeps,
@@ -785,7 +823,22 @@ where
             Terminal(Box<AppEvent>),
         }
 
-        tracing::info!("=== LOOP START ===");
+        // Once a session worker attaches, its `follow_session_globals` stream
+        // carries `session_index`; drop the pre-session `cwd` watcher so the
+        // TUI does not open two concurrent `session_index` SSE streams.
+        if worker.is_some() {
+            pre_session_index = None;
+        } else if pre_session_index.is_none()
+            && let Some(client) = runtime_deps.daemon()
+        {
+            pre_session_index = Some(may_agent::tui::remote::spawn_index_coverage(
+                client.clone(),
+                app.cwd.clone(),
+                events.sender(),
+            ));
+        }
+
+        tracing::trace!("=== LOOP START ===");
         let mut phases = may_agent::tui::perf::LoopPhases::default();
         let jank_threshold = may_agent::tui::perf::jank_threshold();
 
@@ -795,7 +848,7 @@ where
             terminal.draw(|frame| ui::render(frame, app))?;
             phases.draw = draw_start.elapsed();
             last_draw = draw_start;
-            tracing::info!("after draw");
+            tracing::trace!("after draw");
         }
         // Any path back to the top of the loop redraws unless an idle tick
         // below says otherwise.
@@ -940,7 +993,7 @@ where
             phases.step("begin_queued_run", step_start.elapsed());
         }
 
-        tracing::info!("entering select");
+        tracing::trace!("entering select");
 
         // A queued key/paste/mouse/resize beats a ready agent event: a
         // thinking stream keeps `handle.recv()` ready, and `future::or`
@@ -961,7 +1014,7 @@ where
                     async {
                         if let Some(ref handle) = agent_handle {
                             let result = handle.recv().await;
-                            tracing::info!("agent handle.recv() RETURNED");
+                            tracing::trace!("agent handle.recv() RETURNED");
                             result.map(Event::Agent)
                         } else if let Some(worker) = worker.as_ref() {
                             // A turn another client started, rendered
@@ -984,9 +1037,8 @@ where
                         },
                         async {
                             let result = events.next().await;
-                            // Don't log ticks, too noisy
                             if !matches!(result, Some(AppEvent::Tick)) {
-                                tracing::info!(
+                                tracing::trace!(
                                     "events.next() RETURNED: {:?}",
                                     result.as_ref().map(|_| "event")
                                 );
@@ -999,7 +1051,7 @@ where
             .await
         };
 
-        tracing::info!(
+        tracing::trace!(
             "select completed, event type: {}",
             match &event {
                 Some(Event::WorkerBuilt(_)) => "WorkerBuilt",
@@ -1745,50 +1797,19 @@ where
                             .detach();
                         }
                     }
-                    Some(SendAction::OpenChatgptAuthUrl { url, code }) => {
-                        if !code.is_empty()
-                            && let Ok(mut clipboard) = arboard::Clipboard::new()
-                            && let Err(e) = clipboard.set_text(&code)
-                        {
-                            tracing::warn!("Failed to copy code to clipboard: {}", e);
-                        }
-                        if let Err(e) = open::that(&url) {
-                            tracing::warn!("Failed to open URL in browser: {}", e);
-                        }
-                    }
-                    Some(SendAction::OpenCopilotAuthUrl { url, code }) => {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new()
-                            && let Err(e) = clipboard.set_text(&code)
-                        {
-                            tracing::warn!("Failed to copy code to clipboard: {}", e);
-                        }
-                        if let Err(e) = open::that(&url) {
-                            tracing::warn!("Failed to open URL in browser: {}", e);
-                        }
-                    }
-                    Some(SendAction::OpenGrokAuthUrl { url, code }) => {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new()
-                            && let Err(e) = clipboard.set_text(&code)
-                        {
-                            tracing::warn!("Failed to copy code to clipboard: {}", e);
-                        }
-                        if let Err(e) = open::that(&url) {
-                            tracing::warn!("Failed to open URL in browser: {}", e);
-                        }
+                    Some(
+                        SendAction::OpenChatgptAuthUrl { url, code }
+                        | SendAction::OpenCopilotAuthUrl { url, code }
+                        | SendAction::OpenGrokAuthUrl { url, code },
+                    ) => {
+                        open_url_in_background(url, Some(code));
                     }
                     Some(SendAction::OpenOpenrouterAuthUrl { url }) => {
-                        if let Err(e) = open::that(&url) {
-                            tracing::warn!("Failed to open URL in browser: {}", e);
-                        }
+                        open_url_in_background(url, None);
                     }
-                    Some(SendAction::BugReport) => match write_bug_snapshot(app, &log_ring) {
-                        Ok(path) => app
-                            .chat
-                            .push_notice(&format!("Bug snapshot saved to {}", path.display())),
-                        Err(error) => app
-                            .chat
-                            .push_error(&format!("Failed to save bug snapshot: {error}")),
-                    },
+                    Some(SendAction::BugReport) => {
+                        spawn_bug_snapshot(app, log_ring.clone(), events.sender());
+                    }
                     Some(SendAction::ToggleOrchestrator) => {
                         let session_id = app
                             .session_manager
@@ -2221,19 +2242,24 @@ where
                     }) => {
                         // Grant or denial, the decision is recorded: a
                         // covered directory is never asked again.
-                        let result = may_agent::workspace::WorkspaceConfig::load(&config_path)
-                            .and_then(|mut config| {
-                                config.record_workdir(
-                                    dir.clone(),
-                                    if approved {
-                                        may_agent::workspace::Permission::ReadWrite
-                                    } else {
-                                        may_agent::workspace::Permission::ReadOnly
-                                    },
-                                    Some("launch directory".to_string()),
-                                );
-                                config.save(&config_path)
-                            });
+                        let dir_for_io = dir.clone();
+                        let result = blocking::unblock(move || {
+                            may_agent::workspace::WorkspaceConfig::load(&config_path).and_then(
+                                |mut config| {
+                                    config.record_workdir(
+                                        dir_for_io,
+                                        if approved {
+                                            may_agent::workspace::Permission::ReadWrite
+                                        } else {
+                                            may_agent::workspace::Permission::ReadOnly
+                                        },
+                                        Some("launch directory".to_string()),
+                                    );
+                                    config.save(&config_path)
+                                },
+                            )
+                        })
+                        .await;
                         match result {
                             Ok(()) => {
                                 if approved {
@@ -2253,12 +2279,16 @@ where
                         level,
                     }) => {
                         if let Some(level) = level {
-                            let result = may_agent::trust::persist(
-                                &config_path,
-                                &worktree,
-                                Some(&kind),
-                                level,
-                            );
+                            let worktree_for_io = worktree.clone();
+                            let result = blocking::unblock(move || {
+                                may_agent::trust::persist(
+                                    &config_path,
+                                    &worktree_for_io,
+                                    Some(&kind),
+                                    level,
+                                )
+                            })
+                            .await;
                             match result {
                                 Ok(()) => app.chat.push_notice(&format!(
                                     "Repository trust for {} is now {}",
@@ -2509,14 +2539,7 @@ where
                         match action {
                             SendAction::Quit => return Ok(()),
                             SendAction::OpenCopilotAuthUrl { url, code } => {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                    && let Err(e) = clipboard.set_text(&code)
-                                {
-                                    tracing::warn!("Failed to copy code to clipboard: {}", e);
-                                }
-                                if let Err(e) = open::that(&url) {
-                                    tracing::warn!("Failed to open URL in browser: {}", e);
-                                }
+                                open_url_in_background(url, Some(code));
                             }
                             _ => {}
                         }
@@ -2765,9 +2788,7 @@ where
     let url = pkce.authorize_url();
     app.set_chatgpt_auth_url(url.clone());
     terminal.draw(|frame| ui::render(frame, app))?;
-    if let Err(e) = open::that(&url) {
-        tracing::warn!("Failed to open browser: {e}");
-    }
+    open_url_in_background(url, None);
 
     let listener = auth::listen_for_callback(pkce.state());
     tokio::pin!(listener);
@@ -2790,9 +2811,7 @@ where
                         match action {
                             SendAction::Quit => return Ok(()),
                             SendAction::OpenChatgptAuthUrl { url, .. } => {
-                                if let Err(e) = open::that(&url) {
-                                    tracing::warn!("Failed to open URL in browser: {e}");
-                                }
+                                open_url_in_background(url, None);
                             }
                             _ => {}
                         }
@@ -3016,14 +3035,7 @@ where
                         match action {
                             SendAction::Quit => return Ok(()),
                             SendAction::OpenGrokAuthUrl { url, code } => {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                    && let Err(e) = clipboard.set_text(&code)
-                                {
-                                    tracing::warn!("Failed to copy code to clipboard: {e}");
-                                }
-                                if let Err(e) = open::that(&url) {
-                                    tracing::warn!("Failed to open URL in browser: {e}");
-                                }
+                                open_url_in_background(url, Some(code));
                             }
                             _ => {}
                         }
@@ -3101,9 +3113,7 @@ where
 
     app.set_openrouter_auth_url(url.clone());
     terminal.draw(|frame| ui::render(frame, app))?;
-    if let Err(e) = open::that(&url) {
-        tracing::warn!("Failed to open browser: {e}");
-    }
+    open_url_in_background(url.clone(), None);
 
     let listener = openrouter::listen_for_callback();
     tokio::pin!(listener);
@@ -3126,9 +3136,7 @@ where
                         match action {
                             SendAction::Quit => return Ok(()),
                             SendAction::OpenOpenrouterAuthUrl { url } => {
-                                if let Err(e) = open::that(&url) {
-                                    tracing::warn!("Failed to open URL in browser: {e}");
-                                }
+                                open_url_in_background(url, None);
                             }
                             _ => {}
                         }
@@ -3182,9 +3190,7 @@ where
             match action {
                 SendAction::Quit => return Ok(()),
                 SendAction::OpenOpenrouterAuthUrl { url } => {
-                    if let Err(e) = open::that(&url) {
-                        tracing::warn!("Failed to open URL in browser: {e}");
-                    }
+                    open_url_in_background(url, None);
                 }
                 SendAction::SubmitOpenrouterCode { input } => {
                     let input = input.trim().to_string();

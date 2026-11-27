@@ -431,6 +431,26 @@ impl McpService {
     }
 }
 
+/// Snapshot of the inputs `gate_session_repo` last verified for a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoGateStamp {
+    /// Path to the session/profile `workspace.toml` that was checked.
+    pub config_path: PathBuf,
+    /// Raw bytes of `config_path` when verified (`None` when the file did not exist).
+    pub workspace_bytes: Option<Vec<u8>>,
+    /// Session's `repo` column after the gate completed.
+    pub repo_binding: Option<String>,
+}
+
+/// Whether a session's cached `repo_gate` verification is still valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoGateFreshness {
+    /// No valid cached stamp or `workspace.toml` changed; re-run `repo_gate`.
+    Stale,
+    /// `workspace.toml` matches the last verified stamp; carries the expected `repo` column.
+    Fresh(Option<String>),
+}
+
 /// The daemon's shared state: sessions, agents, registries, and services.
 pub struct DaemonState {
     /// Runs the connected ACP agents, one host per session; reads the live
@@ -462,7 +482,7 @@ pub struct DaemonState {
     pub live_limits: crate::agent::LiveLimits,
     pub ui_event_bus: UiEventBus,
     pub container_prepare: ContainerPrepareTracker,
-    pub container_manager: ArcSwapOption<crate::container::lifecycle::ContainerManager>,
+    pub container_manager: Arc<ArcSwapOption<crate::container::lifecycle::ContainerManager>>,
     pub pending_transcripts: super::disk_exhaustion::PendingTranscriptStore,
     pub browser_manager: ArcSwapOption<crate::container::browser::BrowserManager>,
     pub browser_owner_session_id: ArcSwapOption<String>,
@@ -543,6 +563,10 @@ pub struct DaemonState {
     /// and the first turn never duplicate forge API lookups.
     pub repo_gate_locks:
         std::sync::Mutex<std::collections::HashMap<String, Arc<async_lock::Mutex<()>>>>,
+    /// Last verified `repo_gate` state per session so warm turns skip re-running
+    /// `git2` and emitting `CheckingRepo` when `workspace.toml` and repo binding
+    /// have not changed.
+    pub repo_gate_stamps: std::sync::Mutex<std::collections::HashMap<String, RepoGateStamp>>,
     /// Each session agent's fork source and model, working or idle, for
     /// `btw` questions from other agents.
     pub agent_forks: crate::agent_link::ForkHosts,
@@ -642,6 +666,50 @@ impl DaemonState {
                 .entry(session_id.to_string())
                 .or_insert_with(|| Arc::new(async_lock::Mutex::new(()))),
         )
+    }
+
+    /// Records the inputs `gate_session_repo` just verified for `session_id`.
+    pub fn record_repo_gate(&self, session_id: &str, stamp: RepoGateStamp) {
+        self.repo_gate_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_string(), stamp);
+    }
+
+    /// Returns `RepoGateFreshness` indicating whether `session_id` already passed
+    /// `gate_session_repo` and its `workspace.toml` bytes on disk are unchanged.
+    pub async fn fresh_repo_gate_binding(&self, session_id: &str) -> RepoGateFreshness {
+        let stamp = self
+            .repo_gate_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        let Some(stamp) = stamp else {
+            return RepoGateFreshness::Stale;
+        };
+        let current_bytes = match async_fs::read(&stamp.config_path).await {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return RepoGateFreshness::Stale,
+        };
+        if current_bytes == stamp.workspace_bytes {
+            RepoGateFreshness::Fresh(stamp.repo_binding)
+        } else {
+            RepoGateFreshness::Stale
+        }
+    }
+
+    /// Drops cached repo-gate state and lock entries for a deleted session.
+    pub fn clear_repo_gate(&self, session_id: &str) {
+        self.repo_gate_stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.repo_gate_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
     }
 
     pub fn config_snapshot(&self) -> Arc<MayConfig> {
@@ -759,6 +827,7 @@ impl DaemonState {
     /// subagents, and releases unheld managed browser ownership.
     pub async fn teardown_session_resources(&self, session_id: &str) {
         self.session_prewarms.cancel(session_id);
+        self.clear_repo_gate(session_id);
         self.parked_agents.evict_and_wait(session_id).await;
         self.services.debug.teardown_session(session_id).await;
         let stopped = self.session_background.teardown_session(session_id).await;
@@ -1567,6 +1636,7 @@ impl DaemonState {
             )
             .with_live_config(self.config.clone()),
         );
+        let _auto_stop = manager.spawn_auto_stop_task();
         self.container_manager.store(Some(manager.clone()));
         Ok(manager)
     }
@@ -1748,7 +1818,7 @@ impl DaemonState {
             live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
-            container_manager: arc_swap::ArcSwapOption::empty(),
+            container_manager: Arc::new(arc_swap::ArcSwapOption::empty()),
             pending_transcripts: super::disk_exhaustion::PendingTranscriptStore::default(),
             browser_manager: arc_swap::ArcSwapOption::empty(),
             browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
@@ -1808,6 +1878,7 @@ impl DaemonState {
             parked_agents: super::chat::ParkedAgents::default(),
             session_prewarms: super::chat::SessionPrewarms::default(),
             repo_gate_locks: std::sync::Mutex::default(),
+            repo_gate_stamps: std::sync::Mutex::default(),
             agent_forks: crate::agent_link::ForkHosts::default(),
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),

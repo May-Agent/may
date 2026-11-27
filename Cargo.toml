@@ -219,6 +219,40 @@ opt-level = 2
 [profile.dev.package.fancy-regex]
 opt-level = 2
 
+# `agents_md::discover` walks repositories through `ignore`/`globset`/`regex`
+# on every session start and turn sync, and `tiktoken` loads and counts BPE
+# vocabularies on local tokenizers; unoptimized, these dominate turn prep in
+# dev builds.
+[profile.dev.package.ignore]
+opt-level = 2
+
+[profile.dev.package.globset]
+opt-level = 2
+
+[profile.dev.package.regex-automata]
+opt-level = 2
+
+[profile.dev.package.regex-syntax]
+opt-level = 2
+
+[profile.dev.package.aho-corasick]
+opt-level = 2
+
+[profile.dev.package.bstr]
+opt-level = 2
+
+[profile.dev.package.tiktoken]
+opt-level = 2
+
+[profile.dev.package.blake3]
+opt-level = 2
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 2
+
+[profile.dev.package.unicode-width]
+opt-level = 2
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
