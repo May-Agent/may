@@ -411,7 +411,7 @@ pub fn read_clipboard() -> Result<ClipboardPasteResult, ImageError> {
 #[must_use]
 pub fn pasted_image_path_candidate(pasted: &str) -> Option<PathBuf> {
     let text = pasted.trim();
-    if text.is_empty() || text.contains('\n') {
+    if text.is_empty() || text.contains(['\n', '\r']) {
         return None;
     }
     if let Ok(url) = Url::parse(text) {

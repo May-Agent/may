@@ -116,6 +116,55 @@ pub fn drawn_width(cluster: &str) -> usize {
     UnicodeWidthStr::width(cluster)
 }
 
+/// Byte offset on `line` (no newlines) at display column `target_width`,
+/// landing on a grapheme boundary at or before `target_width`, or `line.len()`
+/// when `line` is narrower.
+fn offset_at_width(line: &str, target_width: usize) -> usize {
+    let mut used = 0;
+    for (offset, cluster) in line.grapheme_indices(true) {
+        let w = drawn_width(cluster);
+        if used + w > target_width {
+            return offset;
+        }
+        used += w;
+    }
+    line.len()
+}
+
+/// Move `at` up one logical (`\n`-separated) line, keeping the display column
+/// as close as possible. Returns `None` when `at` is already on the first line.
+#[must_use]
+pub fn move_up(text: &str, at: usize) -> Option<usize> {
+    let at = if text.is_char_boundary(at) {
+        at
+    } else {
+        off_boundary(text, at)
+    };
+    let cur_nl = text[..at].rfind('\n')?;
+    let col = drawn_width(&text[cur_nl + 1..at]);
+    let prev_start = text[..cur_nl].rfind('\n').map_or(0, |i| i + 1);
+    Some(prev_start + offset_at_width(&text[prev_start..cur_nl], col))
+}
+
+/// Move `at` down one logical (`\n`-separated) line, keeping the display column
+/// as close as possible. Returns `None` when `at` is already on the last line.
+#[must_use]
+pub fn move_down(text: &str, at: usize) -> Option<usize> {
+    let at = if text.is_char_boundary(at) {
+        at
+    } else {
+        off_boundary(text, at)
+    };
+    let rel_nl = text[at..].find('\n')?;
+    let cur_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let col = drawn_width(&text[cur_start..at]);
+    let next_start = at + rel_nl + 1;
+    let next_end = text[next_start..]
+        .find('\n')
+        .map_or(text.len(), |i| next_start + i);
+    Some(next_start + offset_at_width(&text[next_start..next_end], col))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +288,28 @@ mod tests {
         assert_eq!(prefix_within_width("a👍🏽b", 3), "a👍🏽");
         assert_eq!(prefix_within_width("日本語abc", 100), "日本語abc");
         assert_eq!(prefix_within_width("", 3), "");
+    }
+
+    #[test]
+    fn vertical_moves_preserve_display_column_across_cjk_and_empty_lines() {
+        let text = "你好世界\nこんにちは\n\n안녕ab";
+        let line1 = "你好世界\n".len();
+        let line2 = "你好世界\nこんにちは\n".len();
+        let line3 = "你好世界\nこんにちは\n\n".len();
+
+        assert_eq!(move_up(text, 0), None);
+        assert_eq!(move_down(text, text.len()), None);
+
+        // From col 4 on line 1 ("こん"), up lands after "你好" (col 4) on line 0.
+        let at_line1_col4 = line1 + "こん".len();
+        assert_eq!(move_up(text, at_line1_col4), Some("你好".len()));
+
+        // Down from line 1 lands on the empty line 2, then down to line 3 col 0.
+        assert_eq!(move_down(text, at_line1_col4), Some(line2));
+        assert_eq!(move_down(text, line2), Some(line3));
+
+        // Up from line 3 end ("안녕ab", col 6) -> empty line 2 -> line 1 col 0.
+        assert_eq!(move_up(text, text.len()), Some(line2));
+        assert_eq!(move_up(text, line2), Some(line1));
     }
 }

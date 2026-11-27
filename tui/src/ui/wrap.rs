@@ -78,16 +78,69 @@ impl Widget for WrappedParagraph<'_> {
 
 /// Rows of `line` wrapped to `width` display columns.
 ///
-/// Breaks at whitespace, which is dropped at the break; between wide
-/// (CJK) glyphs, each of which is its own break opportunity; and inside a
-/// run of narrow glyphs only when the run alone is wider than `width`.
-/// The line's leading whitespace (indentation) is kept on its first row;
-/// continuation rows start at the next visible glyph. A glyph wider than
-/// `width` is dropped, as nothing can show it. Every row carries the
-/// line's style and alignment, and an empty line is one empty row. A zero
-/// `width` has no rows.
+/// Breaks at explicit line breaks (`\n`, `\r\n`, `\r`); at whitespace, which
+/// is dropped at the break; between wide (CJK) glyphs, each of which is its
+/// own break opportunity; and inside a run of narrow glyphs only when the run
+/// alone is wider than `width`. The line's leading whitespace (indentation) is
+/// kept on its first row; continuation rows start at the next visible glyph.
+/// A glyph wider than `width` is dropped, as nothing can show it. Every row
+/// carries the line's style and alignment, and an empty line is one empty row.
+/// A zero `width` has no rows.
 #[must_use]
 pub fn wrap_line(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    if has_newline(line) {
+        return split_hard_breaks(line)
+            .iter()
+            .flat_map(|sub| wrap_single_line(sub, width))
+            .collect();
+    }
+    wrap_single_line(line, width)
+}
+
+fn has_newline(line: &Line<'_>) -> bool {
+    line.spans
+        .iter()
+        .any(|span| span.content.contains(['\n', '\r']))
+}
+
+fn split_hard_breaks(line: &Line<'_>) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        if !text.contains(['\n', '\r']) {
+            current_spans.push(Span::styled(text.to_string(), span.style));
+            continue;
+        }
+        let mut rest = text;
+        while let Some(pos) = rest.find(['\n', '\r']) {
+            let before = &rest[..pos];
+            if !before.is_empty() {
+                current_spans.push(Span::styled(before.to_string(), span.style));
+            }
+            let mut built = Line::from(std::mem::take(&mut current_spans)).style(line.style);
+            built.alignment = line.alignment;
+            out.push(built);
+            let matched = rest.as_bytes()[pos];
+            rest = &rest[pos + 1..];
+            if matched == b'\r' && rest.starts_with('\n') {
+                rest = &rest[1..];
+            }
+        }
+        if !rest.is_empty() {
+            current_spans.push(Span::styled(rest.to_string(), span.style));
+        }
+    }
+    let mut built = Line::from(current_spans).style(line.style);
+    built.alignment = line.alignment;
+    out.push(built);
+    out
+}
+
+fn wrap_single_line(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width);
     if width == 0 {
         return Vec::new();
@@ -188,8 +241,8 @@ pub fn line_rows(line: &Line<'_>, width: u16) -> usize {
     if width == 0 {
         return 0;
     }
-    // A line that fits never wraps.
-    if line.width() <= usize::from(width) {
+    // A single-line string that fits never wraps.
+    if !has_newline(line) && line.width() <= usize::from(width) {
         return 1;
     }
     wrap_line(line, width).len()
@@ -275,5 +328,32 @@ mod tests {
         assert!(rows.iter().all(|row| row.style == line.style));
         assert_eq!(texts(&wrap_line(&Line::from(""), 10)), [""]);
         assert_eq!(wrap_line(&Line::from("x"), 0).len(), 0);
+    }
+
+    #[test]
+    fn hard_newlines_break_rows_and_preserve_styles() {
+        let styled = Line::from(vec![
+            Span::styled("你好\nworld", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("\n\n안녕\r\n"),
+        ]);
+        let rows = wrap_line(&styled, 20);
+        assert_eq!(texts(&rows), ["你好", "world", "", "안녕", ""]);
+        assert_eq!(line_rows(&styled, 20), 5);
+        assert_eq!(
+            rows[0].spans[0].style,
+            Style::default().add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            rows[1].spans[0].style,
+            Style::default().add_modifier(Modifier::BOLD)
+        );
+
+        let wrapped_cjk = Line::from(Span::raw("你好世界\nこんにちは\n안녕하세요"));
+        let rows = wrap_line(&wrapped_cjk, 6);
+        assert_eq!(
+            texts(&rows),
+            ["你好世", "界", "こんに", "ちは", "안녕하", "세요"]
+        );
+        assert_eq!(line_rows(&wrapped_cjk, 6), 6);
     }
 }
