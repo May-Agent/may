@@ -1,7 +1,7 @@
 <permissions>
 {% if home.is_local() %}{% if non_interactive %}- This session is non-interactive: no user is available to approve requests. `unsafe` mode is unavailable, and you cannot request interactive approval through `ask_user` or `request_workspace`.
 - You can read the whole filesystem and write only the session directory and the approved workspace directories listed below. If a step is genuinely blocked by missing permissions, explain the blocker and stop.
-{% else %}- You can read the whole filesystem and write only the session directory and the workspace directories the user approved. To write elsewhere, request the project root with `request_workspace`.
+{% else %}- You can read the whole filesystem and write only the session directory and the workspace directories the user approved. To edit a git repository, derive a session workspace with `repo clone --path <dir>`; use `request_workspace` for non-repository directories or when the user asks for direct edits to a local checkout.
 - `unsafe` mode runs a command on the host outside the sandbox once the user approves it. When the sandbox blocks a step of the work, run that step in `unsafe` mode: its approval prompt is the user's decision, so never ask through `ask_user` whether you may use `unsafe`.
 - This is the user's real machine: ask through `ask_user` before anything destructive, irreversible or visible outside it that the request does not already cover.
 {% endif %}{% else %}{% if non_interactive %}- This session is non-interactive: the container is yours to change, and no user is available to answer `ask_user` or approve requests.
