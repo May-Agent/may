@@ -60,19 +60,23 @@ runs:
         shared-key: ci-build
         local-crates-io-max-bytes: '1610612736'
     # Cargo ignores CARGO_PROFILE_*_PACKAGE_* env vars, so configure per-package
-    # debug=0, strip="debuginfo", and codegen-units=16 for workspace crates in
-    # $CARGO_HOME/config.toml. Leaving dependencies at default settings preserves
-    # stow's public cache hits, while per-package strip="debuginfo" strips linked
-    # dependency DWARF from the final workspace binaries and test executables
-    # (keeping symbol tables intact for backtraces) and codegen-units=16 trims
-    # per-crate LLVM/link overhead on 3-4 core CI runners.
+    # debug=0 and codegen-units=16 (plus strip="debuginfo" on Linux) for
+    # workspace crates in $CARGO_HOME/config.toml. Leaving dependencies at
+    # default settings preserves stow's public cache hits; Linux ELF links
+    # dependency DWARF into every binary so stripping drops the test archive by
+    # ~80% (keeping symbol tables intact for backtraces), while macOS Mach-O
+    # keeps DWARF unpacked and avoids unnecessary rust-objcopy work.
     - name: Configure workspace package build settings
       shell: bash
       run: |
         cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
         mkdir -p "${cargo_home}"
+        strip_line=""
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          strip_line=$'strip = "debuginfo"\n'
+        fi
         for pkg in may-agent may-agent-core may-client may-command-policy may-config may-container-image may-daemon may-db may-git-forge may-harness may-media may-patch may-protocol may-providers may-repo-search may-tasks may-tool-dist may-tui; do
-          printf '[profile.dev.package.%s]\ndebug = 0\nstrip = "debuginfo"\ncodegen-units = 16\n[profile.test.package.%s]\ndebug = 0\nstrip = "debuginfo"\ncodegen-units = 16\n' "$pkg" "$pkg" >> "${cargo_home}/config.toml"
+          printf '[profile.dev.package.%s]\ndebug = 0\ncodegen-units = 16\n%s[profile.test.package.%s]\ndebug = 0\ncodegen-units = 16\n%s' "$pkg" "$strip_line" "$pkg" "$strip_line" >> "${cargo_home}/config.toml"
         done
     # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
