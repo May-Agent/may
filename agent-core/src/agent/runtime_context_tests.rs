@@ -292,11 +292,11 @@ fn the_pr_landing_rule_is_rendered_only_for_a_session_with_a_clone() {
     };
     let with_clone = build_work(&issues, true, true, false);
     assert!(
-        with_clone.contains("Land code with the `pr` command"),
+        with_clone.contains("Land code for any repository with the `pr` command"),
         "{with_clone}"
     );
     let direct = build_work(&issues, false, true, false);
-    assert!(!direct.contains("Land code with"), "{direct}");
+    assert!(!direct.contains("Land code for any repository"), "{direct}");
     assert!(!direct.contains("source checkout"), "{direct}");
 }
 
@@ -962,4 +962,42 @@ fn fusion_mode_and_plan_mode_reconcile_orthogonally_without_touching_static_pref
     runtime_context.reconcile(&mut context);
     assert!(context.instructions().contains(&tag::PLAN_MODE));
     assert!(!context.instructions().contains(&tag::FUSION_MODE));
+}
+
+#[test]
+fn cross_repo_guidance_routes_git_repositories_to_repo_clone_path() {
+    let permissions = super::build_permissions(&AgentEnvironment::Local, false, Vec::new(), None);
+    assert!(
+        permissions.contains("repo clone --path <dir>"),
+        "permissions must direct git repository edits to repo clone --path:\n{permissions}"
+    );
+    assert!(
+        permissions.contains("non-repository directories"),
+        "permissions must scope request_workspace to non-repo directories or explicit checkout edits:\n{permissions}"
+    );
+
+    let issues = crate::issue::IssueBackendInfo {
+        name: "may",
+        repository: None,
+    };
+    let work = build_work(&issues, true, true, false);
+    assert!(
+        work.contains("repo clone --path <dir>")
+            && work.contains("run `pr` inside that workspace or pass `--repo`"),
+        "work must direct cross-repository edits and PRs to repo clone --path and that workspace's pr:\n{work}"
+    );
+
+    let dir = tempdir().expect("temp dir should be created");
+    let session = super::build_session(
+        &AgentEnvironment::Local,
+        &session_paths(&dir),
+        Some("/tmp/may".to_string()),
+        Some("/tmp/may".to_string()),
+        None,
+        &issues,
+    );
+    assert!(
+        session.contains("repo clone --path <dir>"),
+        "session must mention repo clone --path for another local repository:\n{session}"
+    );
 }

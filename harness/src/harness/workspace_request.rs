@@ -16,12 +16,12 @@ use super::tool_request::{
 
 const DEFAULT_REASON: &str = include_str!("texts/request_workspace_default_reason.txt");
 
-/// Request access to a directory outside the sandbox.
+/// Request direct read/write access to a directory outside the sandbox.
 ///
-/// This command asks for permission to read/write files in the specified
-/// directory. The user will be prompted to approve or deny the request.
-/// Use this when you need to modify files in the user's project directory
-/// or other locations outside your sandbox.
+/// Prompts the user to approve or deny direct write access to `path`.
+/// For git repositories, derive an isolated workspace with `repo clone --path <dir>`
+/// instead; use `request_workspace` for non-repository directories or when the user
+/// explicitly wants direct edits to a local checkout rather than a PR.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RequestWorkspaceArgs {
     /// The directory path to request access to (absolute or relative to cwd).
