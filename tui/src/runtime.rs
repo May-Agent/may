@@ -1,6 +1,7 @@
 use aither_core::llm::model::ReasoningEffort;
 use executor_core::spawn;
 
+pub use crate::ui::chat::TurnEnd;
 use crate::{App, Attachment, PendingMessage};
 use may_client::worker::{AgentHandle, AgentWorker};
 use may_config::config::MayConfig;
@@ -872,14 +873,16 @@ impl RuntimeDeps {
         agent_handle: &mut Option<AgentHandle>,
         title_gen: &mut Option<TitleGenContext>,
         _assistant_response: &AssistantReply,
-        _outcome: may_client::session::RunOutcome,
+        end: TurnEnd,
     ) {
         *agent_handle = None;
         app.flush_pending_reasoning();
         app.finish_processing();
         app.clear_persistent_status();
-        app.chat
-            .fold_turn_work(app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()));
+        app.chat.finish_turn_work(
+            end,
+            app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()),
+        );
 
         // The daemon persisted the turn and names the session; fetch the
         // updated transcript off the UI loop so slow socket reads never stall input.

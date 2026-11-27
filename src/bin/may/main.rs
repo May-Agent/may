@@ -58,9 +58,8 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::client::HoldReason;
-use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{
-    AssistantReply, QueuedRunStart, ResponseCommit, RuntimeDeps, TitleGenContext,
+    AssistantReply, QueuedRunStart, ResponseCommit, RuntimeDeps, TitleGenContext, TurnEnd,
     discard_ephemeral_session,
 };
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
@@ -1282,7 +1281,7 @@ where
                                     &mut agent_handle,
                                     &mut pending_title_gen,
                                     &assistant_response,
-                                    RunOutcome::Completed,
+                                    TurnEnd::Finished,
                                 );
                             }
                         }
@@ -1369,7 +1368,7 @@ where
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
-                                RunOutcome::Completed,
+                                TurnEnd::Finished,
                             );
                         }
                         TuiEvent::LoopStopped(message) => {
@@ -1379,7 +1378,7 @@ where
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
-                                RunOutcome::Cancelled,
+                                TurnEnd::Finished,
                             );
                         }
                         TuiEvent::Error(err) => {
@@ -1389,7 +1388,7 @@ where
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
-                                RunOutcome::Failed,
+                                TurnEnd::Finished,
                             );
                         }
                     }
@@ -1539,18 +1538,14 @@ where
                                 handle.cancel();
                             }
                             app.status = None;
-                            // Clean up loading/streaming state before adding interrupt message
                             app.flush_pending_reasoning();
-                            app.chat.collapse_thinking();
-                            app.chat.end_text();
-                            app.chat.push_text("\n\n[Interrupted]");
-                            app.chat.end_text();
+                            app.chat.interrupt_turn();
                             runtime_deps.finish_agent_task(
                                 app,
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
-                                RunOutcome::Cancelled,
+                                TurnEnd::Interrupted,
                             );
                             dirty = true;
                             urgent_draw = true;
