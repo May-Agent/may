@@ -63,6 +63,9 @@ pub struct SubagentAssembly {
     /// The session's permission handler: a read-only subagent's shell is
     /// given its confined variant.
     pub permissions: crate::terminal_permission_handler::TerminalPermissionHandler,
+    /// Shared hashline `edit`-bypass notice store for writable subagents when
+    /// `[experimental] hashline` is enabled.
+    pub edit_bypass_notices: Option<crate::command_policy::EditBypassNotices>,
 }
 
 /// Dependencies every shared terminal IPC command needs from the host runtime.
@@ -869,6 +872,7 @@ where
         instructions,
         vision_ocr,
         permissions,
+        edit_bypass_notices,
     } = config.subagents;
     let subagent_definitions: std::collections::BTreeMap<
         String,
@@ -953,6 +957,7 @@ where
         vision_ocr,
         registry: registry_slot.clone(),
         timeout_cap: config.timeout_cap.clone(),
+        edit_bypass_notices,
     });
     if !is_sidekick {
         describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
@@ -1139,6 +1144,7 @@ mod tests {
             permissions: crate::terminal_permission_handler::TerminalPermissionHandler::for_agent(
                 None, None, None,
             ),
+            edit_bypass_notices: None,
         }
     }
 

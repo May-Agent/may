@@ -281,8 +281,10 @@ pub struct CheckoutReadTracker {
     pub session_id: String,
 }
 
+mod hashline_bypass;
 mod write_lease;
 
+pub use hashline_bypass::{EditBypassNotices, EditBypassUsage, HashlineEditBypassPolicy};
 pub use write_lease::{WorkspaceWriteLease, WorkspaceWriteLeaseGuard, WorkspaceWriteLeasePolicy};
 
 /// A host command (`grep`, `awk`, or `find`) observed in a managed-bash script,
@@ -360,6 +362,9 @@ pub struct PolicySet {
     pub checkout_reads: Option<CheckoutReadTracker>,
     /// Optional exclusive workspace write lease held while an async Fusion `sidekick` runs.
     pub write_lease: Option<WorkspaceWriteLease>,
+    /// Optional hashline `edit`-bypass notice store; `Some` only when
+    /// `[experimental] hashline` is enabled so there is zero overhead otherwise.
+    pub edit_bypass_notices: Option<EditBypassNotices>,
 }
 
 /// Per-agent epochs invalidating [`UnchangedFileReads`] across a compaction,
@@ -418,6 +423,11 @@ impl PolicySet {
         };
         let builder = if let Some(lease) = self.write_lease {
             builder.policy(WorkspaceWriteLeasePolicy::new(lease))
+        } else {
+            builder
+        };
+        let builder = if let Some(notices) = self.edit_bypass_notices {
+            builder.policy(HashlineEditBypassPolicy::new(notices))
         } else {
             builder
         };

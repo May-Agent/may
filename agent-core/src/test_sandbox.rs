@@ -141,6 +141,7 @@ impl TestTerminal {
                 read_epochs: may_command_policy::FileReadEpochs::default(),
                 checkout_reads: None,
                 write_lease: None,
+                edit_bypass_notices: None,
             },
             slot: may_harness::ipc::ShellSlot::new(),
             ssh_servers: Vec::new(),

@@ -1353,19 +1353,28 @@ pub fn build_subagent_instructions(
     environment: &AgentEnvironment,
     remote_hosts: Vec<SshServerConfig>,
     hashline: bool,
+    prepared_tools: Option<String>,
     secret_names: Vec<&str>,
     network_policy: Option<&CompiledNetworkPolicy>,
     request_parameters: &Parameters,
 ) -> Vec<String> {
-    vec![
+    let mut blocks = vec![
         build_subagent_reporting(),
         build_harness(),
         build_subagent_evidence(),
         build_subagent_environment(environment, remote_hosts),
         build_subagent_terminal(environment, hashline),
-        build_subagent_permissions(environment, secret_names, network_policy),
-        build_subagent_time(request_parameters),
-    ]
+    ];
+    if let Some(prepared_tools) = prepared_tools {
+        blocks.push(prepared_tools);
+    }
+    blocks.push(build_subagent_permissions(
+        environment,
+        secret_names,
+        network_policy,
+    ));
+    blocks.push(build_subagent_time(request_parameters));
+    blocks
 }
 
 /// A planning phase that adds a section.
