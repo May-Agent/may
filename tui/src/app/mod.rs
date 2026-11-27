@@ -418,6 +418,16 @@ pub struct App {
     pub pipelines: Vec<may_client::client::background::WirePipeline>,
     /// Last live terminal-output read from the daemon.
     pub live_output_read_at: Option<std::time::Instant>,
+    /// Prevents overlapping live terminal-output reads when the daemon lags.
+    live_reads_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Last live pipeline-stage output poll against the daemon.
+    pipeline_stage_poll_at: Option<std::time::Instant>,
+    /// Prevents overlapping pipeline-stage output polls across 50 ms ticks.
+    pipeline_stage_poll_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Buffered reasoning chunks awaiting the next throttled flush into `chat`.
+    pending_reasoning: String,
+    /// When streamed reasoning was last flushed into `chat`.
+    reasoning_flushed_at: Option<std::time::Instant>,
     /// The lease of the run in flight, held from its start until the TUI has
     /// persisted its last message.
     pub run_guard: Option<may_client::session::SessionRunGuard>,
@@ -615,6 +625,20 @@ pub struct PendingToolCall {
     /// The canonical `ToolCallStart` landed; later deltas are stale and
     /// must not regress the fully-parsed display.
     pub started: bool,
+    /// Unprojected fragments arrived since the last partial-JSON display update.
+    pub dirty: bool,
+    /// When this call's partial arguments were last parsed and projected.
+    pub last_projected_at: Option<std::time::Instant>,
+}
+
+/// Resets an in-flight `AtomicBool` guard when dropped, even if the async task
+/// exits early or panics.
+struct InFlightReset(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for InFlightReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Length of `buf`'s longest prefix that ends on a UTF-8 boundary —
@@ -637,6 +661,12 @@ pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
 
 /// How often live terminal output is read from the daemon while calls run.
 const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// Minimum cadence between background pipeline-stage output polls.
+const PIPELINE_STAGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+/// Minimum interval between progressive partial-JSON tool-call projections.
+const TOOL_DELTA_PROJECTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Minimum interval between streaming reasoning markdown flushes.
+const REASONING_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Base URL `<tunnel id>` tags of `session` resolve against in the TUI: the
 /// session's tunnels on the daemon's loopback listener. A tunnel is named by
@@ -951,6 +981,13 @@ impl App {
             subagents: Vec::new(),
             pipelines: Vec::new(),
             live_output_read_at: None,
+            live_reads_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pipeline_stage_poll_at: None,
+            pipeline_stage_poll_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            pending_reasoning: String::new(),
+            reasoning_flushed_at: None,
             run_guard: None,
             live_reads: std::collections::HashMap::new(),
             pending_tool_calls: std::collections::HashMap::new(),
@@ -1498,8 +1535,9 @@ impl App {
     }
 
     /// Apply finished file diffs and rewind results to their tool-call
-    /// blocks. Called once per event-loop iteration.
-    pub fn poll_file_diffs(&mut self) {
+    /// blocks. Called once per event-loop iteration; returns whether any
+    /// outcome mutated visible state.
+    pub fn poll_file_diffs(&mut self) -> bool {
         while let Ok(specs) = self.clone_roots.1.try_recv() {
             if let Some(handle) = &self.file_diffs {
                 for spec in specs {
@@ -1509,8 +1547,11 @@ impl App {
         }
         let outcomes = match &self.file_diffs {
             Some(handle) => handle.drain(),
-            None => return,
+            None => return false,
         };
+        if outcomes.is_empty() {
+            return false;
+        }
         let mut refresh_status = false;
         for outcome in outcomes {
             match outcome {
@@ -1541,6 +1582,7 @@ impl App {
             self.request_clone_roots(handle.session_id());
             handle.request_status();
         }
+        true
     }
 
     /// Show the result of a completed code rewind in the chat stream.
@@ -2013,12 +2055,19 @@ impl App {
             }
 
             // Reads cross the daemon's socket; a few a second keep the
-            // output live.
+            // output live, guarded against overlapping requests under load.
             let read_due = self
                 .live_output_read_at
                 .is_none_or(|at| at.elapsed() >= LIVE_OUTPUT_READ_INTERVAL);
-            if !self.live_reads.is_empty() && read_due {
+            if !self.live_reads.is_empty()
+                && read_due
+                && self
+                    .live_reads_in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
                 self.live_output_read_at = Some(std::time::Instant::now());
+                let guard = InFlightReset(std::sync::Arc::clone(&self.live_reads_in_flight));
                 let tx = self.event_tx.clone();
                 let reads: Vec<(String, u32, usize)> = self
                     .live_reads
@@ -2026,18 +2075,27 @@ impl App {
                     .map(|(call_id, read)| (call_id.clone(), read.pid, read.cursor))
                     .collect();
                 spawn(async move {
+                    let _guard = guard;
                     let mut deltas = Vec::with_capacity(reads.len());
                     for (call_id, pid, cursor) in reads {
                         if let Ok(delta) = background.read(pid, cursor).await {
-                            deltas.push(super::event::TerminalOutputDelta {
-                                call_id,
-                                cursor: delta.cursor,
-                                bytes: delta.bytes,
-                                status: delta.status.into(),
-                            });
+                            let status: aither_sandbox::JobStatus = delta.status.into();
+                            if !delta.bytes.is_empty()
+                                || delta.cursor != cursor
+                                || !matches!(status, aither_sandbox::JobStatus::Running)
+                            {
+                                deltas.push(super::event::TerminalOutputDelta {
+                                    call_id,
+                                    cursor: delta.cursor,
+                                    bytes: delta.bytes,
+                                    status,
+                                });
+                            }
                         }
                     }
-                    let _ = tx.send(AppEvent::TerminalOutputs(deltas)).await;
+                    if !deltas.is_empty() {
+                        let _ = tx.send(AppEvent::TerminalOutputs(deltas)).await;
+                    }
                 })
                 .detach();
             }
@@ -2059,8 +2117,18 @@ impl App {
         self.poll_pipeline_stages();
     }
 
-    /// Poll incremental UI-colored output for active pipeline stages.
-    pub fn poll_pipeline_stages(&self) {
+    /// Poll incremental UI-colored output for active pipeline stages, throttled
+    /// and guarded so overlapping unix-socket GETs never pile up on 50 ms ticks.
+    pub fn poll_pipeline_stages(&mut self) {
+        if self.pipeline_stage_poll_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+        if self
+            .pipeline_stage_poll_at
+            .is_some_and(|at| at.elapsed() < PIPELINE_STAGE_POLL_INTERVAL)
+        {
+            return;
+        }
         let Some(background) = self.background.clone() else {
             return;
         };
@@ -2068,8 +2136,18 @@ impl App {
         if reads.is_empty() {
             return;
         }
+        if self
+            .pipeline_stage_poll_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.pipeline_stage_poll_at = Some(std::time::Instant::now());
+        let guard = InFlightReset(std::sync::Arc::clone(&self.pipeline_stage_poll_in_flight));
         let tx = self.event_tx.clone();
         spawn(async move {
+            let _guard = guard;
             let mut deltas = Vec::with_capacity(reads.len());
             for req in reads {
                 if let Ok(delta) = background
@@ -2509,11 +2587,62 @@ impl App {
         }
     }
 
+    /// Resolve persisted attachments for every user message in `messages`
+    /// concurrently, suitable for calling off the UI event loop.
+    async fn restore_history_attachments(
+        daemon: Option<may_client::client::DaemonClient>,
+        messages: &[ChatMessage],
+    ) -> Vec<(usize, Vec<Attachment>)> {
+        let mut out = Vec::new();
+        for (history_index, msg) in messages.iter().enumerate() {
+            if msg.role != MessageRole::User || msg.attachments.is_empty() {
+                continue;
+            }
+            let restored = futures_util::future::join_all(msg.attachments.iter().map(|att| {
+                let daemon = daemon.clone();
+                async move {
+                    super::runtime::tui_attachment_from_persisted(daemon.as_ref(), att.clone())
+                        .await
+                        .map_err(|error| (att.name.clone(), error))
+                }
+            }))
+            .await;
+            let mut attachments = Vec::with_capacity(restored.len());
+            for result in restored {
+                match result {
+                    Ok(attachment) => attachments.push(attachment),
+                    Err((name, error)) => {
+                        tracing::warn!("failed to restore attachment {name}: {error}");
+                        attachments.push(Attachment::FileReference {
+                            path: PathBuf::from(&name),
+                        });
+                    }
+                }
+            }
+            out.push((history_index, attachments));
+        }
+        out
+    }
+
     /// Rebuilds the chat view from `messages` the way the live turns built
     /// it: tool calls replay from their stored lifecycle rows, and every
     /// finished turn folds into its "Worked for" row. The last turn folds
     /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
+        let daemon = self.session_manager.daemon_handle().ok();
+        let restored = Self::restore_history_attachments(daemon, messages).await;
+        self.render_history_with_attachments(messages, restored);
+    }
+
+    /// Synchronous counterpart to [`Self::render_history`] taking already
+    /// restored user-message attachments.
+    fn render_history_with_attachments(
+        &mut self,
+        messages: &[ChatMessage],
+        restored: Vec<(usize, Vec<Attachment>)>,
+    ) {
+        let mut attachments_by_index: std::collections::HashMap<usize, Vec<Attachment>> =
+            restored.into_iter().collect();
         self.chat = ChatStream::successor_of(&self.chat).with_tunnel_base(tunnel_base(
             &self.config,
             self.daemon_addr.as_deref(),
@@ -2529,32 +2658,9 @@ impl App {
             turn.note(msg);
             match msg.role {
                 MessageRole::User => {
-                    let daemon = self.session_manager.daemon_handle().ok();
-                    let restored =
-                        futures_util::future::join_all(msg.attachments.iter().map(|att| {
-                            let daemon = daemon.clone();
-                            async move {
-                                super::runtime::tui_attachment_from_persisted(
-                                    daemon.as_ref(),
-                                    att.clone(),
-                                )
-                                .await
-                                .map_err(|error| (att.name.clone(), error))
-                            }
-                        }))
-                        .await;
-                    let mut attachments = Vec::with_capacity(restored.len());
-                    for result in restored {
-                        match result {
-                            Ok(attachment) => attachments.push(attachment),
-                            Err((name, error)) => {
-                                tracing::warn!("failed to restore attachment {name}: {error}");
-                                attachments.push(Attachment::FileReference {
-                                    path: PathBuf::from(&name),
-                                });
-                            }
-                        }
-                    }
+                    let attachments = attachments_by_index
+                        .remove(&history_index)
+                        .unwrap_or_default();
                     self.chat
                         .push_user(&msg.content, attachments, history_index);
                 }
@@ -2638,6 +2744,75 @@ impl App {
         self.chat.fold_turn_work(turn.seconds());
     }
 
+    /// Re-reads the current session from the daemon off the UI event loop and
+    /// delivers [`AppEvent::HistoryReloaded`] to rebuild the chat view while
+    /// keeping what the user is typing.
+    pub fn spawn_reload_chat(&self) {
+        let Some(session_id) = self
+            .session_manager
+            .current()
+            .map(|session| session.id.as_str().to_string())
+        else {
+            return;
+        };
+        let Ok(daemon) = self.session_manager.daemon_handle() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            match daemon.get_transcript(&session_id).await {
+                Ok(transcript) => {
+                    let messages =
+                        may_client::session::chat_messages_from_transcript(&transcript.entries);
+                    let attachments =
+                        Self::restore_history_attachments(Some(daemon), &messages).await;
+                    let _ = tx
+                        .send(AppEvent::HistoryReloaded {
+                            session_id,
+                            messages,
+                            attachments,
+                        })
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to reload the session history");
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Apply a background history sync (after a finished turn) when the
+    /// session is still active.
+    pub(crate) fn apply_synced_history(&mut self, session_id: &str, messages: Vec<ChatMessage>) {
+        if let Some(session) = self.session_manager.current_mut()
+            && session.id.as_str() == session_id
+        {
+            *session.history.messages_mut() = messages;
+            self.chat
+                .sync_user_history_indices(session.history.messages());
+        }
+    }
+
+    /// Apply a background full history reload when the session is still active.
+    pub(crate) fn apply_reloaded_history(
+        &mut self,
+        session_id: &str,
+        messages: Vec<ChatMessage>,
+        attachments: Vec<(usize, Vec<Attachment>)>,
+    ) {
+        let Some(session) = self.session_manager.current_mut() else {
+            return;
+        };
+        if session.id.as_str() != session_id {
+            return;
+        }
+        *session.history.messages_mut() = messages;
+        let messages = session.history.messages().to_vec();
+        self.render_history_with_attachments(&messages, attachments);
+        self.scroll = usize::MAX;
+    }
+
     /// Re-reads the current session from the database and rebuilds the chat
     /// view, keeping what the user is typing: a turn another client or the
     /// daemon's queue ran wrote rows this view has not seen.
@@ -2690,6 +2865,9 @@ impl App {
         self.background = None;
         self.subagents.clear();
         self.live_output_read_at = None;
+        self.pipeline_stage_poll_at = None;
+        self.pending_reasoning.clear();
+        self.reasoning_flushed_at = None;
         self.live_reads.clear();
         self.pending_tool_calls.clear();
         self.hosted_tool_calls.clear();
@@ -2709,7 +2887,7 @@ impl App {
         );
         self.image_manager = Some(ImageManager::new(&session_dir));
         self.text_manager = Some(TextManager::new(&session_dir));
-        self.refresh_todos().await;
+        self.spawn_refresh_todos();
 
         // Reset usage tracking for new session
         self.usage = None;
@@ -4176,9 +4354,72 @@ impl App {
             .max(1)
     }
 
+    /// Apply a coalesced mouse-wheel scroll burst (`delta < 0` scrolls up,
+    /// `delta > 0` scrolls down; each step moves 3 lines).
+    #[allow(clippy::unnecessary_wraps)]
+    pub(super) fn handle_mouse_scroll(
+        &mut self,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+        delta: i32,
+    ) -> AppResult<Option<SendAction>> {
+        const SCROLL_STEP_LINES: usize = 3;
+
+        self.hover = None;
+        self.pointer_modifiers = KeyModifiers::NONE;
+        if delta == 0 || self.new_year.animating() || !matches!(self.mode, AppMode::Chat) {
+            return Ok(None);
+        }
+        let lines = usize::try_from(delta.unsigned_abs())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(SCROLL_STEP_LINES);
+
+        let over_sidebar = self
+            .sidebar
+            .area
+            .contains(ratatui::layout::Position::new(column, row));
+        if over_sidebar && self.sidebar.scrollable() {
+            if delta < 0 {
+                self.sidebar.scroll_up(lines);
+            } else {
+                self.sidebar.scroll_down(lines);
+            }
+            return Ok(None);
+        }
+
+        let in_chat = self.chat_area.is_empty()
+            || self
+                .chat_area
+                .contains(ratatui::layout::Position::new(column, row));
+        self.hover = in_chat.then_some((column, row));
+        self.pointer_modifiers = if in_chat {
+            super::ui::links::open_modifiers(modifiers)
+        } else {
+            KeyModifiers::NONE
+        };
+        if delta < 0 {
+            self.scroll_chat_up(lines);
+        } else {
+            self.scroll_chat_down(lines);
+        }
+        let _ = self.refresh_host_open_modifiers();
+        Ok(None)
+    }
+
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
-        const SCROLL_STEP_LINES: usize = 3;
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -1
+            } else {
+                1
+            };
+            return self.handle_mouse_scroll(mouse.column, mouse.row, mouse.modifiers, delta);
+        }
 
         self.hover = None;
         self.pointer_modifiers = KeyModifiers::NONE;
@@ -4207,48 +4448,27 @@ impl App {
             _ => return Ok(None),
         }
 
-        // Over the sidebar the wheel scrolls it while it overflows, and a
-        // click folds or expands the row under the pointer.
+        // Over the sidebar, a click folds or expands the row under the pointer.
         let over_sidebar = self
             .sidebar
             .area
             .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
-        if over_sidebar {
-            match mouse.kind {
-                MouseEventKind::ScrollUp if self.sidebar.scrollable() => {
-                    self.sidebar.scroll_up(SCROLL_STEP_LINES);
-                    return Ok(None);
-                }
-                MouseEventKind::ScrollDown if self.sidebar.scrollable() => {
-                    self.sidebar.scroll_down(SCROLL_STEP_LINES);
-                    return Ok(None);
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    if let Some(action) = self.sidebar.click_action(mouse.row) {
-                        self.trigger_sidebar_pr_action(action);
-                    }
-                    return Ok(None);
-                }
-                _ => {}
+        if over_sidebar && mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+            if let Some(action) = self.sidebar.click_action(mouse.row) {
+                self.trigger_sidebar_pr_action(action);
             }
+            return Ok(None);
         }
 
         // Clicks and drags outside the chat column (the sidebar) select
-        // nothing; the wheel scrolls the chat anywhere, and an active drag
-        // continues clamping against the chat column edges.
+        // nothing; an active drag continues clamping against the chat column edges.
         let dragging_selection =
             self.selection.is_some() && mouse.kind == MouseEventKind::Drag(MouseButton::Left);
         let in_chat = self.chat_area.is_empty()
             || self
                 .chat_area
                 .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
-        if !in_chat
-            && !dragging_selection
-            && !matches!(
-                mouse.kind,
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            )
-        {
+        if !in_chat && !dragging_selection {
             return Ok(None);
         }
         self.hover = in_chat.then_some((mouse.column, mouse.row));
@@ -4257,11 +4477,12 @@ impl App {
         } else {
             KeyModifiers::NONE
         };
-        let _ = self.refresh_host_open_modifiers();
 
         // Ctrl-click or Cmd-click (with Cmd tracked via host or Kitty modifier
         // state) opens the link under the pointer instead of starting a selection.
+        // Only query live host modifiers when the pointer actually sits on a link.
         let hit = self.link_at_screen(mouse.column, mouse.row);
+        let _ = self.refresh_host_open_modifiers_for(hit.is_some());
         let mut open_mouse = mouse;
         open_mouse.modifiers |= self.held_modifiers.as_key_modifiers() | self.host_open_modifiers;
         if super::ui::links::dispatch_click(self.link_opener.as_ref(), &open_mouse, hit.as_ref()) {
@@ -4271,8 +4492,6 @@ impl App {
         }
 
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_chat_up(SCROLL_STEP_LINES),
-            MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 let point = self.mouse_to_selection_point(mouse);
                 if let Some(p) = point
@@ -4397,10 +4616,16 @@ impl App {
         self.link_at_screen(col, row)
     }
 
-    /// Refresh cached live host open modifiers while hovering in a focused
-    /// terminal; returns whether the state changed so the loop can redraw.
+    /// Refresh cached live host open modifiers while hovering a link in a
+    /// focused terminal; returns whether the state changed so the loop can
+    /// redraw. Skips OS modifier queries when the pointer is not over a link.
     pub fn refresh_host_open_modifiers(&mut self) -> bool {
-        let next = if self.terminal_focused && self.hover.is_some() {
+        let hovering_link = self.terminal_focused && self.hovered_link().is_some();
+        self.refresh_host_open_modifiers_for(hovering_link)
+    }
+
+    fn refresh_host_open_modifiers_for(&mut self, hovering_link: bool) -> bool {
+        let next = if self.terminal_focused && hovering_link {
             super::ui::links::open_modifiers(self.host_modifiers.open_modifiers())
         } else {
             KeyModifiers::NONE
@@ -5260,7 +5485,7 @@ impl App {
     /// user home shown as `~` (component-wise, so `~/foo2` is not mistaken
     /// for home).
     pub fn cwd_label(&self) -> String {
-        dirs::home_dir()
+        crate::home_dir()
             .and_then(|home| {
                 self.cwd.strip_prefix(home).ok().map(|rest| {
                     if rest.as_os_str().is_empty() {
@@ -5273,10 +5498,10 @@ impl App {
             .unwrap_or_else(|| self.cwd.display().to_string())
     }
 
-    /// Re-read the session's canonical `tasks.md` and refresh the todo
-    /// block. `async_fs` keeps the filesystem IO off the UI thread. The
-    /// sidebar's task tree is refetched from the daemon alongside.
-    async fn refresh_todos(&mut self) {
+    /// Re-read the session's canonical `tasks.md` off the UI loop and send
+    /// [`AppEvent::TodosLoaded`] to update the inline todo block. The sidebar's
+    /// task tree and PR list refresh from the daemon alongside.
+    fn spawn_refresh_todos(&mut self) {
         self.request_sidebar_tasks();
         self.request_sidebar_prs();
         let Some(session) = self
@@ -5286,20 +5511,25 @@ impl App {
         else {
             return;
         };
+        let session_id = session.id.as_str().to_string();
         let paths = self
             .session_manager
             .store()
             .session_paths(session.id.as_str(), session.profile_id.as_deref());
-        match paths.tasks_content().await {
-            Ok(content) => {
-                self.chat.set_todos(may_protocol::task_rows::task_rows(
-                    content.as_deref().unwrap_or_default(),
-                ));
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            match paths.tasks_content().await {
+                Ok(content) => {
+                    let rows =
+                        may_protocol::task_rows::task_rows(content.as_deref().unwrap_or_default());
+                    let _ = tx.send(AppEvent::TodosLoaded { session_id, rows }).await;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to read session tasks.md");
+                }
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to read session tasks.md");
-            }
-        }
+        })
+        .detach();
     }
 
     /// Fetch the current session's PRs for the sidebar from the daemon
@@ -5600,16 +5830,73 @@ impl App {
         }
     }
 
+    /// Flush any buffered streaming reasoning chunks into the chat stream so
+    /// reasoning text is never lost across ticks or phase transitions.
+    pub fn flush_pending_reasoning(&mut self) {
+        if self.pending_reasoning.is_empty() {
+            return;
+        }
+        let buffered = std::mem::take(&mut self.pending_reasoning);
+        self.chat.push_thinking(&buffered);
+        self.reasoning_flushed_at = Some(std::time::Instant::now());
+        if let Some(start) = self.thinking_start {
+            self.chat.update_thinking(start.elapsed().as_secs_f64());
+        }
+    }
+
+    /// Flush any pending streamed reasoning and stamp the finished duration.
+    pub fn finish_thinking(&mut self, seconds: f64) {
+        self.flush_pending_reasoning();
+        self.reasoning_flushed_at = None;
+        self.chat.finish_thinking(seconds);
+    }
+
+    /// Project any dirty streaming tool-call argument buffers whose throttle
+    /// interval has elapsed, keeping progressive display updates capped at
+    /// `TOOL_DELTA_PROJECTION_INTERVAL`.
+    pub fn flush_pending_tool_deltas(&mut self) {
+        let now = std::time::Instant::now();
+        let mut updates = Vec::new();
+        for (id, pending) in &mut self.pending_tool_calls {
+            if pending.started || !pending.dirty || pending.name.is_empty() {
+                continue;
+            }
+            if pending.last_projected_at.is_some_and(|at| {
+                now.saturating_duration_since(at) < TOOL_DELTA_PROJECTION_INTERVAL
+            }) {
+                continue;
+            }
+            pending.dirty = false;
+            pending.last_projected_at = Some(now);
+            updates.push((
+                id.clone(),
+                parse_tool_start_partial(&pending.name, &pending.arguments),
+            ));
+        }
+        if !updates.is_empty() {
+            self.flush_pending_reasoning();
+            self.chat.collapse_thinking();
+            self.chat.end_text();
+            self.thinking_start = None;
+            for (id, kind) in updates {
+                let display = self.tool_start_display(kind);
+                self.chat.upsert_tool_display(id, display);
+            }
+        }
+    }
+
     /// The model response in flight is being sent again: drop what it
     /// streamed, which the replacement does not continue.
     pub fn retract_response(&mut self) {
+        self.pending_reasoning.clear();
+        self.reasoning_flushed_at = None;
         self.chat.retract_response();
         self.pending_tool_calls.retain(|_, pending| pending.started);
         self.thinking_start = None;
     }
 
     /// Handle an agent event. Returns true if stream ended.
-    pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
+    pub fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
             // A subagent's events ride its parent's stream; its own views
             // show them.
@@ -5622,8 +5909,10 @@ impl App {
                         ..
                     } => {
                         self.activity_phase = crate::ui::chat::ActivityPhase::Working;
+                        self.flush_pending_reasoning();
                         self.chat.collapse_thinking();
                         self.thinking_start = None;
+                        self.reasoning_flushed_at = None;
                         self.decode_meter.note_output(chunk.len());
                         self.chat.push_text(&chunk);
                         self.input_visible = true;
@@ -5638,10 +5927,12 @@ impl App {
                         if self.thinking_start.is_none() {
                             self.thinking_start = Some(std::time::Instant::now());
                         }
-                        self.chat.push_thinking(&chunk);
-                        // Update thinking time
-                        if let Some(start) = self.thinking_start {
-                            self.chat.update_thinking(start.elapsed().as_secs_f64());
+                        self.pending_reasoning.push_str(&chunk);
+                        let flush_due = self
+                            .reasoning_flushed_at
+                            .is_none_or(|at| at.elapsed() >= REASONING_FLUSH_INTERVAL);
+                        if flush_due {
+                            self.flush_pending_reasoning();
                         }
                     }
                     AgentEvent::ToolCallDelta {
@@ -5653,23 +5944,30 @@ impl App {
                         let id = call.as_str().to_owned();
                         self.activity_phase = crate::ui::chat::ActivityPhase::Working;
                         self.decode_meter.note_output(arguments_fragment.len());
+                        let now = std::time::Instant::now();
                         let kind = {
                             let pending = self.pending_tool_calls.entry(id.clone()).or_default();
                             if !name.is_empty() {
                                 pending.name.clone_from(&name);
                             }
                             pending.arguments.push_str(&arguments_fragment);
-                            if pending.started || pending.name.is_empty() {
+                            pending.dirty = true;
+                            let due = pending.last_projected_at.is_none_or(|at| {
+                                now.saturating_duration_since(at) >= TOOL_DELTA_PROJECTION_INTERVAL
+                            });
+                            if pending.started || pending.name.is_empty() || !due {
                                 None
                             } else {
+                                pending.dirty = false;
+                                pending.last_projected_at = Some(now);
                                 Some(parse_tool_start_partial(&pending.name, &pending.arguments))
                             }
                         };
                         if let Some(kind) = kind {
                             // Materialize the call the moment its name is
-                            // known and grow its display as arguments
-                            // stream in; the canonical start re-parses
-                            // and replaces it below.
+                            // known and throttle progressive argument updates;
+                            // the canonical start re-parses and replaces it.
+                            self.flush_pending_reasoning();
                             self.chat.collapse_thinking();
                             self.chat.end_text();
                             self.thinking_start = None;
@@ -5690,6 +5988,7 @@ impl App {
                             .as_str()
                             .map_or_else(|| arguments.to_string(), str::to_owned);
                         self.activity_phase = crate::ui::chat::ActivityPhase::Working;
+                        self.flush_pending_reasoning();
                         self.chat.collapse_thinking();
                         self.chat.end_text();
                         self.thinking_start = None;
@@ -5707,6 +6006,7 @@ impl App {
                         let id = call.as_str().to_owned();
                         let arguments = arguments.to_string();
                         self.activity_phase = crate::ui::chat::ActivityPhase::Working;
+                        self.flush_pending_reasoning();
                         self.chat.collapse_thinking();
                         self.chat.end_text();
                         self.thinking_start = None;
@@ -5721,6 +6021,7 @@ impl App {
                         self.decode_meter.note_boundary();
                         if let Some(pending) = self.pending_tool_calls.get_mut(&id) {
                             pending.started = true;
+                            pending.dirty = false;
                         }
                         self.show_tool_start(id, parse_tool_start(&name, &arguments));
                     }
@@ -5750,7 +6051,7 @@ impl App {
                             self.live_reads.remove(&id);
                             self.pending_tool_calls.remove(&id);
                             self.request_file_diff(&id);
-                            self.refresh_todos().await;
+                            self.spawn_refresh_todos();
                         }
                     }
                     // A reply that ends without tool calls may be followed
@@ -5758,6 +6059,7 @@ impl App {
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
                     AgentEvent::TurnEnded { tool_calls, .. } => {
+                        self.flush_pending_reasoning();
                         if tool_calls == 0 {
                             self.chat.end_text();
                             self.decode_meter.note_boundary();
@@ -5772,6 +6074,7 @@ impl App {
                     AgentEvent::RunEnded { .. } => {
                         // Text was already streamed as block deltas; just
                         // finalize the message.
+                        self.flush_pending_reasoning();
                         self.chat.collapse_thinking();
                         self.chat.finish_running_calls();
                         self.chat.end_text();
@@ -5780,7 +6083,7 @@ impl App {
                         self.input_visible = true;
                         // The turn may have edited tasks.md without a tool
                         // call ending after the edit (or in a foreign turn).
-                        self.refresh_todos().await;
+                        self.spawn_refresh_todos();
                         // Signal that processing is complete
                         return true;
                     }
@@ -5808,6 +6111,7 @@ impl App {
                 tracing::error!("Agent error: {}", e);
                 self.decode_meter.note_boundary();
                 self.pending_tool_calls.clear();
+                self.flush_pending_reasoning();
                 // Display error to user
                 self.chat.collapse_thinking();
                 self.chat.finish_running_calls();
@@ -7498,8 +7802,8 @@ mod tests {
             }))
             .expect("a timed event"))
         };
-        app.handle_agent_event(usage(40_000)).await;
-        app.handle_agent_event(usage(45_000)).await;
+        app.handle_agent_event(usage(40_000));
+        app.handle_agent_event(usage(45_000));
         assert_eq!(
             app.usage.and_then(|u| u.prompt_tokens),
             Some(45_000),
@@ -9386,5 +9690,49 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), omega_x, row))
             .expect("click2 down");
         assert_eq!(app.selected_text().as_deref(), Some("omega"));
+    }
+
+    #[tokio::test]
+    async fn refresh_host_open_modifiers_skips_os_query_when_not_hovering_a_link() {
+        use super::HostModifierSource;
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct CountingHostModifiers(AtomicUsize);
+        impl HostModifierSource for CountingHostModifiers {
+            fn open_modifiers(&self) -> KeyModifiers {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                KeyModifiers::SUPER
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let host = std::sync::Arc::new(CountingHostModifiers::default());
+        app.host_modifiers = host.clone();
+        app.chat.push_text("plain text without links");
+        app.chat.end_text();
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("term");
+        let rows = draw_rows(&mut terminal, &mut app);
+        let y = rows
+            .iter()
+            .position(|r| r.contains("plain text"))
+            .expect("text row");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 4,
+            row: u16::try_from(y).expect("y"),
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("hover");
+        assert!(!app.refresh_host_open_modifiers());
+        assert_eq!(
+            host.0.load(Ordering::Relaxed),
+            0,
+            "must not query OS modifier flags when pointer is not over a link"
+        );
     }
 }

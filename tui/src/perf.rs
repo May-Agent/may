@@ -7,6 +7,7 @@
 //! (document size, scroll position, per-phase timings, event backlog) to
 //! reproduce a stall from `~/.may/logs/may.log` alone.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Default busy-time threshold for a jank report, in milliseconds.
@@ -92,17 +93,20 @@ impl LoopPhases {
 }
 
 /// Jank-report threshold from `MAY_JANK_MS`; defaults to
-/// [`DEFAULT_JANK_THRESHOLD_MS`]. `0` disables reporting. The TUI reads it
-/// once at startup and passes it to [`report`].
+/// [`DEFAULT_JANK_THRESHOLD_MS`]. `0` disables reporting. Cached once per
+/// process so event-loop iterations never re-read the environment.
 #[must_use]
 pub fn jank_threshold() -> Duration {
-    std::env::var("MAY_JANK_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map_or_else(
-            || Duration::from_millis(DEFAULT_JANK_THRESHOLD_MS),
-            Duration::from_millis,
-        )
+    static THRESHOLD: OnceLock<Duration> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("MAY_JANK_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or_else(
+                || Duration::from_millis(DEFAULT_JANK_THRESHOLD_MS),
+                Duration::from_millis,
+            )
+    })
 }
 
 fn millis(d: Duration) -> u64 {

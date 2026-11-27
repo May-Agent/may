@@ -865,10 +865,9 @@ impl RuntimeDeps {
         })
     }
 
-    /// Settle the app after a run finishes: persist the assistant message, save
-    /// the session, finish the run (which settles the session's runtime state
-    /// and releases its lease), and kick off title generation.
-    pub async fn finish_agent_task(
+    /// Settle the app after a run finishes: fold the finished turn's work and
+    /// kick off a non-blocking history sync off the UI event loop.
+    pub fn finish_agent_task(
         &self,
         app: &mut App,
         agent_handle: &mut Option<AgentHandle>,
@@ -876,11 +875,8 @@ impl RuntimeDeps {
         _assistant_response: &AssistantReply,
         end: TurnEnd,
     ) {
-        let _session_id = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone());
         *agent_handle = None;
+        app.flush_pending_reasoning();
         app.finish_processing();
         app.clear_persistent_status();
         app.chat.finish_turn_work(
@@ -888,12 +884,33 @@ impl RuntimeDeps {
             app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()),
         );
 
-        // The daemon persisted the turn and names the session.
-        if let Err(error) = app.session_manager.refresh_history().await {
-            tracing::warn!(%error, "failed to reload the session history");
-        } else if let Some(session) = app.session_manager.current() {
-            app.chat
-                .sync_user_history_indices(session.history.messages());
+        // The daemon persisted the turn and names the session; fetch the
+        // updated transcript off the UI loop so slow socket reads never stall input.
+        if let (Ok(daemon), Some(session_id)) = (
+            app.session_manager.daemon_handle(),
+            app.session_manager
+                .current()
+                .map(|session| session.id.as_str().to_string()),
+        ) {
+            let tx = app.event_tx.clone();
+            executor_core::spawn(async move {
+                match daemon.get_transcript(&session_id).await {
+                    Ok(transcript) => {
+                        let messages =
+                            may_client::session::chat_messages_from_transcript(&transcript.entries);
+                        let _ = tx
+                            .send(crate::event::AppEvent::HistorySynced {
+                                session_id,
+                                messages,
+                            })
+                            .await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to reload the session history");
+                    }
+                }
+            })
+            .detach();
         }
         title_gen.take();
     }

@@ -1,13 +1,11 @@
 //! Event handling for the TUI.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
-use blocking::unblock;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEvent,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseEvent, MouseEventKind,
 };
-use executor_core::spawn;
 
 use may_client::session::import::ForeignSessionSummary;
 use may_client::skill::SkillInfo;
@@ -85,6 +83,18 @@ pub enum AppEvent {
     Paste(String),
     /// Mouse event (for wheel scrolling in alternate screen)
     Mouse(MouseEvent),
+    /// Coalesced mouse-wheel scroll burst: net scroll steps (`< 0` up, `> 0` down)
+    /// anchored at the latest pointer cell and modifiers.
+    MouseScroll {
+        /// Pointer column (0-indexed screen cell).
+        column: u16,
+        /// Pointer row (0-indexed screen cell).
+        row: u16,
+        /// Key modifiers reported on the latest scroll event.
+        modifiers: KeyModifiers,
+        /// Net scroll steps: negative scrolls up, positive scrolls down.
+        delta: i32,
+    },
 
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
@@ -374,6 +384,31 @@ pub enum AppEvent {
     /// `/bug` snapshot dump finished off the UI thread.
     BugSnapshotWritten(Result<std::path::PathBuf, String>),
 
+    /// Session `tasks.md` parsed off the UI thread for the inline todo block.
+    TodosLoaded {
+        /// Session the tasks belong to.
+        session_id: String,
+        /// Parsed task rows.
+        rows: Vec<may_protocol::task_rows::TaskRow>,
+    },
+    /// Session history refreshed off the UI thread after a finished turn so
+    /// in-memory history indices align with daemon-persisted rows.
+    HistorySynced {
+        /// Session the history belongs to.
+        session_id: String,
+        /// Refreshed persisted messages.
+        messages: Vec<may_protocol::session_messages::ChatMessage>,
+    },
+    /// Full session history and restored user attachments loaded off the UI
+    /// thread to rebuild the chat stream (`ReloadHistory`).
+    HistoryReloaded {
+        /// Session the history belongs to.
+        session_id: String,
+        /// Refreshed persisted messages.
+        messages: Vec<may_protocol::session_messages::ChatMessage>,
+        /// Restored attachments per user-message index in `messages`.
+        attachments: Vec<(usize, Vec<super::queue::Attachment>)>,
+    },
     /// Opening the session sandbox directory failed.
     SandboxOpenFailed(String),
 }
@@ -391,6 +426,7 @@ impl AppEvent {
             Self::Resize(..) => "resize",
             Self::Paste(_) => "paste",
             Self::Mouse(_) => "mouse",
+            Self::MouseScroll { .. } => "mouse_scroll",
             Self::SessionsLoaded(_) => "sessions_loaded",
             Self::AcpAgentsLoaded(_) => "acp_agents_loaded",
             Self::BotsLoaded(_) => "bots_loaded",
@@ -451,6 +487,9 @@ impl AppEvent {
             Self::FileDiffsPrepared { .. } => "file_diffs_prepared",
             Self::PermissionGateLoaded(_) => "permission_gate_loaded",
             Self::BugSnapshotWritten(_) => "bug_snapshot_written",
+            Self::TodosLoaded { .. } => "todos_loaded",
+            Self::HistorySynced { .. } => "history_synced",
+            Self::HistoryReloaded { .. } => "history_reloaded",
             Self::SandboxOpenFailed(_) => "sandbox_open_failed",
         }
     }
@@ -519,7 +558,160 @@ fn map_terminal_event(evt: Event) -> Option<AppEvent> {
     }
 }
 
-/// Event handler that polls terminal events.
+/// Heartbeat tick interval for animations, notice expiry, and live polling.
+const TICK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Maximum ready crossterm events drained per burst on the input thread before
+/// coalescing and forwarding to the main loop.
+const SOURCE_DRAIN_LIMIT: usize = 256;
+
+/// Promote the calling thread's OS scheduling priority on macOS so interactive
+/// TUI input and rendering stay ahead of background CPU-bound builds.
+#[cfg(target_os = "macos")]
+pub fn promote_thread_qos() {
+    // SAFETY: `pthread_set_qos_class_self_np` only adjusts the calling
+    // thread's QoS class; `QOS_CLASS_USER_INTERACTIVE` with relative priority
+    // `0` is a documented valid invocation.
+    unsafe {
+        let _ =
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+/// Promote the calling thread's OS scheduling priority on macOS so interactive
+/// TUI input and rendering stay ahead of background CPU-bound builds.
+#[cfg(not(target_os = "macos"))]
+pub const fn promote_thread_qos() {}
+
+#[derive(Clone, Copy)]
+struct PendingScroll {
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+    delta: i32,
+}
+
+fn flush_scroll(out: &mut Vec<AppEvent>, pending: &mut Option<PendingScroll>) {
+    if let Some(scroll) = pending.take()
+        && scroll.delta != 0
+    {
+        out.push(AppEvent::MouseScroll {
+            column: scroll.column,
+            row: scroll.row,
+            modifiers: scroll.modifiers,
+            delta: scroll.delta,
+        });
+    }
+}
+
+/// Coalesce a batch of queued terminal/app events before dispatching them:
+///
+/// - Consecutive `MouseEventKind::Moved` events collapse to the latest cell.
+/// - Consecutive `MouseEventKind::Drag(btn)` events for the same button
+///   collapse to the latest cell.
+/// - Consecutive scroll events (`ScrollUp`, `ScrollDown`, `MouseScroll`) fold
+///   into one [`AppEvent::MouseScroll`] with the net step delta (dropping a
+///   zero net delta).
+/// - Consecutive `Resize` events collapse to the latest dimensions.
+/// - Multiple `Tick` events in a batch deduplicate to a single trailing `Tick`.
+#[must_use]
+pub fn coalesce_events(events: Vec<AppEvent>) -> Vec<AppEvent> {
+    let mut out = Vec::with_capacity(events.len());
+    let mut pending_scroll: Option<PendingScroll> = None;
+    let mut saw_tick = false;
+
+    for event in events {
+        match event {
+            AppEvent::Tick => {
+                saw_tick = true;
+            }
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column,
+                row,
+                modifiers,
+            }) => {
+                let delta = pending_scroll.map_or(-1, |prev| prev.delta.saturating_sub(1));
+                pending_scroll = Some(PendingScroll {
+                    column,
+                    row,
+                    modifiers,
+                    delta,
+                });
+            }
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row,
+                modifiers,
+            }) => {
+                let delta = pending_scroll.map_or(1, |prev| prev.delta.saturating_add(1));
+                pending_scroll = Some(PendingScroll {
+                    column,
+                    row,
+                    modifiers,
+                    delta,
+                });
+            }
+            AppEvent::MouseScroll {
+                column,
+                row,
+                modifiers,
+                delta,
+            } => {
+                let next_delta =
+                    pending_scroll.map_or(delta, |prev| prev.delta.saturating_add(delta));
+                pending_scroll = Some(PendingScroll {
+                    column,
+                    row,
+                    modifiers,
+                    delta: next_delta,
+                });
+            }
+            AppEvent::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+                flush_scroll(&mut out, &mut pending_scroll);
+                if let Some(AppEvent::Mouse(prev)) = out.last_mut()
+                    && prev.kind == MouseEventKind::Moved
+                {
+                    *prev = mouse;
+                } else {
+                    out.push(AppEvent::Mouse(mouse));
+                }
+            }
+            AppEvent::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Drag(_)) => {
+                flush_scroll(&mut out, &mut pending_scroll);
+                if let Some(AppEvent::Mouse(prev)) = out.last_mut()
+                    && prev.kind == mouse.kind
+                {
+                    *prev = mouse;
+                } else {
+                    out.push(AppEvent::Mouse(mouse));
+                }
+            }
+            AppEvent::Resize(w, h) => {
+                flush_scroll(&mut out, &mut pending_scroll);
+                if let Some(AppEvent::Resize(prev_w, prev_h)) = out.last_mut() {
+                    *prev_w = w;
+                    *prev_h = h;
+                } else {
+                    out.push(AppEvent::Resize(w, h));
+                }
+            }
+            other => {
+                flush_scroll(&mut out, &mut pending_scroll);
+                out.push(other);
+            }
+        }
+    }
+
+    flush_scroll(&mut out, &mut pending_scroll);
+    if saw_tick {
+        out.push(AppEvent::Tick);
+    }
+    out
+}
+
+/// Event handler that polls terminal events on a dedicated OS thread.
 #[derive(Debug)]
 pub struct EventHandler {
     rx: Receiver<AppEvent>,
@@ -531,35 +723,56 @@ impl EventHandler {
     ///
     /// # Panics
     ///
-    /// Panics if the spawned terminal-event polling thread fails to start.
+    /// Panics if the dedicated terminal-input OS thread fails to spawn.
     #[must_use]
     pub fn new() -> Self {
         let (tx, rx) = async_channel::unbounded();
         let tx_clone = tx.clone();
 
-        // Spawn event polling task
-        spawn(async move {
-            loop {
-                // Poll with timeout for tick events
-                let has_event = unblock(|| event::poll(Duration::from_millis(50)))
-                    .await
-                    .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
-                if has_event {
-                    let evt = unblock(event::read)
-                        .await
-                        .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
-                    let Some(app_event) = map_terminal_event(evt) else {
-                        continue;
-                    };
-                    if tx_clone.send(app_event).await.is_err() {
+        std::thread::Builder::new()
+            .name("tui-input".to_string())
+            .spawn(move || {
+                promote_thread_qos();
+                let mut last_tick = Instant::now();
+                loop {
+                    if tx_clone.is_closed() {
                         break;
                     }
-                } else if tx_clone.send(AppEvent::Tick).await.is_err() {
-                    break;
+                    let wait = TICK_INTERVAL.saturating_sub(last_tick.elapsed());
+                    let has_event = event::poll(wait)
+                        .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
+                    if has_event {
+                        let mut batch = Vec::new();
+                        loop {
+                            let evt = event::read()
+                                .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
+                            if let Some(app_event) = map_terminal_event(evt) {
+                                batch.push(app_event);
+                            }
+                            if batch.len() >= SOURCE_DRAIN_LIMIT {
+                                break;
+                            }
+                            let more = event::poll(Duration::ZERO)
+                                .unwrap_or_else(|e| panic!("{}: {}", ERR_TUI_EVENT_POLL.trim(), e));
+                            if !more {
+                                break;
+                            }
+                        }
+                        for app_event in coalesce_events(batch) {
+                            if tx_clone.send_blocking(app_event).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if last_tick.elapsed() >= TICK_INTERVAL {
+                        last_tick = Instant::now();
+                        if tx_clone.send_blocking(AppEvent::Tick).is_err() {
+                            return;
+                        }
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .expect("failed to spawn tui-input thread");
 
         Self { rx, tx }
     }
@@ -573,6 +786,17 @@ impl EventHandler {
     /// Get the next event.
     pub async fn next(&mut self) -> Option<AppEvent> {
         self.rx.recv().await.ok()
+    }
+
+    /// Drain up to `limit` already-queued events from the channel without
+    /// blocking, appending them to `out`.
+    pub fn drain_ready(&self, out: &mut Vec<AppEvent>, limit: usize) {
+        while out.len() < limit {
+            match self.rx.try_recv() {
+                Ok(event) => out.push(event),
+                Err(_) => break,
+            }
+        }
     }
 
     /// A queued key, paste, mouse, or resize, skipping coalesced ticks.
@@ -709,5 +933,102 @@ mod tests {
             map_terminal_event(Event::FocusGained),
             Some(AppEvent::FocusGained)
         ));
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> AppEvent {
+        AppEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn coalesce_events_collapses_mouse_moves_and_drags_to_latest() {
+        use crossterm::event::MouseButton;
+
+        let out = coalesce_events(vec![
+            mouse_event(MouseEventKind::Moved, 1, 2),
+            mouse_event(MouseEventKind::Moved, 3, 4),
+            mouse_event(MouseEventKind::Moved, 5, 6),
+            AppEvent::Key(KeyCode::Char('x'), KeyModifiers::NONE),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 1),
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 12, 3),
+        ]);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(
+            out[0],
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 5,
+                row: 6,
+                ..
+            })
+        ));
+        assert!(matches!(
+            out[1],
+            AppEvent::Key(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
+        assert!(matches!(
+            out[2],
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 12,
+                row: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn coalesce_events_folds_scroll_deltas_and_drops_cancelling_bursts() {
+        let net_up = coalesce_events(vec![
+            mouse_event(MouseEventKind::ScrollUp, 10, 5),
+            mouse_event(MouseEventKind::ScrollUp, 10, 6),
+            mouse_event(MouseEventKind::ScrollDown, 10, 7),
+            mouse_event(MouseEventKind::ScrollUp, 10, 8),
+        ]);
+        assert_eq!(net_up.len(), 1);
+        assert!(matches!(
+            net_up[0],
+            AppEvent::MouseScroll {
+                column: 10,
+                row: 8,
+                delta: -2,
+                ..
+            }
+        ));
+
+        let cancelled = coalesce_events(vec![
+            mouse_event(MouseEventKind::ScrollUp, 4, 4),
+            mouse_event(MouseEventKind::ScrollDown, 4, 4),
+        ]);
+        assert!(cancelled.is_empty());
+
+        let with_ticks_and_resize = coalesce_events(vec![
+            AppEvent::Tick,
+            AppEvent::Resize(80, 24),
+            AppEvent::Resize(100, 30),
+            AppEvent::Tick,
+            mouse_event(MouseEventKind::ScrollDown, 2, 2),
+            AppEvent::Tick,
+            mouse_event(MouseEventKind::ScrollDown, 2, 3),
+        ]);
+        assert_eq!(with_ticks_and_resize.len(), 3);
+        assert!(matches!(
+            with_ticks_and_resize[0],
+            AppEvent::Resize(100, 30)
+        ));
+        assert!(matches!(
+            with_ticks_and_resize[1],
+            AppEvent::MouseScroll {
+                column: 2,
+                row: 3,
+                delta: 2,
+                ..
+            }
+        ));
+        assert!(matches!(with_ticks_and_resize[2], AppEvent::Tick));
     }
 }

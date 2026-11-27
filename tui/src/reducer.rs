@@ -72,6 +72,8 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
             if app.processing {
+                app.flush_pending_reasoning();
+                app.flush_pending_tool_deltas();
                 if let Some(start) = app.thinking_start {
                     app.chat.update_thinking(start.elapsed().as_secs_f64());
                 }
@@ -92,6 +94,12 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         AppEvent::Resize(_, _) => Ok(None),
         AppEvent::Paste(text) => Ok(app.handle_paste_event(text)),
         AppEvent::Mouse(mouse) => app.handle_mouse(mouse),
+        AppEvent::MouseScroll {
+            column,
+            row,
+            modifiers,
+            delta,
+        } => app.handle_mouse_scroll(column, row, modifiers, delta),
 
         AppEvent::EffortLoaded(effort) => {
             app.current_effort = effort;
@@ -771,6 +779,31 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                     .chat
                     .push_error(&format!("Failed to save bug snapshot: {error}")),
             }
+            Ok(None)
+        }
+        AppEvent::TodosLoaded { session_id, rows } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.chat.set_todos(rows);
+            }
+            Ok(None)
+        }
+        AppEvent::HistorySynced {
+            session_id,
+            messages,
+        } => {
+            app.apply_synced_history(&session_id, messages);
+            Ok(None)
+        }
+        AppEvent::HistoryReloaded {
+            session_id,
+            messages,
+            attachments,
+        } => {
+            app.apply_reloaded_history(&session_id, messages, attachments);
             Ok(None)
         }
         AppEvent::SandboxOpenFailed(error) => {
