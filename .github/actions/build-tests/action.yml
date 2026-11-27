@@ -60,15 +60,18 @@ runs:
         shared-key: ci-build
         local-crates-io-max-bytes: '1610612736'
     # Cargo ignores CARGO_PROFILE_*_PACKAGE_* env vars, so configure per-package
-    # debug=0 for workspace crates in $CARGO_HOME/config.toml while leaving
-    # dependencies at default debuginfo=2 to match stow's public cache.
-    - name: Disable debuginfo for workspace packages
+    # debug=0 and strip="debuginfo" for workspace crates in $CARGO_HOME/config.toml.
+    # Leaving dependencies at default debuginfo=2 preserves stow's public cache
+    # hits, while per-package strip="debuginfo" strips linked dependency DWARF
+    # from the final workspace binaries and test executables (keeping symbol
+    # tables intact for backtraces).
+    - name: Disable and strip debuginfo for workspace packages
       shell: bash
       run: |
         cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
         mkdir -p "${cargo_home}"
         for pkg in may-agent may-agent-core may-client may-command-policy may-config may-container-image may-daemon may-db may-git-forge may-harness may-media may-patch may-protocol may-providers may-repo-search may-tasks may-tool-dist may-tui; do
-          printf '[profile.dev.package.%s]\ndebug = 0\n[profile.test.package.%s]\ndebug = 0\n' "$pkg" "$pkg" >> "${cargo_home}/config.toml"
+          printf '[profile.dev.package.%s]\ndebug = 0\nstrip = "debuginfo"\n[profile.test.package.%s]\ndebug = 0\nstrip = "debuginfo"\n' "$pkg" "$pkg" >> "${cargo_home}/config.toml"
         done
     # Drop any leftover scratch directory before test runs.
     - name: Drop restored test scratch
@@ -133,16 +136,16 @@ runs:
         name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
         path: ${{ runner.temp }}/may-debug.tar.gz
         retention-days: 90
-    # Verify baseline tools (~5s) right from the archive before fanning out;
-    # this also validates the archive itself.
+    # Verify baseline tools (~6s) directly from target/debug before uploading
+    # the archive and fanning out, avoiding an unnecessary local unpack of the
+    # archive on the build runner.
     - name: Verify baseline tools
       if: inputs.e2e == 'true' && steps.decide.outputs.run-tests == 'true'
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
         cargo nextest run \
-          --archive-file "${{ runner.temp }}/tests-archive.tar.zst" \
-          --workspace-remap . \
+          --locked ${{ inputs.cargo-flags }} \
           --run-ignored ignored-only \
           --no-capture \
           -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
