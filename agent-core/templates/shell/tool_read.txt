@@ -1,1 +1,1 @@
-Read the new output of a background terminal job, or a retained pipeline stage (`step`), by its PID.
+Read the new output of a background terminal job, or a retained pipeline stage (`step`), by its PID. Do not poll it to wait for a job to finish — background completion is delivered automatically when it exits.

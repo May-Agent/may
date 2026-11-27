@@ -58,12 +58,32 @@ pub fn place_tolerant(
     }
 }
 
-/// Applies `hunks` with [`place_tolerant`] and returns the patched lines.
+/// An inclusive 1-based line range in the resulting file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    /// First affected line (1-based).
+    pub first: usize,
+    /// Last affected line (1-based, inclusive).
+    pub last: usize,
+}
+
+impl std::fmt::Display for LineRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.first == self.last {
+            write!(f, "{}", self.first)
+        } else {
+            write!(f, "{}-{}", self.first, self.last)
+        }
+    }
+}
+
+/// Applies `hunks` with [`place_tolerant`] and returns the patched lines
+/// together with the resulting 1-based line ranges touched by each hunk.
 pub fn apply_tolerant(
     path: &str,
     file: &[String],
     hunks: &[Hunk],
-) -> Result<Vec<String>, PatchError> {
+) -> Result<(Vec<String>, Vec<LineRange>), PatchError> {
     place_tolerant(path, file, hunks).map(|(placement, _)| build(file, hunks, &placement))
 }
 
@@ -148,11 +168,12 @@ fn place_hunks(
 
     match search.solutions.as_slice() {
         [] => {
-            let (hunk, reason) = search.failure.expect("no solution implies a failed hunk");
+            let (hunk, detail) = search.failure.expect("no solution implies a failed hunk");
             Err(PatchError::Conflict {
                 path: path.to_owned(),
                 hunk: hunk + 1,
-                reason,
+                reason: detail.reason,
+                nearby: detail.nearby,
             })
         }
         [only] => Ok(only.clone()),
@@ -193,6 +214,17 @@ fn place_hunks(
 /// error compact.
 const EXCERPT_CONTEXT: usize = 2;
 
+/// Maximum number of lines shown in a conflict's nearby-file excerpt so a
+/// failing large hunk never dumps a huge slice of the file.
+const MAX_CONFLICT_EXCERPT_LINES: usize = 12;
+
+/// Why a hunk failed to place, with an optional nearby file excerpt.
+#[derive(Debug)]
+struct ConflictDetail {
+    reason: String,
+    nearby: Option<Excerpt>,
+}
+
 /// The matched `region` (0-based file indices, never empty: an empty old side
 /// has a single place and is never ambiguous) with up to [`EXCERPT_CONTEXT`]
 /// lines on each side, clipped to the file.
@@ -211,6 +243,34 @@ fn excerpt(file: &[String], region: Range<usize>) -> Excerpt {
             })
             .collect(),
     }
+}
+
+/// A compact excerpt around `window` highlighting `focus` with `>`, capped at
+/// [`MAX_CONFLICT_EXCERPT_LINES`] lines.
+fn conflict_excerpt(file: &[String], window: Range<usize>, focus: Range<usize>) -> Option<Excerpt> {
+    if file.is_empty() {
+        return None;
+    }
+    let start = window.start.min(file.len().saturating_sub(1));
+    let end = window.end.max(start + 1).min(file.len());
+    let from = start.saturating_sub(EXCERPT_CONTEXT);
+    let mut to = (end + EXCERPT_CONTEXT).min(file.len());
+    if to - from > MAX_CONFLICT_EXCERPT_LINES {
+        to = from + MAX_CONFLICT_EXCERPT_LINES;
+    }
+    let first = focus.start.min(file.len().saturating_sub(1)) + 1;
+    let last = focus.end.max(first).min(file.len());
+    Some(Excerpt {
+        first,
+        last,
+        lines: (from..to)
+            .map(|index| ExcerptLine {
+                number: index + 1,
+                text: file[index].clone(),
+                matched: focus.contains(&index),
+            })
+            .collect(),
+    })
 }
 
 /// The file's whitespace-free lines laid end to end, for finding a hunk whose
@@ -250,13 +310,13 @@ struct Search<'a> {
     /// `(hunk, cursor)` states known to have no solution below them.
     dead: HashSet<(usize, usize)>,
     /// The furthest hunk that could not be placed, with the reason.
-    failure: Option<(usize, String)>,
+    failure: Option<(usize, ConflictDetail)>,
 }
 
 impl Search<'_> {
     /// Where hunk `index` may sit when the previous hunk ended at `cursor`;
     /// `Err` carries the reason when it fits nowhere.
-    fn candidates(&self, index: usize, cursor: usize) -> Result<Vec<Range<usize>>, String> {
+    fn candidates(&self, index: usize, cursor: usize) -> Result<Vec<Range<usize>>, ConflictDetail> {
         let hunk = &self.hunks[index];
         let lower = if let Some(anchor) = &hunk.anchor {
             let anchor_key = self.mode.key(anchor);
@@ -264,10 +324,27 @@ impl Search<'_> {
                 .iter()
                 .position(|key| *key == anchor_key);
             let Some(found) = found else {
-                return Err(format!(
-                    "the anchor line {anchor:?} does not exist at or after file line {}",
-                    cursor + 1
-                ));
+                let trimmed = anchor.trim();
+                let nearby = (!trimmed.is_empty())
+                    .then(|| {
+                        self.file[cursor..]
+                            .iter()
+                            .position(|line| {
+                                line.trim().eq_ignore_ascii_case(trimmed) || line.contains(trimmed)
+                            })
+                            .and_then(|offset| {
+                                let at = cursor + offset;
+                                conflict_excerpt(self.file, at..at + 1, at..at + 1)
+                            })
+                    })
+                    .flatten();
+                return Err(ConflictDetail {
+                    reason: format!(
+                        "the anchor line {anchor:?} does not exist at or after file line {}",
+                        cursor + 1
+                    ),
+                    nearby,
+                });
             };
             cursor + found + 1
         } else {
@@ -288,10 +365,13 @@ impl Search<'_> {
         if regions.is_empty() {
             return Err(match self.mode {
                 Whitespace::Strict => diagnose(self.file, self.keys, old, lower, hunk),
-                Whitespace::Free => format!(
-                    "the hunk's context/deleted lines match nowhere at or after file line {} even with all whitespace removed",
-                    lower + 1
-                ),
+                Whitespace::Free => ConflictDetail {
+                    reason: format!(
+                        "the hunk's context/deleted lines match nowhere at or after file line {} even with all whitespace removed",
+                        lower + 1
+                    ),
+                    nearby: None,
+                },
             });
         }
         Ok(regions)
@@ -337,17 +417,24 @@ impl Search<'_> {
     }
 }
 
-/// Builds the patched lines from a consistent placement.
+/// Builds the patched lines and the resulting 1-based line ranges touched by
+/// each hunk from a consistent placement.
 ///
 /// A region whose file lines correspond one to one with the hunk's old side
 /// (equal once whitespace is removed, which every exact match is) keeps the
 /// file's own text for context lines. Any other region, one a formatter
 /// rewrapped, is replaced by the hunk's new side as written.
-fn build(file: &[String], hunks: &[Hunk], placement: &[Range<usize>]) -> Vec<String> {
+fn build(
+    file: &[String],
+    hunks: &[Hunk],
+    placement: &[Range<usize>],
+) -> (Vec<String>, Vec<LineRange>) {
     let mut out = Vec::with_capacity(file.len());
+    let mut ranges = Vec::with_capacity(hunks.len());
     let mut cursor = 0;
     for (hunk, region) in hunks.iter().zip(placement) {
         out.extend_from_slice(&file[cursor..region.start]);
+        let start_out = out.len();
         let old: Vec<&str> = hunk.lines.iter().filter_map(HunkLine::old_side).collect();
         let region_lines = &file[region.clone()];
         let corresponds = region_lines.len() == old.len()
@@ -357,15 +444,38 @@ fn build(file: &[String], hunks: &[Hunk], placement: &[Range<usize>]) -> Vec<Str
                 .all(|(line, wanted)| same_without_whitespace(line, wanted));
         if corresponds {
             let mut at = region.start;
+            let mut first_mod: Option<usize> = None;
+            let mut last_mod: Option<usize> = None;
+            let mut first_del: Option<usize> = None;
             for line in &hunk.lines {
                 match line {
                     HunkLine::Context(_) => {
                         out.push(file[at].clone());
                         at += 1;
                     }
-                    HunkLine::Delete(_) => at += 1,
-                    HunkLine::Insert(text) => out.push(text.clone()),
+                    HunkLine::Delete(_) => {
+                        first_del.get_or_insert(out.len());
+                        at += 1;
+                    }
+                    HunkLine::Insert(text) => {
+                        let idx = out.len();
+                        out.push(text.clone());
+                        first_mod.get_or_insert(idx);
+                        last_mod = Some(idx);
+                    }
                 }
+            }
+            if let (Some(first), Some(last)) = (first_mod, last_mod) {
+                ranges.push(LineRange {
+                    first: first + 1,
+                    last: last + 1,
+                });
+            } else if let Some(at_del) = first_del {
+                let line = at_del.max(1);
+                ranges.push(LineRange {
+                    first: line,
+                    last: line,
+                });
             }
         } else {
             for line in &hunk.lines {
@@ -374,11 +484,31 @@ fn build(file: &[String], hunks: &[Hunk], placement: &[Range<usize>]) -> Vec<Str
                     HunkLine::Delete(_) => {}
                 }
             }
+            let end_out = out.len();
+            if end_out > start_out {
+                ranges.push(LineRange {
+                    first: start_out + 1,
+                    last: end_out,
+                });
+            } else if start_out > 0 {
+                ranges.push(LineRange {
+                    first: start_out,
+                    last: start_out,
+                });
+            }
         }
         cursor = region.end;
     }
     out.extend_from_slice(&file[cursor..]);
-    out
+    if out.is_empty() {
+        ranges.clear();
+    } else {
+        for range in &mut ranges {
+            range.first = range.first.min(out.len());
+            range.last = range.last.min(out.len());
+        }
+    }
+    (out, ranges)
 }
 
 /// Whether `a` and `b` are the same text once every whitespace is removed.
@@ -465,14 +595,15 @@ fn free_candidates(
 }
 
 /// Explains why `old` fits nowhere: names the first line of the best partial
-/// match that did not match.
+/// match that did not match, and attaches a compact nearby excerpt of the
+/// target file when a likely location can be narrowed down.
 fn diagnose(
     file: &[String],
     keys: &[Cow<'_, str>],
     old: &[Cow<'_, str>],
     lower: usize,
     hunk: &Hunk,
-) -> String {
+) -> ConflictDetail {
     let old_lines: Vec<&str> = hunk.lines.iter().filter_map(HunkLine::old_side).collect();
     let mut best = (0, lower);
     for start in lower..keys.len() {
@@ -487,23 +618,95 @@ fn diagnose(
     }
     let (matched, start) = best;
     if matched == old.len() {
-        return format!(
-            "the context/deleted lines match at file line {} but `*** End of File` requires them to end the file",
-            start + 1
-        );
+        let end = (start + old.len()).min(file.len());
+        return ConflictDetail {
+            reason: format!(
+                "the context/deleted lines match at file line {} but `*** End of File` requires them to end the file",
+                start + 1
+            ),
+            nearby: conflict_excerpt(file, start..end, start..end),
+        };
     }
     let wanted = old_lines[matched];
     match file.get(start + matched) {
-        Some(found) if matched > 0 => format!(
-            "context/deleted line {} of the hunk, {wanted:?}, does not match; the closest candidate starts at file line {} and has {found:?} there",
-            matched + 1,
-            start + 1,
-        ),
-        _ => format!(
-            "the first context/deleted line, {wanted:?}, does not exist at or after file line {}",
-            lower + 1
-        ),
+        Some(found) if matched > 0 => {
+            let mismatch = start + matched;
+            let end = (start + old.len()).min(file.len());
+            ConflictDetail {
+                reason: format!(
+                    "context/deleted line {} of the hunk, {wanted:?}, does not match; the closest candidate starts at file line {} and has {found:?} there",
+                    matched + 1,
+                    start + 1,
+                ),
+                nearby: conflict_excerpt(file, start..end, mismatch..mismatch + 1),
+            }
+        }
+        _ => {
+            let nearby = best_fuzzy_candidate(file, &old_lines, lower)
+                .map(|cand| {
+                    let end = (cand + old_lines.len()).min(file.len());
+                    conflict_excerpt(file, cand..end, cand..end)
+                })
+                .or_else(|| {
+                    (hunk.anchor.is_some() && lower < file.len()).then(|| {
+                        let end = (lower + old_lines.len().min(6)).min(file.len());
+                        conflict_excerpt(file, lower..end, lower..end)
+                    })
+                })
+                .or_else(|| {
+                    (lower < file.len() && file.len() - lower <= MAX_CONFLICT_EXCERPT_LINES)
+                        .then(|| conflict_excerpt(file, lower..file.len(), lower..file.len()))
+                })
+                .flatten();
+            ConflictDetail {
+                reason: format!(
+                    "the first context/deleted line, {wanted:?}, does not exist at or after file line {}",
+                    lower + 1
+                ),
+                nearby,
+            }
+        }
     }
+}
+
+/// Finds the start line at or after `lower` where the most non-empty trimmed
+/// lines of `old_lines` align with `file`.
+fn best_fuzzy_candidate(file: &[String], old_lines: &[&str], lower: usize) -> Option<usize> {
+    let trimmed_old: Vec<&str> = old_lines.iter().map(|line| line.trim()).collect();
+    if trimmed_old.iter().all(|line| line.is_empty()) || lower >= file.len() {
+        return None;
+    }
+    let mut checked = HashSet::new();
+    let mut best: Option<(usize, usize)> = None;
+    for (offset, wanted) in trimmed_old.iter().enumerate() {
+        if wanted.is_empty() {
+            continue;
+        }
+        for (rel, line) in file[lower..].iter().enumerate() {
+            if line.trim() != *wanted {
+                continue;
+            }
+            let pos = lower + rel;
+            let cand = pos.saturating_sub(offset).max(lower);
+            if !checked.insert(cand) {
+                continue;
+            }
+            let score = trimmed_old
+                .iter()
+                .enumerate()
+                .filter(|&(i, target)| {
+                    !target.is_empty()
+                        && file
+                            .get(cand + i)
+                            .is_some_and(|actual| actual.trim() == *target)
+                })
+                .count();
+            if score > 0 && best.is_none_or(|(best_score, _)| score > best_score) {
+                best = Some((score, cand));
+            }
+        }
+    }
+    best.map(|(_, start)| start)
 }
 
 #[cfg(test)]
@@ -527,14 +730,14 @@ mod tests {
         let hunks = hunks_of(hunks);
         let lines = lines_of(file);
         place_hunks("f", &lines, &hunks, mode)
-            .map(|placement| build(&lines, &hunks, &placement).join("\n"))
+            .map(|placement| build(&lines, &hunks, &placement).0.join("\n"))
             .map_err(|error| error.to_string())
     }
 
     /// The two-step placement the tool performs.
     fn tolerant(file: &str, hunks: &str) -> Result<String, String> {
         apply_tolerant("f", &lines_of(file), &hunks_of(hunks))
-            .map(|lines| lines.join("\n"))
+            .map(|(lines, _)| lines.join("\n"))
             .map_err(|error| error.to_string())
     }
 
@@ -678,6 +881,39 @@ match 2, file lines 8-9:
         .unwrap_err();
         assert!(error.contains("hunk 2"), "{error}");
         assert!(error.contains("\"nope\""), "{error}");
+        assert!(
+            error.contains("Actual file content around lines"),
+            "{error}"
+        );
+        assert!(error.contains("> 4| d"), "{error}");
+    }
+
+    #[test]
+    fn conflict_includes_nearby_lines_when_first_line_differs_but_later_lines_match() {
+        let file = "fn alpha() {\n    let x = 1;\n    let y = 2;\n    let z = 3;\n}\n";
+        let error = tolerant(
+            file,
+            "@@\n     let x = 999;\n-    let y = 2;\n+    let y = 20;\n     let z = 3;",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("Actual file content around lines"),
+            "{error}"
+        );
+        assert!(error.contains("2|     let x = 1;"), "{error}");
+        assert!(error.contains("3|     let y = 2;"), "{error}");
+    }
+
+    #[test]
+    fn conflict_includes_nearby_lines_after_matched_anchor() {
+        let file = "fn alpha() {\n    body_a();\n}\n\nfn beta() {\n    actual_body();\n}\n";
+        let error =
+            tolerant(file, "@@ fn beta() {\n-    stale_body();\n+    new_body();").unwrap_err();
+        assert!(
+            error.contains("Actual file content around lines"),
+            "{error}"
+        );
+        assert!(error.contains("6|     actual_body();"), "{error}");
     }
 
     #[test]

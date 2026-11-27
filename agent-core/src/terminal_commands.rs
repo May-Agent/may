@@ -174,6 +174,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Session-scoped registry of open `tui` PTY sessions reused across
     /// main-agent rebuilds; `None` starts a fresh registry.
     pub tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
+    /// Whether this session is non-interactive (`may "<prompt>"`): interactive
+    /// prompt commands (`ask_user`, `withdraw_ask_user`, `request_workspace`)
+    /// are omitted from registration and prompt usage blocks.
+    pub non_interactive: bool,
 }
 
 /// Handles the host owns once and every session's commands share: cloning
@@ -617,7 +621,10 @@ where
         builder.configure_role_tools(repo_tool, subagent_repo_tool);
     }
 
-    if !is_sidekick && let Some(runtime) = config.ask_user {
+    if !is_sidekick
+        && !config.non_interactive
+        && let Some(runtime) = config.ask_user
+    {
         let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone())
             .with_task_events(config.task_events.clone())
             .with_cards(config.subagent_tracker.cards().clone());
@@ -823,7 +830,10 @@ where
         });
     }
 
-    if !is_sidekick && let Some(workspace_request_broker) = config.workspace_request_broker {
+    if !is_sidekick
+        && !config.non_interactive
+        && let Some(workspace_request_broker) = config.workspace_request_broker
+    {
         // A workspace request asks the user to widen the session's view of
         // the host: main-agent authority.
         let approval_pause = builder.approval_pause();
@@ -1221,6 +1231,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1308,6 +1319,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_interactive_omits_ask_user_and_request_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        let ask_user_runtime = test_runtime(temp.path()).await;
+        let (workspace_broker, _queue) = crate::workspace_request::channel();
+        let mut builder = CommandRegistryBuilder::new();
+
+        let shared = Box::pin(register_shared_terminal_commands(
+            &mut builder,
+            SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
+                rules_import: None,
+                subagent_models: None,
+                model_listing: None,
+                child_approvals: crate::subagent::ChildApprovals::new(),
+                session_role: crate::fusion::SessionRole::Main,
+                tui_registry: None,
+                non_interactive: true,
+                services: SharedServices::new(temp.path()),
+                llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
+                session_id: "session-1".to_string(),
+                may_dir: temp.path().to_path_buf(),
+                sandbox_dir: session_dir.clone(),
+                cwd: PathBuf::from("."),
+                db: test_db(temp.path()).await,
+                ask_user: Some(ask_user_runtime),
+                imagine: None,
+                task_runtime: TaskRuntimeKind::Local,
+                task_broker: None,
+                tunnel_broker: None,
+                browser_broker: None,
+                register_skills_broker: None,
+                workspace_request_broker: Some(workspace_broker),
+                subagents: test_subagents(),
+                subagent_tracker: SubagentTracker::default(),
+                request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
+                task_events: crate::harness::working_document::WorkEvents::new(),
+                publish_gate: None,
+                live_config: None,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
+                agent_messaging: None,
+                languages: None,
+                acp: None,
+                session_prompts: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
+                timeout_cap: crate::shell::ShellBudgets::of(
+                    &crate::config::ShellSettings::default(),
+                )
+                .limits()
+                .timeout_cap,
+            },
+        ))
+        .await
+        .expect("commands should register");
+
+        let built = TestCommands::build(builder, session_dir.join("outputs")).await;
+        let registry = built.registry();
+        for omitted in ["ask_user", "withdraw_ask_user", "request_workspace"] {
+            assert!(
+                !registry.is_configured(&main_launch(), omitted),
+                "{omitted}"
+            );
+            assert!(
+                !shared.descriptions.iter().any(|(name, _)| name == omitted),
+                "{omitted} should not appear in descriptions"
+            );
+            assert!(
+                !shared.usages.iter().any(|usage| usage.name == omitted),
+                "{omitted} should not appear in core usages"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn chat_specific_tools_are_absent_without_live_chat_brokers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
@@ -1324,6 +1415,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1400,6 +1492,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1470,6 +1563,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1535,6 +1629,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1713,6 +1808,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1849,6 +1945,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1916,6 +2013,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1987,6 +2085,7 @@ mod tests {
                 child_approvals: crate::subagent::ChildApprovals::new(),
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
+                non_interactive: false,
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

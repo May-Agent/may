@@ -792,7 +792,7 @@ impl<R: HostReader> HostLoadMonitor<R> {
                     self.foreground_wait.extend(window);
                     events.push(HostLoadEvent::LoadHigh {
                         load,
-                        foreground_wait: window,
+                        foreground_wait: self.foreground_wait.get(),
                     });
                 }
                 Some(Transition::Ended) => {

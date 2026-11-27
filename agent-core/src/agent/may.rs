@@ -53,6 +53,11 @@ use crate::harness::working_document::{
     AnyBlockerResolver, AnyWorkTracker, WorkEvents, WorkingDocument,
 };
 use crate::ipc::{CommandRegistry, CommandRegistryBuilder, SessionShell, ShellSlot};
+
+/// Non-interactive runs wait 5× longer in the foreground (50s normal,
+/// 300s under high load) so builds and tests finish inline without
+/// churning extra turns on background promotion.
+const NON_INTERACTIVE_FOREGROUND_WAIT_SCALE: u32 = 5;
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
@@ -999,7 +1004,14 @@ impl MayAgent {
             tracker.set_extra_roots(extra_roots);
             (Some(lease), Some(tracker))
         };
-        let budgets = config.limits.shell();
+        let budgets = if config.non_interactive {
+            config
+                .limits
+                .shell()
+                .with_foreground_wait_scale(NON_INTERACTIVE_FOREGROUND_WAIT_SCALE)
+        } else {
+            config.limits.shell()
+        };
         let host_command_notices = HostCommandNotices::default();
         let assembly = ShellAssembly {
             tools: tools.clone(),
@@ -1467,9 +1479,17 @@ impl MayAgent {
                         services: config.services.clone(),
                         session_role: config.session_role.clone(),
                         tui_registry: config.tui_registry.clone(),
+                        non_interactive: config.non_interactive,
                     },
                 ))
                 .await?;
+                let indexed_search_command = if let Some(ref wt) = worktree
+                    && config.services.repo_search.worktree_index_ready(wt).await
+                {
+                    Some(if config.hashline { "rag" } else { "search" })
+                } else {
+                    None
+                };
                 Ok::<_, MayAgentError>((
                     commands,
                     shared_terminal_commands,
@@ -1488,6 +1508,7 @@ impl MayAgent {
                     readonly_checkouts,
                     readonly_checkout,
                     remote_repo,
+                    indexed_search_command,
                 ))
             }
         );
@@ -1510,6 +1531,7 @@ impl MayAgent {
             readonly_checkouts,
             readonly_checkout,
             remote_repo,
+            indexed_search_command,
         ) = shared_terminal_commands_res?;
         let registry = commands.build();
         shared_terminal_commands
@@ -1543,10 +1565,7 @@ impl MayAgent {
         .await?;
         let issue_backend = crate::issue::IssueStore::info(&issue_store);
         runtime_system_context = runtime_system_context
-            .with_instruction(
-                tag::EFFICIENCY,
-                build_efficiency(&command_descriptions, config.hashline),
-            )
+            .with_instruction(tag::EFFICIENCY, build_efficiency(config.hashline))
             .with_instruction(tag::CAPABILITIES, capabilities)
             .with_instruction(
                 tag::COMMANDS,
@@ -1570,6 +1589,7 @@ impl MayAgent {
                     readonly_checkout,
                     remote_repo.as_deref(),
                     &issue_backend,
+                    indexed_search_command,
                 ),
             );
 

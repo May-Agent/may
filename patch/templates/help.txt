@@ -33,6 +33,6 @@ Options:
   -h, --help     show this help and exit
   -V, --version  print the version and exit
 
-Output: one summary line per file (`A` added, `M` modified, `D` deleted,
-`R` renamed). Exit status: 0 success, 1 patch or filesystem failure,
-2 bad arguments.
+Output: one summary line per file (`A` added with line count, `M` modified with
+resulting line ranges, `D` deleted, `R` renamed). Exit status: 0 success, 1
+patch or filesystem failure, 2 bad arguments.

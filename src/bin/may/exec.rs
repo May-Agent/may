@@ -526,6 +526,7 @@ where
                 .with_forge_auth(forge_auth.clone()),
             session_role: may_agent::fusion::SessionRole::Main,
             tui_registry: None,
+            non_interactive: true,
             llm,
             ask_flagship: None,
             ask_balanced: None,

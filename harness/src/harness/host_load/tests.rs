@@ -305,3 +305,39 @@ fn a_host_without_sources_states_nothing_and_never_raises_load_events() {
         assert_eq!(monitor.tick(&any_clock), []);
     }
 }
+
+#[test]
+fn a_scaled_foreground_wait_reports_scaled_high_and_normal_windows() {
+    let clock = ManualClock::new();
+    let any_clock = AnyClock::new(clock);
+    let base = ForegroundWait::new(NORMAL_WAIT);
+    let scaled = base.scaled(5);
+    let host = ScriptedHost {
+        memory: Arc::new(Mutex::new(MemoryPressure::Normal)),
+        load: Arc::new(Mutex::new(2.0)),
+    };
+    let config = HostLoadConfig::new()
+        .start_after(Duration::ZERO)
+        .end_after(Duration::ZERO)
+        .high_load_foreground_wait(HIGH_LOAD_WAIT);
+    let mut monitor = HostLoadMonitor::new(host.clone(), config, scaled);
+
+    assert_eq!(
+        monitor.tick(&any_clock),
+        [HostLoadEvent::LoadHigh {
+            load: MachineLoad(2.0),
+            foreground_wait: HIGH_LOAD_WAIT * 5,
+        }]
+    );
+    assert_eq!(base.get(), HIGH_LOAD_WAIT);
+
+    *host.load.lock().unwrap() = 0.2;
+    assert_eq!(
+        monitor.tick(&any_clock),
+        [HostLoadEvent::LoadEnded {
+            load: MachineLoad(0.2),
+            foreground_wait: NORMAL_WAIT * 5,
+        }]
+    );
+    assert_eq!(base.get(), NORMAL_WAIT);
+}

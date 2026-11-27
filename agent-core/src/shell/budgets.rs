@@ -79,6 +79,15 @@ impl ShellBudgets {
             .set(settings.monitor_default_interval);
     }
 
+    /// Returns a view sharing every live handle of `self` with its foreground
+    /// wait window multiplied by `factor` (normal and extended high-load alike).
+    #[must_use]
+    pub fn with_foreground_wait_scale(&self, factor: u32) -> Self {
+        let mut scaled = self.clone();
+        scaled.limits.foreground_wait = self.limits.foreground_wait.scaled(factor);
+        scaled
+    }
+
     /// The limits a shell is built with.
     #[must_use]
     pub fn limits(&self) -> ShellLimits {
@@ -130,5 +139,30 @@ mod tests {
         assert_eq!(held.pipeline_record_after.get(), Duration::from_secs(5));
         assert_eq!(held.pipeline_retention.get(), Duration::from_mins(20));
         assert_eq!(output.lines(None), 50);
+    }
+
+    #[test]
+    fn scaled_foreground_wait_tracks_live_normal_and_high_load_windows() {
+        let budgets = ShellBudgets::of(&ShellSettings::default());
+        let non_interactive = budgets.with_foreground_wait_scale(5);
+        let base_wait = budgets.limits().foreground_wait;
+        let scaled_wait = non_interactive.limits().foreground_wait;
+
+        assert_eq!(base_wait.get(), Duration::from_secs(10));
+        assert_eq!(scaled_wait.get(), Duration::from_secs(50));
+
+        base_wait.extend(Duration::from_secs(60));
+        assert_eq!(base_wait.get(), Duration::from_secs(60));
+        assert_eq!(scaled_wait.get(), Duration::from_secs(300));
+
+        base_wait.restore();
+        assert_eq!(scaled_wait.get(), Duration::from_secs(50));
+
+        budgets.apply(&ShellSettings {
+            foreground_wait: Duration::from_secs(12),
+            ..ShellSettings::default()
+        });
+        assert_eq!(base_wait.get(), Duration::from_secs(12));
+        assert_eq!(scaled_wait.get(), Duration::from_secs(60));
     }
 }

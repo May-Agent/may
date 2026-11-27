@@ -1,2 +1,2 @@
 {{ folded }}
-[Code folded; line numbers are those of the unfolded text.]
+[Code folded; line numbers are those of the unfolded text. Read a specific range with `sed -n` or re-run with `raw: true` for verbatim output.]

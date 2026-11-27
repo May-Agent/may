@@ -135,12 +135,19 @@ where
             Some(_) => Shell::builder(sandbox),
             None => Shell::builder_on_host(sandbox, self.tools.host_launch()?),
         };
+        let outputs_dir = if self.container.is_some() {
+            PathBuf::from(crate::container::lifecycle::container_workspace_path(
+                "outputs",
+            ))
+        } else {
+            self.working_dir.join("outputs")
+        };
         let mut builder = builder
             .interpreters(self.interpreters)
             .limits(self.budgets.limits())
             .output(self.budgets.output())
             .wording(MayShellWording)
-            .treat_output(FileReadsAreVerbatim)
+            .treat_output(FileReadsAreVerbatim::with_outputs_dir(outputs_dir))
             .plan_pipelines(MayPipelinePlanner)
             .tools(shell_tool_settings(&self.budgets))
             .policy(ServerApproval::new(sessions.clone()))

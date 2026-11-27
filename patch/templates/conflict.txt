@@ -1,0 +1,5 @@
+Patch conflict: in {{ path }}: hunk {{ hunk }}: {{ reason }}{% if let Some(found) = nearby %}
+
+Actual file content around lines {{ found.first }}-{{ found.last }}:
+{% for line in found.lines %}{{ line.marker() }} {{ line.number }}| {{ line.text }}
+{% endfor %}{% endif %}
