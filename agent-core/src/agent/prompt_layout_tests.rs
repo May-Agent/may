@@ -380,7 +380,10 @@ async fn hashline_mode_injects_syntax_and_alerts_on_edit_bypass_only_when_enable
     standard_config.experimental.hashline = false;
     let mut standard = Box::pin(Session::start_with_runtime(&standard_config)).await;
     let standard_prefix = system_prefix(&mut standard).await;
-    assert!(!standard_prefix.contains("PUT N.=M:"), "{standard_prefix}");
+    assert!(
+        !standard_prefix.contains("PUT N#HH.=M#KK:"),
+        "{standard_prefix}"
+    );
     std::fs::write(standard.agent.sandbox_dir().join("existing.py"), "x = 1\n")
         .expect("write existing.py");
     run_terminal(&standard, "cat <<'EOF' > existing.py\nx = 2\nEOF\n").await;
@@ -406,15 +409,26 @@ async fn hashline_mode_injects_syntax_and_alerts_on_edit_bypass_only_when_enable
     let mut hashline = Box::pin(Session::start_with_runtime(&hashline_config)).await;
     let hashline_prefix = system_prefix(&mut hashline).await;
     for expected in [
+        "search sed",
         "search rg",
+        "search cat",
+        "search head",
+        "search tail",
+        "search nl",
         "search sg",
+        "raw: true",
+        "[PATH]",
+        "N#HH|content",
         "edit <<'PATCH'",
-        "PUT N.=M:",
-        "PUT N*:",
-        "CUT N.=M",
+        "PUT N#HH:",
+        "PUT N#HH.=M#KK:",
+        "PUT N#HH*:",
+        "PUT <1:",
+        "PUT >$:",
+        "CUT N#HH.=M#KK",
         "MV DEST",
         "REM",
-        "PUT <N @name",
+        "edit --help",
     ] {
         assert!(
             hashline_prefix.contains(expected),
@@ -462,7 +476,7 @@ async fn hashline_mode_injects_syntax_and_alerts_on_edit_bypass_only_when_enable
         alert_msg.content().contains("`shell redirection`")
             && alert_msg.content().contains("`existing.py`")
             && alert_msg.content().contains("`edit`")
-            && alert_msg.content().contains("[path#TAG]"),
+            && alert_msg.content().contains("N#HH"),
         "{}",
         alert_msg.content()
     );

@@ -845,6 +845,7 @@ mod tests {
             outcome,
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }))
     }
 

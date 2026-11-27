@@ -1,38 +1,87 @@
-search — line and structural search with hashline anchors
+search — line search, structural search and file reading with hashline anchors
 
 USAGE:
-    search rg [options] <pattern> [path…]        line search (ripgrep engine)
+    search rg [options] <pattern> [path…]        line search (ripgrep-compatible)
     search sg <pattern> --lang <lang> [options] [path…]
-                                               structural search (ast-grep)
+                                                 structural search (ast-grep)
+    search sed [-n] [-E] '<range>p' <file…>      read-only line slicing (sed -n)
+    search cat [-n|-b] [--limit N] <file…>       read whole file(s)
+    search head [-n N | -N] [--limit N] <file…>  read first N lines (default 10)
+    search tail [-n N | -N | -n +N] [--limit N] <file…>
+                                                 read last N lines or from line +N
+    search nl [nl flags] [--limit N] <file…>     read whole file(s) numbered
 
-Every matching file prints as a `[path#TAG]` section of `N:content` lines:
-the tag validates a later `edit` patch that anchors the numbered lines.
+Every matching or read file prints as a `[path]` section of `N#HH|content`
+lines: each line's `N#HH` anchor feeds a follow-up `edit` patch directly.
 
-RG OPTIONS:
-    -F, --literal            match the pattern literally
+RG OPTIONS (short flags bundle like `rg`, e.g. `-ni`, `-nC2`, `-A5`):
+    -e, --regexp <pattern>   search pattern (repeatable; positionals become paths)
+    -f, --file <file>        read patterns line-by-line from file (`-` for stdin)
+    -F, --fixed-strings      match patterns literally (alias `--literal`)
     -i, --ignore-case        case-insensitive search
-    -S, --smart-case         insensitive unless the pattern has uppercase
-    -C, --context <n>        lines of context around each match
-    -g, --glob <glob>        filter searched paths by glob (repeatable, ! negates)
-    -m, --limit <n>          stop after <n> result lines total (default 200)
-    -l, --files-with-matches print only the [path#TAG] headers
-        --hidden             include hidden files
+    -s, --case-sensitive     case-sensitive search (default)
+    -S, --smart-case         insensitive unless pattern has uppercase
+    -w, --word-regexp        match whole words only
+    -x, --line-regexp        match whole lines only
+    -v, --invert-match       select non-matching lines
+    -U, --multiline          allow matches spanning multiple lines
+        --multiline-dotall   allow `.` to match newlines in multiline mode
+    -n, --line-number        print line numbers (always on; accepted for parity)
+    -A, --after-context <n>  lines of context after each match
+    -B, --before-context <n> lines of context before each match
+    -C, --context <n>        lines of context before and after each match
+    -g, --glob <glob>        filter paths by glob (repeatable, `!` negates)
+        --iglob <glob>       case-insensitive glob filter (repeatable)
+    -t, --type <type>        only search files of <type> (`--type-list` lists all)
+    -T, --type-not <type>    exclude files of <type>
+    -d, --max-depth <n>      descend at most <n> directories
+    -m, --max-count <n>      stop after <n> matching lines per file
+        --limit <n>          stop after <n> total result lines (default 200)
+    -l, --files-with-matches print only `[path]` headers of matching files
+        --files-without-match print only `[path]` headers of non-matching files
+    -c, --count              print `[path] (<count> matches)` per matching file
+        --files              print `[path]` for every searched file
+    -., --hidden             include hidden files
+    -L, --follow             follow symbolic links
+    -u, --unrestricted       reduce filtering (`-u` no-ignore, `-uu` +hidden, `-uuu` +binary)
+        --no-ignore          do not respect ignore files
         --                   end of options
 
 SG OPTIONS:
     -l, --lang <lang>        language of pattern and files (required)
-    -C, --context <n>        lines of context around each matched node
+    -p, --pattern <pattern>  structural pattern (alternative to positional)
+    -A/-B/-C <n>             context lines around each matched node
     -g, --glob <glob>        filter searched paths by glob (repeatable)
     -m, --limit <n>          stop after <n> matched nodes (default 200)
         --hidden             include hidden files
         --                   end of options
 
-A `-` pattern reads the pattern from stdin (`search sg` only).
+SED OPTIONS (read-only line selection; mutating commands are refused):
+    -n, --quiet, --silent    suppress automatic printing (accepted; always active)
+    -e, --expression <expr>  add a selection expression (repeatable)
+    -E, -r                   extended regular expressions in `/regex/` addresses
+    -f, --file <file>        read selection expressions from file
+        --limit <n>          stop after <n> total output lines
+        --                   end of options
+
+READ SUBCOMMAND OPTIONS (`cat`, `head`, `tail`, `nl`; stdin `-` is refused):
+    cat:  -n, -b, --limit <n>                   (non-plain `-A/-v/-e/-E/-t/-T` refused)
+    head: -n <n>, -<n>, --lines <n>, --limit <n> (-c/--bytes refused)
+    tail: -n <n>, -n +<n>, -<n>, --lines <n>, --limit <n>
+                                                 (-c/--bytes and -f/-F/--follow refused)
+    nl:   -b/-n/-w/-s/-v/-i/-l/-d/-p, --limit <n>
 
 EXAMPLES:
-    search rg 'fn parse' src
-    search rg -F 'a.b' -C 2 .
+    search rg -n 'fn parse' src
+    search rg -nF -C 2 'a.b' src/main.rs
+    search rg -n -e foo -e bar -t py tests/
     search sg 'fn $NAME($$$ARGS) { $$$ }' --lang rust src
+    search sed -n '1,120p' src/main.rs
+    search sed -n '/def foo/,/return/p' src/app.py
+    search cat src/config.toml
+    search head -n 40 src/main.rs
+    search tail -n +120 src/main.rs
+    search nl -ba src/lib.rs
 
 SEE ALSO:
     edit --help   the hashline patch language these anchors feed

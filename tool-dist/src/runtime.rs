@@ -3069,10 +3069,10 @@ printf '%s\n' 'uv @VERSION@'
         for hashline_only in [
             "search rg",
             "search sg",
-            "PUT N.=M:",
-            "CUT N.=M",
+            "PUT N#HH.=M#KK:",
+            "CUT N#HH.=M#KK",
             "MV DEST",
-            "[PATH#TAG]",
+            "N#HH|content",
         ] {
             assert!(
                 !first.contains(hashline_only),
@@ -3082,47 +3082,36 @@ printf '%s\n' 'uv @VERSION@'
     }
 
     #[test]
-    fn hashline_prompt_catalog_injects_complete_search_and_edit_syntax() {
+    fn hashline_prompt_catalog_injects_compact_search_and_edit_syntax() {
         let catalog = bundle().without(ManagedTool::ApplyPatch).catalog();
         let rendered = catalog.render(true).unwrap();
         assert_eq!(rendered, catalog.render(true).unwrap());
 
         for expected in [
+            "search sed",
             "search rg",
-            "-F",
-            "-i",
-            "-S",
-            "-C N",
-            "-g 'glob'",
-            "-m N",
-            "-l",
-            "--hidden",
+            "search cat",
+            "search head",
+            "search tail",
+            "search nl",
             "search sg",
             "--lang <lang>",
-            "[path#TAG]",
-            "N:content",
+            "raw: true",
+            "[PATH]",
+            "N#HH|content",
             "edit <<'PATCH'",
-            "[PATH#TAG]",
-            "PUT N.=M:",
-            "PUT N:",
-            "PUT N*:",
-            "PUT <N:",
+            "PUT N#HH:",
+            "PUT N#HH.=M#KK:",
+            "PUT N#HH*:",
+            "PUT <N#HH:",
+            "PUT >N#HH:",
             "PUT <1:",
-            "PUT >N:",
             "PUT >$:",
-            "PUT >N*:",
-            "CUT N.=M",
-            "CUT N*",
+            "CUT N#HH.=M#KK",
+            "CUT N#HH*",
             "REM",
             "MV DEST",
-            "CUT … @name",
-            "PUT <N @name",
-            "PUT >N @name",
-            "PUT >$ @name",
-            "PUT N.=M @name",
-            "PUT N* @name",
-            "`+` alone = blank line",
-            "`+-`/`++`",
+            "edit --help",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -3132,10 +3121,6 @@ printf '%s\n' 'uv @VERSION@'
         assert!(
             !rendered.contains("*** Begin Patch"),
             "hashline catalog must not show apply_patch syntax:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("edit --help"),
-            "hashline catalog must inject complete syntax directly rather than deferring to `edit --help`:\n{rendered}"
         );
     }
 

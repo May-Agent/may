@@ -838,8 +838,8 @@ fn subagent_instructions_report_to_the_parent_and_never_the_user() {
         "{text}"
     );
     // Non-hashline subagent instructions must not inject hashline patch ops.
-    assert!(!text.contains("PUT N.=M:"), "{text}");
-    assert!(!text.contains("CUT N.=M"), "{text}");
+    assert!(!text.contains("PUT N#HH.=M#KK:"), "{text}");
+    assert!(!text.contains("CUT N#HH.=M#KK"), "{text}");
 }
 
 #[test]
@@ -867,24 +867,30 @@ fn hashline_prepared_tools_inject_complete_syntax_for_main_and_subagents() {
     let subagent_text = subagent_blocks.join("\n");
 
     for expected in [
+        "search sed",
         "search rg",
+        "search cat",
+        "search head",
+        "search tail",
+        "search nl",
         "search sg",
         "--lang <lang>",
+        "raw: true",
         "edit <<'PATCH'",
-        "[PATH#TAG]",
-        "PUT N.=M:",
-        "PUT N:",
-        "PUT N*:",
-        "PUT <N:",
-        "PUT >N:",
+        "[PATH]",
+        "N#HH|content",
+        "PUT N#HH:",
+        "PUT N#HH.=M#KK:",
+        "PUT N#HH*:",
+        "PUT <N#HH:",
+        "PUT >N#HH:",
+        "PUT <1:",
         "PUT >$:",
-        "PUT >N*:",
-        "CUT N.=M",
-        "CUT N*",
+        "CUT N#HH.=M#KK",
+        "CUT N#HH*",
         "REM",
         "MV DEST",
-        "CUT … @name",
-        "PUT <N @name",
+        "edit --help",
     ] {
         assert!(
             hashline_tools.contains(expected),
@@ -899,7 +905,7 @@ fn hashline_prepared_tools_inject_complete_syntax_for_main_and_subagents() {
     let standard_tools =
         super::build_prepared_tools(&tools.catalog(), false).expect("standard prepared tools");
     assert!(
-        !standard_tools.contains("PUT N.=M:"),
+        !standard_tools.contains("PUT N#HH.=M#KK:"),
         "non-hashline prepared_tools must omit hashline syntax:\n{standard_tools}"
     );
     assert!(

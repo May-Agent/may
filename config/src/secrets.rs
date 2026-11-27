@@ -978,6 +978,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 0 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }));
         redactions.redact_tool_result(&mut result);
         let ToolResult::Command(record) = result else {

@@ -724,8 +724,7 @@ mod tests {
 
     #[test]
     fn heredoc_body_of_edit_never_produces_output_redirects() {
-        let script =
-            "edit <<'PATCH'\n[src/main.rs#1A2B]\nPUT >5:\n+fn f() -> i32 { a > b }\nPATCH\n";
+        let script = "edit <<'PATCH'\n[src/main.rs]\nPUT >5#PM:\n+fn f() -> i32 { a > b }\nPATCH\n";
         let actions = inspect_shell_actions(script).expect("parses");
         assert!(
             !actions

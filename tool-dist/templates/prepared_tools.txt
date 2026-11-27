@@ -3,31 +3,21 @@ These commands are already on PATH in the initialized execution environment:
 {% for tool in tools %}- {{ tool.listed_name() }}
 {% endfor %}
 {% if hashline %}### Hashline `search` and `edit`
-- `search rg [opts] <pattern> [path…]` — line search (`-F` literal, `-i` ignore-case, `-S` smart-case, `-C N` context, `-g 'glob'` repeatable / `!` negates, `-m N` limit, `-l` files-with-matches, `--hidden`).
-- `search sg <pattern> --lang <lang> [opts] [path…]` — structural ast-grep search (`-l`/`--lang <lang>` required, `-C N`, `-g 'glob'`, `-m N`, `--hidden`; pattern `-` reads from stdin).
-- Both output `[path#TAG]` sections of `N:content` lines whose tag and line numbers anchor `edit`.
-- Every change to an existing file goes through `edit` on stdin (`edit <<'PATCH'`); create brand-new files with shell redirection. Never modify an existing file with `sed -i`, `perl -i`, `ruby -i`, `apply_patch`, `patch`, `ed`, `ex`, `sponge`, a Python/Node/Bun/Ruby script, a shell redirect, `tee`, or `cp`/`mv`.
-- Each section starts `[PATH#TAG]` (path relative to cwd, no `..` segments). All line numbers name the ORIGINAL lines — hunks in one patch never shift later numbers, and a stale tag refuses the whole patch.
-- Ops (headers ending in `:` take `+` body rows; the rest take none):
-  - `PUT N.=M:` replace lines N–M inclusive
-  - `PUT N:` replace single line N
-  - `PUT N*:` replace syntactic block beginning on line N (anchor the opening line or leading decorator/attribute)
-  - `PUT <N:` insert before line N (`PUT <1:` = file head)
-  - `PUT >N:` insert after line N (`PUT >$:` = file tail)
-  - `PUT >N*:` insert after block beginning on line N
-  - `CUT N.=M` / `CUT N*` delete lines or block and capture
-  - `REM` delete file (stands alone in its section)
-  - `MV DEST` move file to relative `DEST` (edits above land first)
-- Registers: `CUT … @name` captures into `@name`; bodyless `PUT <N @name`, `PUT >N @name`, `PUT >$ @name`, `PUT >N* @name`, `PUT N.=M @name`, or `PUT N* @name` pastes (including across files in one patch). One unlabeled `CUT` + one unlabeled gap `PUT` (`PUT <N`, `PUT >N`, `PUT >$`, `PUT >N*`) moves once within a patch.
-- Body rows: every body row starts with `+` verbatim (`+TEXT`, leading whitespace preserved; `+` alone = blank line; no `-old` or context rows; literal leading `-`/`+` kept as `+-`/`++`).
-- Rules: touch only lines seen with the file's current tag, and re-ground from the echoed `[path#TAG]` after each edit (on a stale tag, re-read with `search` or `cat` before retrying):
+- Read files with `search sed`/`search rg`/`search cat`/`search head`/`search tail`/`search nl`/`search sg` (`--lang <lang>`) for `[PATH]` headers and `N#HH|content` anchors; bare `rg`/`sed -n`/`cat`/`head`/`tail`/`nl` are auto-rewritten to `search …` unless `raw: true`.
+- Edit existing files only via `edit <<'PATCH'` (never `sed -i`, scripts, redirects, `tee`, or `cp`/`mv`); create new files via redirection.
+- Sections start `[PATH]`; copy each line's `N#HH` anchor from `search` or prior `edit` (mismatched hashes reject the whole patch with live lines).
+- Ops (`:` headers take `+TEXT` verbatim, no `N#HH|` prefix; `+` = blank line; no `-old` rows):
+  - `PUT N#HH:` / `PUT N#HH.=M#KK:` / `PUT N#HH*:` replace line / range / block
+  - `PUT <N#HH:` / `PUT >N#HH:` / `PUT <1:` / `PUT >$:` insert before N / after N / BOF / EOF
+  - `CUT N#HH.=M#KK` / `CUT N#HH*` delete; `REM` remove file; `MV DEST` move file
 ```sh
 edit <<'PATCH'
-[src/main.rs#1A2B]
-PUT 3.=5:
+[src/main.rs]
+PUT 3#PM.=5#YN:
 +    new_call();
 PATCH
 ```
+- Run `search --help` / `edit --help` for `YANK`/`PASTE` registers and advanced options.
 {% elif self.has("ast-grep") %}Prefer `ast-grep` patterns over text search for code constructs (`ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`).
 {% endif %}{% if self.has("apply_patch") %}Every change to an existing file goes through `apply_patch`; it validates a contextual patch before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command:
 ```sh

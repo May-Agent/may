@@ -1,0 +1,1 @@
+Auto-rewrote {% for item in rewrites %}{% if !loop.first %}, {% endif %}`{{ item.from }}` to `{{ item.to }}`{% endfor %} so output includes `[path]` and `N#HH|content` hashline anchors for `edit`. Call {% for item in rewrites %}{% if !loop.first %}, {% endif %}`{{ item.to }}`{% endfor %} directly next time, or pass `raw: true` when you intentionally need unrewritten output.

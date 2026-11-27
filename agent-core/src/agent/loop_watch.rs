@@ -765,6 +765,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }))
     }
 

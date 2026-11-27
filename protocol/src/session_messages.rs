@@ -548,6 +548,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 3 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }));
         assert_eq!(
             serde_json::to_value(&result).expect("the result serializes"),

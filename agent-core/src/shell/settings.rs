@@ -77,7 +77,7 @@ fn arguments() -> BTreeMap<&'static str, Cow<'static, str>> {
         ),
         (
             "raw",
-            "When true, skip all output compression and return the verbatim stdout bytes, for checksums, binary protocols and diff inputs. Default false.",
+            "When true, skip all output compression and automatic script rewriting and return the verbatim stdout bytes, for checksums, binary protocols and diff inputs. Default false.",
         ),
         (
             "timeout",
