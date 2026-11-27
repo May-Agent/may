@@ -14,6 +14,7 @@ mod patch;
 mod recognise;
 mod shell;
 mod shell_actions;
+mod top_level;
 
 use std::path::Path;
 
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 pub use card::{AnswerCard, AskedCard, Card, RowChange, RowChangeKind, RowView, SubagentState};
 pub use patch::{DiffLine, DiffOp, FileChange, FileEdit, Hunk};
 pub use shell_actions::{ShellAction, ShellActionKind, inspect_shell_actions};
+pub use top_level::{CommandWord, TopLevelSimpleCommand, extract_top_level_simple_commands};
 
 /// A terminal call's script, read into the commands it runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]

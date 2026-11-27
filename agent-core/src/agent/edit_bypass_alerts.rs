@@ -111,7 +111,7 @@ mod tests {
         assert!(content.contains("`sed -i`"), "{content}");
         assert!(content.contains("`src/lib.rs`"), "{content}");
         assert!(content.contains("`edit`"), "{content}");
-        assert!(content.contains("[path#TAG]"), "{content}");
+        assert!(content.contains("N#HH"), "{content}");
         assert!(content.contains("`search`"), "{content}");
 
         // Drained after delivery.

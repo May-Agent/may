@@ -1,7 +1,7 @@
 //! `search sg`: structural search over the ast-grep engine — a `Pattern`
 //! matched against each file's syntax tree, walked by `ignore` the way
-//! `search rg` is. Matches are emitted as `[path#TAG]` sections of the whole
-//! matched node, `N:content` lines, ready for an `edit` anchor.
+//! `search rg` is. Matches are emitted as `[path]` sections of the whole
+//! matched node, `N#HH|content` lines, ready for an `edit` anchor.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -13,15 +13,17 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 
 use crate::error::Error;
-use crate::{file_tag, numbered_line, section_header};
+use crate::{display_path, hashed_line, section_header};
 
 /// Knobs for `search sg`.
 #[derive(Debug, Clone)]
 pub struct SgOptions {
     /// The language pattern and files are parsed as (`--lang`).
     pub lang: String,
-    /// Lines of context around each matched node.
-    pub context: usize,
+    /// Lines of context before each matched node (`-B` / `-C`).
+    pub before_context: usize,
+    /// Lines of context after each matched node (`-A` / `-C`).
+    pub after_context: usize,
     /// Search hidden files too.
     pub hidden: bool,
     /// `-g` glob filters on the searched paths.
@@ -34,7 +36,8 @@ impl Default for SgOptions {
     fn default() -> Self {
         Self {
             lang: String::new(),
-            context: 0,
+            before_context: 0,
+            after_context: 0,
             hidden: false,
             globs: Vec::new(),
             limit: 200,
@@ -47,7 +50,7 @@ impl Default for SgOptions {
 ///
 /// # Errors
 /// Returns [`Error::Usage`] for an unknown language or a pattern that does
-/// not parse, and [`Error::Io`] when a matching file cannot be read.
+/// not parse.
 pub fn run_sg(pattern: &str, paths: &[PathBuf], opts: &SgOptions) -> Result<String, Error> {
     let lang = support_lang(&opts.lang)?;
     let pattern = Pattern::new(pattern, lang);
@@ -57,7 +60,12 @@ pub fn run_sg(pattern: &str, paths: &[PathBuf], opts: &SgOptions) -> Result<Stri
         let mut walker = WalkBuilder::new(&root);
         walker.hidden(!opts.hidden);
         if !opts.globs.is_empty() {
-            let mut overrides = OverrideBuilder::new(&root);
+            let override_root = if root.is_file() {
+                root.parent().unwrap_or_else(|| Path::new("."))
+            } else {
+                &root
+            };
+            let mut overrides = OverrideBuilder::new(override_root);
             for glob in &opts.globs {
                 overrides
                     .add(glob)
@@ -95,7 +103,7 @@ pub fn run_sg(pattern: &str, paths: &[PathBuf], opts: &SgOptions) -> Result<Stri
             if ranges.is_empty() {
                 continue;
             }
-            emit_file(&mut out, path, &text, &ranges, opts, &mut remaining)?;
+            emit_file(&mut out, path, &text, &ranges, opts, &mut remaining);
             if remaining == 0 {
                 break 'paths;
             }
@@ -120,7 +128,7 @@ fn search_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
-/// Appends one file's `[path#TAG]` section of matched node spans to `out`.
+/// Appends one file's `[path]` section of matched node spans to `out`.
 fn emit_file(
     out: &mut String,
     path: &Path,
@@ -128,32 +136,38 @@ fn emit_file(
     ranges: &[(usize, usize)],
     opts: &SgOptions,
     remaining: &mut usize,
-) -> Result<(), Error> {
-    let tag = file_tag(text);
-    let display = path.display().to_string();
-    let _ = writeln!(out, "{}", section_header(&display, &tag));
-    let lines: Vec<&str> = text.split('\n').collect();
+) {
+    let display = display_path(path);
+    let _ = writeln!(out, "{}", section_header(&display));
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if text.ends_with('\n') {
+        lines.pop();
+    }
     let mut previous = 0usize;
     let mut emitted = false;
     for &(start, end) in ranges {
         if *remaining == 0 {
             break;
         }
-        let from = start.saturating_sub(opts.context);
-        let to = (end + opts.context).min(lines.len().saturating_sub(1));
+        let from = start.saturating_sub(opts.before_context);
+        let to = (end + opts.after_context).min(lines.len().saturating_sub(1));
         for number in from..=to {
-            let content = lines.get(number).copied().unwrap_or_default();
+            let content = lines
+                .get(number)
+                .copied()
+                .unwrap_or_default()
+                .strip_suffix('\r')
+                .unwrap_or_else(|| lines.get(number).copied().unwrap_or_default());
             if emitted && number > previous + 1 {
                 let _ = writeln!(out, "--");
             }
             if number <= previous && emitted {
                 continue;
             }
-            let _ = writeln!(out, "{}", numbered_line(number + 1, content));
+            let _ = writeln!(out, "{}", hashed_line(number + 1, content));
             previous = number;
             emitted = true;
         }
         *remaining -= 1;
     }
-    Ok(())
 }

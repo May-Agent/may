@@ -667,6 +667,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 0 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }))
     }
 
@@ -770,6 +771,7 @@ mod tests {
                 outcome,
                 retained_pid: None,
                 interruptions: Vec::new(),
+                notice: None,
             }));
             match parse_tool_end(&result) {
                 ToolEndKind::Output(out) => {

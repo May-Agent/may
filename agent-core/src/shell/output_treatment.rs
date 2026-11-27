@@ -2,7 +2,8 @@
 //! command output treatment.
 //!
 //! - Targeted file reads (`sed -n`, `head`, `tail`, and pipelines ending in
-//!   them), reads of saved output files under `outputs/`, and searches (`rg`,
+//!   them), reads of saved output files under `outputs/`, hashline `search`
+//!   subcommands (`search rg|sg|sed|cat|head|tail|nl`), and searches (`rg`,
 //!   `grep`, `ast-grep`, `sg`, `fd`, read-only `find`) stay
 //!   [`OutputTreatment::Verbatim`]: blank lines are preserved and oversized
 //!   output is never syntax-folded.
@@ -189,7 +190,30 @@ fn classify_unknown(source: &str, piped_in: bool, outputs_dir: Option<&Path>) ->
                 StageKind::Command
             }
         }
+        "search" => classify_hashline_search(args, piped_in),
         _ => StageKind::Command,
+    }
+}
+
+/// Classifies hashline `search <subcmd>` invocations (`rg`, `sg`, `sed`, `cat`,
+/// `head`, `tail`, `nl`) as verbatim reads so blank lines and hashline anchors
+/// are preserved and oversized outputs are never syntax-folded.
+fn classify_hashline_search(args: &[String], piped_in: bool) -> StageKind {
+    if piped_in {
+        return StageKind::Command;
+    }
+    let Some((subcmd, rest)) = args.split_first() else {
+        return StageKind::Command;
+    };
+    if !rest.is_empty()
+        && matches!(
+            subcmd.as_str(),
+            "rg" | "sg" | "sed" | "cat" | "head" | "tail" | "nl"
+        )
+    {
+        StageKind::VerbatimRead
+    } else {
+        StageKind::Command
     }
 }
 

@@ -6,6 +6,7 @@ mod approval;
 mod assembly;
 mod budgets;
 mod environment;
+mod hashline_rewrite;
 mod output_treatment;
 mod pipeline_plan;
 mod python_shim;
@@ -18,6 +19,7 @@ pub use approval::ServerApproval;
 pub use assembly::{ShellAssembly, ShellAssemblyError};
 pub use budgets::ShellBudgets;
 pub use environment::{HostSession, SessionEnvironmentError};
+pub use hashline_rewrite::{HashlineReadRewriter, HashlineRewrite};
 pub use output_treatment::FileReadsAreVerbatim;
 pub use pipeline_plan::MayPipelinePlanner;
 pub use settings::{

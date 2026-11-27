@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use aither_agent::AgentPath;
 use aither_sandbox::{
-    Grants, Interpreter, ScriptCheck, ScriptDecision, ScriptOrigin, ScriptPolicy,
+    Grants, Interpreter, ScriptCheck, ScriptDecision, ScriptDir, ScriptOrigin, ScriptPolicy,
 };
 use may_protocol::command_reading::{ShellAction, ShellActionKind, inspect_shell_actions};
 
@@ -157,8 +157,68 @@ impl EditBypassNotices {
 struct PathScope<'a> {
     start: Option<&'a Path>,
     cwd: Option<&'a Path>,
+    /// True when a container/remote command changed into an unmounted scratch
+    /// directory (such as container `/tmp` or `/dev`) that cannot be statted
+    /// on the host.
+    unmounted_scratch: bool,
     sandbox_dir: Option<&'a Path>,
     grants: Option<&'a Grants>,
+}
+
+enum EffectiveCwd {
+    /// Host path that can be resolved and statted directly.
+    Host(PathBuf),
+    /// Container or remote directory outside the host workspace mount.
+    Unmounted { scratch: bool },
+}
+
+/// Resolves `cd_steps` starting from `start`, translating container workspace
+/// paths back onto the host mount when inside the mounted workspace and
+/// falling back to [`EffectiveCwd::Unmounted`] for container-only directories
+/// (such as `/testbed`) that do not exist on the host.
+fn resolve_effective_cwd(start: &ScriptDir, cd_steps: &[String]) -> EffectiveCwd {
+    match start {
+        ScriptDir::Host(dir) => EffectiveCwd::Host(apply_cd_steps(dir, cd_steps)),
+        ScriptDir::Remote { .. } => EffectiveCwd::Unmounted { scratch: false },
+        ScriptDir::Container { inside, host } => {
+            let inside_path = normalize_path(Path::new(inside.as_str()));
+            let host_path = normalize_path(host);
+            let inside_cwd = apply_cd_steps(&inside_path, cd_steps);
+            let (mount_inside, mount_host) = infer_container_mount_root(&inside_path, &host_path);
+            inside_cwd.strip_prefix(&mount_inside).map_or_else(
+                |_| {
+                    let canon = canonical_tmp_path(&inside_cwd);
+                    EffectiveCwd::Unmounted {
+                        scratch: canon.starts_with("/dev") || is_under_system_temp(&canon),
+                    }
+                },
+                |rel| EffectiveCwd::Host(normalize_path(&mount_host.join(rel))),
+            )
+        }
+    }
+}
+
+/// Walks matching trailing path components backwards from `(inside, host)` to
+/// recover the container workspace mount root (stopping before stripping the
+/// container path down to `/`).
+fn infer_container_mount_root(inside: &Path, host: &Path) -> (PathBuf, PathBuf) {
+    let mut inside_parts: Vec<Component<'_>> = inside.components().collect();
+    let mut host_parts: Vec<Component<'_>> = host.components().collect();
+    while inside_parts.len() > 2 && host_parts.len() > 1 {
+        let (Some(Component::Normal(in_last)), Some(Component::Normal(host_last))) =
+            (inside_parts.last(), host_parts.last())
+        else {
+            break;
+        };
+        if in_last != host_last {
+            break;
+        }
+        inside_parts.pop();
+        host_parts.pop();
+    }
+    let mount_inside: PathBuf = inside_parts.into_iter().collect();
+    let mount_host: PathBuf = host_parts.into_iter().collect();
+    (mount_inside, mount_host)
 }
 
 /// Observes scripts in hashline mode that bypass `edit` to modify existing
@@ -187,6 +247,7 @@ impl HashlineEditBypassPolicy {
             let scope = PathScope {
                 start,
                 cwd: start,
+                unmounted_scratch: false,
                 sandbox_dir,
                 grants,
             };
@@ -200,10 +261,15 @@ impl HashlineEditBypassPolicy {
         let mut found = Vec::new();
         if let Some(actions) = inspect_shell_actions(script.script) {
             for action in &actions {
-                let effective_cwd = start.map(|base| apply_cd_steps(base, &action.cd_steps));
+                let effective = resolve_effective_cwd(script.start, &action.cd_steps);
+                let (cwd, unmounted_scratch) = match &effective {
+                    EffectiveCwd::Host(path) => (Some(path.as_path()), false),
+                    EffectiveCwd::Unmounted { scratch } => (None, *scratch),
+                };
                 let scope = PathScope {
                     start,
-                    cwd: effective_cwd.as_deref(),
+                    cwd,
+                    unmounted_scratch,
                     sandbox_dir,
                     grants,
                 };
@@ -424,8 +490,9 @@ fn check_always_flagged_command(program: &str, args: &[String]) -> Option<EditBy
     }
 }
 
-fn sed_in_place_usage(args: &[String]) -> Option<EditBypassUsage> {
-    let mut in_place_flag: Option<&str> = None;
+/// Returns `"sed -i"` or `"sed --in-place"` when `args` invoke in-place editing
+/// (stopping at `--` and skipping `-e`/`-f`/`--expression`/`--file` values).
+pub fn sed_in_place_flag(args: &[String]) -> Option<&'static str> {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -433,9 +500,7 @@ fn sed_in_place_usage(args: &[String]) -> Option<EditBypassUsage> {
             break;
         }
         if arg == "--in-place" || arg.starts_with("--in-place=") {
-            in_place_flag = Some("sed --in-place");
-            i += 1;
-            continue;
+            return Some("sed --in-place");
         }
         if matches!(arg, "-e" | "--expression" | "-f" | "--file") {
             i += 2;
@@ -448,20 +513,21 @@ fn sed_in_place_usage(args: &[String]) -> Option<EditBypassUsage> {
         if let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
             for ch in cluster.chars() {
                 if ch == 'i' {
-                    in_place_flag = Some("sed -i");
-                    break;
+                    return Some("sed -i");
                 }
                 if matches!(ch, 'e' | 'f') {
                     // Remainder of cluster is the expression/filename, not flags.
                     break;
                 }
             }
-            i += 1;
-            continue;
         }
-        break;
+        i += 1;
     }
-    let mechanism = in_place_flag?;
+    None
+}
+
+fn sed_in_place_usage(args: &[String]) -> Option<EditBypassUsage> {
+    let mechanism = sed_in_place_flag(args)?;
     let target = sed_target_file(args);
     Some(EditBypassUsage::new(mechanism, target))
 }
@@ -580,7 +646,7 @@ fn inspect_stdin_interpreter(
         if inline_flag_value(args, "-c").is_some() || inline_flag_value(args, "-m").is_some() {
             return None;
         }
-        if has_script_file_arg(args) {
+        if has_script_file_arg(args, &["-W", "-X", "-Q"]) {
             return None;
         }
         return Some((program.to_string(), python_file_write_targets(stdin)));
@@ -589,13 +655,25 @@ fn inspect_stdin_interpreter(
         if inline_flag_value(args, "-e").is_some() || inline_flag_value(args, "--eval").is_some() {
             return None;
         }
-        if has_script_file_arg(args) {
+        if has_script_file_arg(
+            args,
+            &[
+                "-r",
+                "--require",
+                "--import",
+                "-C",
+                "--conditions",
+                "--env-file",
+            ],
+        ) {
             return None;
         }
         return Some((program.to_string(), js_file_write_targets(stdin)));
     }
     if program == "ruby" {
-        if inline_flag_value(args, "-e").is_some() || has_script_file_arg(args) {
+        if inline_flag_value(args, "-e").is_some()
+            || has_script_file_arg(args, &["-I", "-r", "-C", "-E", "-F"])
+        {
             return None;
         }
         return Some(("ruby".to_string(), ruby_file_write_targets(stdin)));
@@ -603,14 +681,21 @@ fn inspect_stdin_interpreter(
     None
 }
 
-fn has_script_file_arg(args: &[String]) -> bool {
-    for arg in args {
+fn has_script_file_arg(args: &[String], value_flags: &[&str]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
         if arg == "--" || arg == "-" {
             return false;
+        }
+        if value_flags.contains(&arg) {
+            i += 2;
+            continue;
         }
         if !arg.starts_with('-') {
             return true;
         }
+        i += 1;
     }
     false
 }
@@ -626,21 +711,23 @@ async fn check_scripted_mutation(
     let mut found = Vec::new();
     for target in targets {
         if let Some(raw) = target {
-            if is_scratch_or_allowed_path(raw, scope) {
+            if is_scratch_or_allowed_path(raw, scope).await {
                 continue;
             }
             if let Some(host_cwd) = scope.cwd {
                 if path_exists_as_file(&resolve_path(host_cwd, raw)).await {
                     push_unique(&mut found, EditBypassUsage::new(mechanism, Some(raw)));
                 }
-            } else {
+            } else if !scope.unmounted_scratch || Path::new(raw).is_absolute() {
                 push_unique(&mut found, EditBypassUsage::new(mechanism, Some(raw)));
             }
         } else {
             // Unknown/dynamic target: allow only when cwd itself is clearly scratch.
-            if scope
-                .cwd
-                .is_some_and(|dir| is_scratch_directory(dir, scope))
+            if scope.unmounted_scratch {
+                continue;
+            }
+            if let Some(dir) = scope.cwd
+                && is_scratch_directory(dir, scope).await
             {
                 continue;
             }
@@ -781,7 +868,7 @@ async fn cp_or_mv_overwritten_targets(
 }
 
 async fn target_is_existing_non_scratch(raw: &str, scope: PathScope<'_>) -> bool {
-    if is_scratch_or_allowed_path(raw, scope) {
+    if is_scratch_or_allowed_path(raw, scope).await {
         return false;
     }
     let Some(host_cwd) = scope.cwd else {
@@ -801,8 +888,8 @@ fn canonical_tmp_path(path: &Path) -> PathBuf {
     if let Ok(rest) = normalized.strip_prefix("/private/tmp") {
         return Path::new("/tmp").join(rest);
     }
-    if let Ok(rest) = normalized.strip_prefix("/private/var/tmp") {
-        return Path::new("/var/tmp").join(rest);
+    if let Ok(rest) = normalized.strip_prefix("/private/var") {
+        return Path::new("/var").join(rest);
     }
     normalized
 }
@@ -815,7 +902,7 @@ fn is_under_system_temp(canon: &Path) -> bool {
     canon.starts_with("/tmp") || canon.starts_with("/var/tmp")
 }
 
-fn is_scratch_or_allowed_path(raw: &str, scope: PathScope<'_>) -> bool {
+async fn is_scratch_or_allowed_path(raw: &str, scope: PathScope<'_>) -> bool {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() {
         return true;
@@ -858,10 +945,10 @@ fn is_scratch_or_allowed_path(raw: &str, scope: PathScope<'_>) -> bool {
     } else {
         return false;
     };
-    is_scratch_directory(&resolved, scope)
+    is_scratch_directory(&resolved, scope).await
 }
 
-fn is_scratch_directory(resolved: &Path, scope: PathScope<'_>) -> bool {
+async fn is_scratch_directory(resolved: &Path, scope: PathScope<'_>) -> bool {
     let canon = canonical_tmp_path(resolved);
     if canon.starts_with("/dev") {
         return true;
@@ -876,15 +963,22 @@ fn is_scratch_directory(resolved: &Path, scope: PathScope<'_>) -> bool {
             .iter()
             .any(|prefix| canon.starts_with(sandbox.join(prefix)));
     }
-    // Approved writable directories (and the shell's starting workspace root)
-    // may also reside under `/tmp`; edits inside them are never scratch.
-    if let Some(grants) = scope.grants
-        && grants.snapshot().writable.iter().any(|dir| {
-            let dir_canon = canonical_tmp_path(dir);
-            !is_system_temp_root(&dir_canon) && canon.starts_with(&dir_canon)
-        })
-    {
-        return false;
+    // Approved writable/readable workspace directories (and the shell's
+    // starting workspace root) may also reside under `/tmp`; edits inside them
+    // are never scratch.
+    if let Some(grants) = scope.grants {
+        let snapshot = grants.snapshot();
+        if snapshot
+            .writable
+            .iter()
+            .chain(snapshot.readable.iter())
+            .any(|dir| {
+                let dir_canon = canonical_tmp_path(dir);
+                !is_system_temp_root(&dir_canon) && canon.starts_with(&dir_canon)
+            })
+        {
+            return false;
+        }
     }
     if let Some(root) = scope.start {
         let root_canon = canonical_tmp_path(root);
@@ -892,7 +986,27 @@ fn is_scratch_directory(resolved: &Path, scope: PathScope<'_>) -> bool {
             return false;
         }
     }
-    is_under_system_temp(&canon)
+    if !is_under_system_temp(&canon) {
+        return false;
+    }
+    // A real git repository checked out under `/tmp` (for example in an
+    // unsandboxed evaluation harness) is never scratch.
+    !has_git_ancestor_under_temp(resolved).await
+}
+
+async fn has_git_ancestor_under_temp(path: &Path) -> bool {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        let canon = canonical_tmp_path(dir);
+        if !is_under_system_temp(&canon) || is_system_temp_root(&canon) {
+            break;
+        }
+        if async_fs::metadata(dir.join(".git")).await.is_ok() {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
 }
 
 /// Shared Python file-mutation detector used by both [`HashlineEditBypassPolicy`]
@@ -945,16 +1059,20 @@ pub fn python_file_write_targets(source: &str) -> Vec<Option<String>> {
     for call in scan_calls(source, CommentStyle::Hash) {
         if call.name == "open" {
             let args = split_top_level_args(call.args);
-            let is_method = call.dot_receiver.is_some();
-            if python_open_is_mutating(&args, is_method, has_non_stdio_write_method) {
-                let target = call.dot_receiver.map_or_else(
-                    || {
-                        python_kwarg(&args, "file")
-                            .or_else(|| args.first().copied())
-                            .and_then(|expr| resolve_python_path_expr(expr, &bindings))
-                    },
-                    |recv| resolve_python_path_expr(recv, &bindings),
-                );
+            // `io.open`, `codecs.open`, `builtins.open` take `(file, mode, ...)`
+            // just like builtin `open`, whereas `Path(...).open(mode)` takes `mode` first.
+            let is_path_method = call
+                .dot_receiver
+                .is_some_and(|recv| !matches!(recv, "io" | "_io" | "codecs" | "builtins"));
+            if python_open_is_mutating(&args, is_path_method, has_non_stdio_write_method) {
+                let target = if is_path_method {
+                    call.dot_receiver
+                        .and_then(|recv| resolve_python_path_expr(recv, &bindings))
+                } else {
+                    python_kwarg(&args, "file")
+                        .or_else(|| args.first().copied())
+                        .and_then(|expr| resolve_python_path_expr(expr, &bindings))
+                };
                 targets.push(target);
             }
             continue;
@@ -968,15 +1086,19 @@ pub fn python_file_write_targets(source: &str) -> Vec<Option<String>> {
         }
         if matches!(call.name, "replace" | "rename")
             && let Some(recv) = call.dot_receiver
-            && (recv == "os" || looks_like_python_path_receiver(recv, &bindings))
         {
             let args = split_top_level_args(call.args);
-            let dest_index = usize::from(recv == "os");
-            let target = args
-                .get(dest_index)
-                .and_then(|expr| resolve_python_path_expr(expr, &bindings));
-            targets.push(target);
-            continue;
+            // `os.replace(src, dst)` takes 2 args; `Path.replace(dst)` takes 1 arg
+            // (unlike `str.replace(old, new)` which takes 2-3 args).
+            if recv == "os" || (args.len() == 1 && looks_like_python_path_receiver(recv, &bindings))
+            {
+                let dest_index = usize::from(recv == "os");
+                let target = args
+                    .get(dest_index)
+                    .and_then(|expr| resolve_python_path_expr(expr, &bindings));
+                targets.push(target);
+                continue;
+            }
         }
         if call.name == "truncate" && call.dot_receiver == Some("os") {
             let args = split_top_level_args(call.args);
@@ -1096,36 +1218,72 @@ fn python_kwarg<'a>(args: &[&'a str], key: &str) -> Option<&'a str> {
     None
 }
 
-fn collect_python_path_bindings(source: &str) -> HashMap<String, Option<String>> {
-    let mut bindings: HashMap<String, Option<String>> = HashMap::new();
+#[derive(Clone, PartialEq, Eq)]
+struct PythonPathBinding {
+    path: String,
+    is_path_obj: bool,
+}
+
+fn collect_python_path_bindings(source: &str) -> HashMap<String, Option<PythonPathBinding>> {
+    let mut bindings: HashMap<String, Option<PythonPathBinding>> = HashMap::new();
     for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        let stripped = strip_trailing_hash_comment(line.trim());
+        if stripped.is_empty() {
             continue;
         }
-        let Some((lhs, rhs)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if rhs.starts_with('=') {
-            continue;
+        for stmt in split_top_level_semicolons(stripped) {
+            let trimmed = stmt.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some((lhs, rhs)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if rhs.starts_with('=') {
+                continue;
+            }
+            let name = lhs.trim();
+            if !is_ident(name) {
+                continue;
+            }
+            let resolved = extract_direct_python_binding(rhs.trim());
+            bindings
+                .entry(name.to_string())
+                .and_modify(|existing| {
+                    if *existing != resolved {
+                        *existing = None;
+                    }
+                })
+                .or_insert(resolved);
         }
-        let name = lhs.trim();
-        if !is_ident(name) {
-            continue;
-        }
-        // Strip trailing inline comment outside quotes when inspecting the RHS.
-        let rhs = strip_trailing_hash_comment(rhs.trim());
-        let resolved = extract_direct_python_path(rhs);
-        bindings
-            .entry(name.to_string())
-            .and_modify(|existing| {
-                if *existing != resolved {
-                    *existing = None;
-                }
-            })
-            .or_insert(resolved);
     }
     bindings
+}
+
+fn split_top_level_semicolons(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_string(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&line[start..]);
+    out
 }
 
 fn strip_trailing_hash_comment(expr: &str) -> &str {
@@ -1162,10 +1320,13 @@ fn strip_trailing_hash_comment(expr: &str) -> &str {
     expr
 }
 
-fn extract_direct_python_path(expr: &str) -> Option<String> {
+fn extract_direct_python_binding(expr: &str) -> Option<PythonPathBinding> {
     let expr = expr.trim();
     if let Some(lit) = unquote_literal(expr) {
-        return Some(lit);
+        return Some(PythonPathBinding {
+            path: lit,
+            is_path_obj: false,
+        });
     }
     for prefix in ["Path(", "pathlib.Path("] {
         if let Some(rest) = expr.strip_prefix(prefix)
@@ -1173,7 +1334,10 @@ fn extract_direct_python_path(expr: &str) -> Option<String> {
         {
             let args = split_top_level_args(inner);
             if args.len() == 1 {
-                return unquote_literal(args[0]);
+                return unquote_literal(args[0]).map(|path| PythonPathBinding {
+                    path,
+                    is_path_obj: true,
+                });
             }
         }
     }
@@ -1182,14 +1346,16 @@ fn extract_direct_python_path(expr: &str) -> Option<String> {
 
 fn resolve_python_path_expr(
     expr: &str,
-    bindings: &HashMap<String, Option<String>>,
+    bindings: &HashMap<String, Option<PythonPathBinding>>,
 ) -> Option<String> {
     let expr = expr.trim();
-    if let Some(direct) = extract_direct_python_path(expr) {
-        return Some(direct);
+    if let Some(direct) = extract_direct_python_binding(expr) {
+        return Some(direct.path);
     }
     if is_ident(expr) {
-        return bindings.get(expr).cloned().flatten();
+        return bindings
+            .get(expr)
+            .and_then(|entry| entry.as_ref().map(|binding| binding.path.clone()));
     }
     for prefix in ["Path(", "pathlib.Path("] {
         if let Some(rest) = expr.strip_prefix(prefix)
@@ -1204,11 +1370,17 @@ fn resolve_python_path_expr(
     None
 }
 
-fn looks_like_python_path_receiver(recv: &str, bindings: &HashMap<String, Option<String>>) -> bool {
+fn looks_like_python_path_receiver(
+    recv: &str,
+    bindings: &HashMap<String, Option<PythonPathBinding>>,
+) -> bool {
     let recv = recv.trim();
     recv.starts_with("Path(")
         || recv.starts_with("pathlib.Path(")
-        || bindings.get(recv).is_some_and(Option::is_some)
+        || bindings
+            .get(recv)
+            .and_then(Option::as_ref)
+            .is_some_and(|binding| binding.is_path_obj)
 }
 
 fn unquote_literal(expr: &str) -> Option<String> {

@@ -571,6 +571,7 @@ mod tests {
             outcome: CommandOutcome::Exited { code: 3 },
             retained_pid: None,
             interruptions: Vec::new(),
+            notice: None,
         }));
         let stored = serde_json::to_string(&ToolEventRecord::End {
             id: "call_1".to_string(),

@@ -21,17 +21,16 @@ pub enum Error {
         /// What went wrong with it.
         detail: String,
     },
-    /// A file's live content no longer matches the tag the patch named.
-    #[error(
-        "{path}: stale tag {expected} — the file changed since the search or read it came from (live tag {live}); search or read it again and re-anchor the edit"
-    )]
-    StaleTag {
+    /// One or more line anchors in a section did not match the live file.
+    #[error("{path}: hash mismatch (no files were modified):\n{details}\n{context}")]
+    HashMismatch {
         /// The path the section named.
         path: PathBuf,
-        /// The tag the patch named.
-        expected: String,
-        /// The tag the live file computes to.
-        live: String,
+        /// Per-anchor mismatch descriptions and any moved-line hints.
+        details: String,
+        /// Live `[path]` section with `N#HH|content` context around mismatches
+        /// and hinted lines.
+        context: String,
     },
     /// An op addressed lines the file does not have, or ranges overlapped.
     #[error("{path}: {detail}")]
@@ -41,7 +40,7 @@ pub enum Error {
         /// What the op got wrong.
         detail: String,
     },
-    /// A `N*` op's language could not resolve a block.
+    /// A `N#HH*` op's language could not resolve a block.
     #[error("{path}: line {line} does not begin a block{hint}")]
     NoBlock {
         /// The path the section named.
@@ -51,9 +50,9 @@ pub enum Error {
         /// A hint such as " for this file type" when known.
         hint: &'static str,
     },
-    /// A register was pasted before a `CUT` filled it.
+    /// A register was pasted before a `YANK` or `CUT` filled it.
     #[error(
-        "{path}: register @{name} is empty — a `CUT … @{name}` must precede the `PUT … @{name}` that uses it"
+        "{path}: register `{name}` is empty — a `YANK {name} …` or `CUT … @{name}` must precede the paste that uses it"
     )]
     EmptyRegister {
         /// The path the section named.

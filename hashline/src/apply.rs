@@ -1,23 +1,41 @@
-//! Applies a parsed hashline patch to files under a base directory.
+//! Applies a parsed stateless per-line hashline patch to files under a base
+//! directory.
 //!
-//! Line numbers in a patch always address the file as the tag that read
-//! minted it: edits are compiled against the original lines and applied in
-//! one pass, so applied hunks never shift the numbers of the ops that follow.
-//! Every file's tag is verified before any write lands, so a stale file
-//! refuses the whole patch rather than half-applying it.
+//! Line numbers in a patch always address the original file: edits are
+//! compiled against the original lines and applied in one pass, so applied
+//! hunks never shift the numbers of the ops that follow. Every line anchor in
+//! every section is verified against live disk contents before any write lands,
+//! so a single mismatch refuses the whole patch atomically with live context
+//! and moved-line hints.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::block::BlockResolver;
 use crate::error::Error;
-use crate::parse::{self, Op, PasteTarget, Range, Section};
-use crate::{file_tag, section_header};
+use crate::parse::{self, LineAnchor, Op, PasteTarget, Range, Section};
+use crate::{format_hash, hashed_line, line_hash, section_header, split_display_lines};
+
+/// Surrounding hashed context lines echoed around each edited hunk.
+const ECHO_CONTEXT: usize = 2;
+/// Maximum lines echoed in full for a single merged hunk window before eliding.
+const ECHO_LIMIT: usize = 40;
+/// Head lines shown when a single merged hunk window exceeds [`ECHO_LIMIT`].
+const ECHO_HEAD: usize = 25;
+/// Tail lines shown when a single merged hunk window exceeds [`ECHO_LIMIT`].
+const ECHO_TAIL: usize = 10;
+/// Surrounding live context lines shown around each mismatched anchor.
+const MISMATCH_CONTEXT: usize = 3;
+/// Surrounding live context lines shown around each hinted moved line.
+const MOVED_HINT_CONTEXT: usize = 2;
+/// Maximum live context lines printed in a hash-mismatch refusal.
+const MAX_MISMATCH_CONTEXT_LINES: usize = 40;
 
 /// The result of applying a whole patch.
 #[derive(Debug)]
 pub struct ApplyReport {
-    /// One report per section the patch held, in patch order.
+    /// One report per unique touched file, in first-seen patch order.
     pub sections: Vec<SectionReport>,
 }
 
@@ -28,11 +46,14 @@ pub struct SectionReport {
     pub path: PathBuf,
     /// What happened to the file.
     pub outcome: FileOutcome,
-    /// The tag the new content hashes to (`None` when the file was removed).
-    pub new_tag: Option<String>,
-    /// The 1-indexed inclusive span of lines the edit changed in the new
-    /// numbering, when the outcome was a change.
+    /// The overall 1-indexed inclusive span covering first hunk start through
+    /// last hunk end in the new numbering, when the outcome was a change.
     pub changed: Option<Range>,
+    /// Individual 1-indexed inclusive new-numbering ranges for each distinct
+    /// edited hunk.
+    pub hunks: Vec<Range>,
+    /// Net line-count change (`new_lines.len() as isize - old_lines.len() as isize`).
+    pub line_delta: isize,
 }
 
 /// The file-level result of one section.
@@ -58,12 +79,12 @@ struct Clipboard {
     anon: Option<Vec<String>>,
     /// How many unlabeled `CUT`s have not been pasted since.
     pending_anon: usize,
-    /// Lines captured into named registers.
+    /// Lines captured into named registers via `YANK` or `CUT … @name`.
     named: HashMap<String, Vec<String>>,
 }
 
 impl Clipboard {
-    /// Records the lines a `CUT` captured.
+    /// Records the lines a `CUT` or `YANK` captured.
     fn capture(&mut self, register: Option<&str>, lines: Vec<String>) {
         match register {
             Some(name) => {
@@ -76,7 +97,7 @@ impl Clipboard {
         }
     }
 
-    /// Reads the register a `PUT` names.
+    /// Reads the register a `PASTE` or `PUT` paste names.
     fn paste(&mut self, path: &str, register: Option<&str>) -> Result<Vec<String>, Error> {
         match register {
             Some(name) => self
@@ -95,9 +116,8 @@ impl Clipboard {
                             "an unlabeled `PUT` paste needs one unlabeled `CUT` ahead of it"
                                 .to_string()
                         } else {
-                            "several unlabeled `CUT`s precede this paste — name the one it "
+                            "several unlabeled `CUT`s precede this paste — name the register with `YANK R …` / `PASTE R …` or `CUT … @R` / `PUT … @R`"
                                 .to_string()
-                                + "means: `CUT … @name` and `PUT … @name`"
                         },
                     });
                 }
@@ -142,19 +162,21 @@ impl FileEdits {
         self.inserts.entry(gap).or_default().extend(lines);
     }
 
-    /// Whether an op other than `REM`/`MV` was compiled.
+    /// Whether an op other than `REM`/`MV`/`YANK` mutated content.
     fn has_content_ops(&self) -> bool {
         !self.deleted.is_empty() || !self.inserts.is_empty()
     }
 }
 
-/// One file's state while a patch is being compiled and applied.
+/// One file's state while a patch is being verified, compiled, and applied.
 struct FileState {
     /// Original text, whole.
     text: String,
-    /// The lines `text` splits into on `\n`.
+    /// Normalized display lines (`\r` stripped, trailing `\n` omitted).
     lines: Vec<String>,
-    /// Whether `text` ends in a newline.
+    /// Original line separator (`"\r\n"` when the file uses CRLF, else `"\n"`).
+    line_ending: &'static str,
+    /// Whether post-edit non-empty text should end with [`Self::line_ending`].
     final_newline: bool,
     /// Compiled edits on the original numbering.
     edits: FileEdits,
@@ -171,16 +193,16 @@ impl FileState {
             path: PathBuf::from(path),
             detail: "not UTF-8 text — hashline edits text files".to_string(),
         })?;
-        let final_newline = text.ends_with('\n');
-        let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
-        let lines = if final_newline {
-            lines[..lines.len() - 1].to_vec()
-        } else {
-            lines
-        };
+        let line_ending = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let final_newline = text.is_empty() || text.ends_with('\n');
+        let lines = split_display_lines(&text)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         Ok(Self {
             text,
             lines,
+            line_ending,
             final_newline,
             edits: FileEdits::default(),
         })
@@ -188,7 +210,7 @@ impl FileState {
 
     /// A 1-indexed line number checked against the file's length.
     fn bound(&self, path: &str, line: usize) -> Result<(), Error> {
-        if line > self.lines.len() {
+        if line == 0 || line > self.lines.len() {
             return Err(Error::Anchoring {
                 path: PathBuf::from(path),
                 detail: format!("line {line} is past the file's {} lines", self.lines.len()),
@@ -202,70 +224,155 @@ impl FileState {
         self.bound(path, range.end)
     }
 
-    /// The post-edit text.
+    /// The post-edit text, preserving original CRLF vs LF and trailing newline.
     fn new_text(&self) -> String {
+        if !self.edits.has_content_ops() {
+            return self.text.clone();
+        }
         let mut out = String::with_capacity(self.text.len());
         for (index, line) in self.lines.iter().enumerate() {
             let line_no = index + 1;
             if let Some(lines) = self.edits.inserts.get(&index) {
                 for inserted in lines {
                     out.push_str(inserted);
-                    out.push('\n');
+                    out.push_str(self.line_ending);
                 }
             }
             if !self.edits.deleted.contains(&line_no) {
                 out.push_str(line);
-                out.push('\n');
+                out.push_str(self.line_ending);
             }
         }
         if let Some(lines) = self.edits.inserts.get(&self.lines.len()) {
             for inserted in lines {
                 out.push_str(inserted);
-                out.push('\n');
+                out.push_str(self.line_ending);
             }
         }
-        if !self.final_newline && out.ends_with('\n') {
-            out.pop();
+        if !self.final_newline && out.ends_with(self.line_ending) {
+            out.truncate(out.len() - self.line_ending.len());
         }
         out
     }
 
-    /// The 1-indexed span of new-numbering lines the edit changed, or `None`
-    /// when the post-edit text equals the original.
-    fn changed_span(&self, new_text: &str) -> Option<Range> {
-        let new_lines: Vec<&str> = new_text.split('\n').collect();
-        let old_lines: Vec<&str> = self.text.split('\n').collect();
-        let common = old_lines.len().min(new_lines.len());
-        let mut first = 0;
-        while first < common && old_lines[first] == new_lines[first] {
-            first += 1;
+    /// Computes individual 1-indexed inclusive new-numbering ranges for each
+    /// distinct edited hunk directly from the compiled edit map.
+    fn changed_hunks(&self, new_text: &str) -> Vec<Range> {
+        if new_text == self.text {
+            return Vec::new();
         }
-        let mut tail = 0;
-        while tail < common - first
-            && old_lines[old_lines.len() - 1 - tail] == new_lines[new_lines.len() - 1 - tail]
+        let new_lines = split_display_lines(new_text);
+        let total_new = new_lines.len();
+        if total_new == 0 {
+            return Vec::new();
+        }
+        let old_lines = &self.lines;
+        let old_len = old_lines.len();
+        let mut hunks = Vec::new();
+        let mut in_change = false;
+        let mut old_start = 0usize;
+        let mut new_start = 0usize;
+        let mut emitted_new = 0usize;
+
+        let flush = |hunks: &mut Vec<Range>,
+                     old_start: usize,
+                     old_end: usize,
+                     new_start: usize,
+                     new_end: usize| {
+            let mut os = old_start;
+            let mut oe = old_end;
+            let mut ns = new_start;
+            let mut ne = new_end;
+            while os < oe && ns < ne && old_lines[os] == new_lines[ns] {
+                os += 1;
+                ns += 1;
+            }
+            while os < oe && ns < ne && old_lines[oe - 1] == new_lines[ne - 1] {
+                oe -= 1;
+                ne -= 1;
+            }
+            if os == oe && ns == ne {
+                return;
+            }
+            if ns < ne {
+                hunks.push(Range {
+                    start: ns + 1,
+                    end: ne,
+                });
+            } else {
+                hunks.push(delete_anchor(ns, total_new));
+            }
+        };
+
+        for index in 0..old_len {
+            let line_no = index + 1;
+            if let Some(inserted) = self.edits.inserts.get(&index)
+                && !inserted.is_empty()
+            {
+                if !in_change {
+                    in_change = true;
+                    old_start = index;
+                    new_start = emitted_new;
+                }
+                emitted_new += inserted.len();
+            }
+            if self.edits.deleted.contains(&line_no) {
+                if !in_change {
+                    in_change = true;
+                    old_start = index;
+                    new_start = emitted_new;
+                }
+            } else {
+                if in_change {
+                    flush(&mut hunks, old_start, index, new_start, emitted_new);
+                    in_change = false;
+                }
+                emitted_new += 1;
+            }
+        }
+        if let Some(inserted) = self.edits.inserts.get(&old_len)
+            && !inserted.is_empty()
         {
-            tail += 1;
+            if !in_change {
+                in_change = true;
+                old_start = old_len;
+                new_start = emitted_new;
+            }
+            emitted_new += inserted.len();
         }
-        if first == old_lines.len() && first == new_lines.len() {
-            return None;
+        if in_change {
+            flush(&mut hunks, old_start, old_len, new_start, emitted_new);
         }
-        let end = new_lines.len().saturating_sub(tail);
-        Some(Range {
-            start: first + 1,
-            end: end.max(first + 1),
-        })
+        hunks
     }
 }
 
-/// Parses `patch` and applies it to files under `base`.
+fn delete_anchor(new_index: usize, total_new: usize) -> Range {
+    if new_index == 0 {
+        Range { start: 1, end: 1 }
+    } else if new_index >= total_new {
+        Range {
+            start: total_new,
+            end: total_new,
+        }
+    } else {
+        Range {
+            start: new_index,
+            end: new_index + 1,
+        }
+    }
+}
+
+/// Parses `patch` and applies it atomically to files under `base`.
 ///
-/// Relative section paths resolve against `base`; absolute paths are refused
-/// by the parser. All file tags are verified before any write lands.
+/// Relative section paths resolve against `base`; absolute paths and `..`
+/// segments are refused by the parser. Every `LineAnchor` across every section
+/// is validated against live disk contents before any write lands.
 ///
 /// # Errors
 /// Returns [`Error`] when the patch does not parse, a file is missing or
-/// unreadable, a tag is stale, ops misaddress lines or overlap, a register is
-/// empty, a block anchor resolves nothing, or a write fails.
+/// unreadable, any line anchor mismatches, ops overlap, a register is empty,
+/// a block anchor resolves nothing, or a write fails.
 pub fn apply_patch(
     base: &Path,
     patch: &str,
@@ -273,51 +380,232 @@ pub fn apply_patch(
 ) -> Result<ApplyReport, Error> {
     let sections = parse::parse(patch)?;
 
-    // Load and tag-check every file before compiling a single edit.
-    let mut files: Vec<(Section, FileState)> = Vec::with_capacity(sections.len());
+    // Phase 1: load every unique target file once (merging duplicate sections).
+    let mut path_index: HashMap<String, usize> = HashMap::new();
+    let mut files: Vec<(String, FileState)> = Vec::new();
+    let mut raw_sections: Vec<(usize, Section)> = Vec::with_capacity(sections.len());
+
     for section in sections {
         let abs = base.join(&section.path);
         if !abs.is_file() {
+            if let Some((stripped, tag)) = section.path.rsplit_once('#')
+                && !stripped.is_empty()
+                && tag.len() == 4
+                && tag.bytes().all(|b| b.is_ascii_hexdigit())
+                && base.join(stripped).is_file()
+            {
+                return Err(Error::File {
+                    path: PathBuf::from(&section.path),
+                    detail: format!(
+                        "no such file — section headers use `[{stripped}]` without a `#TAG` suffix, and lines are anchored individually with `N#HH` from `search` (e.g. `PUT 12#VK:`)"
+                    ),
+                });
+            }
             return Err(Error::File {
                 path: PathBuf::from(&section.path),
                 detail: "no such file — `edit` edits existing files".to_string(),
             });
         }
-        let state = FileState::load(&abs, &section.path)?;
-        let live = file_tag(&state.text);
-        if live != section.tag {
-            return Err(Error::StaleTag {
-                path: PathBuf::from(&section.path),
-                expected: section.tag,
-                live,
-            });
-        }
-        files.push((section, state));
+        let idx = if let Some(&existing) = path_index.get(&section.path) {
+            existing
+        } else {
+            let loaded = FileState::load(&abs, &section.path)?;
+            let idx = files.len();
+            path_index.insert(section.path.clone(), idx);
+            files.push((section.path.clone(), loaded));
+            idx
+        };
+        raw_sections.push((idx, section));
     }
 
-    // Compile ops file by file, in patch order, so registers flow across
-    // sections the way a `CUT` in one feeds a `PUT` in the next.
-    let mut clipboard = Clipboard::default();
-    for (section, state) in &mut files {
-        let path = section.path.clone();
+    // Phase 2: strictly validate ALL line anchors in ALL sections per file
+    // before compiling or writing anything.
+    let mut anchors_per_file: Vec<Vec<LineAnchor>> = vec![Vec::new(); files.len()];
+    for (file_idx, section) in &raw_sections {
         for op in &section.ops {
-            compile_op(op, &path, state, &mut clipboard, resolver)?;
+            collect_op_anchors(op, &mut anchors_per_file[*file_idx]);
+        }
+    }
+    for ((path, file_state), anchors) in files.iter().zip(anchors_per_file.iter()) {
+        validate_file_anchors(path, file_state, anchors)?;
+    }
+
+    // Phase 3: compile ops in exact patch order so registers flow across sections.
+    let mut clipboard = Clipboard::default();
+    for (file_idx, section) in &raw_sections {
+        let (path, file_state) = &mut files[*file_idx];
+        let path_owned = path.clone();
+        for op in &section.ops {
+            compile_op(op, &path_owned, file_state, &mut clipboard, resolver)?;
         }
     }
 
-    // Apply and write each file, collecting reports.
+    // Phase 4: write each unique file once and build the report.
     let mut report = ApplyReport {
         sections: Vec::with_capacity(files.len()),
     };
-    for (section, state) in files {
-        report
-            .sections
-            .push(write_section(base, &section.path, &state)?);
+    for (path, file_state) in files {
+        let section_report = write_section(base, &path, &file_state)?;
+        report.sections.push(section_report);
     }
     Ok(report)
 }
 
-/// Compiles one op into `state`'s edit set, updating registers.
+/// Appends every [`LineAnchor`] carried by `op` in appearance order.
+fn collect_op_anchors(op: &Op, out: &mut Vec<LineAnchor>) {
+    match op {
+        Op::Replace { range, .. } | Op::Cut { range, .. } | Op::Yank { range, .. } => {
+            out.push(range.start);
+            if range.end != range.start {
+                out.push(range.end);
+            }
+        }
+        Op::ReplaceBlock { anchor, .. }
+        | Op::InsertBefore { anchor, .. }
+        | Op::InsertAfter { anchor, .. }
+        | Op::InsertAfterBlock { anchor, .. }
+        | Op::CutBlock { anchor, .. }
+        | Op::YankBlock { anchor, .. } => out.push(*anchor),
+        Op::Paste { target, .. } => match *target {
+            PasteTarget::Before(anchor)
+            | PasteTarget::After(anchor)
+            | PasteTarget::AfterBlock(anchor)
+            | PasteTarget::Block(anchor) => out.push(anchor),
+            PasteTarget::Range(range) => {
+                out.push(range.start);
+                if range.end != range.start {
+                    out.push(range.end);
+                }
+            }
+            PasteTarget::BeforeStart | PasteTarget::Eof => {}
+        },
+        Op::InsertBeforeStart { .. } | Op::InsertEof { .. } | Op::Remove | Op::Move { .. } => {}
+    }
+}
+
+/// Validates every anchor for one file, collecting ALL mismatches and moved-line
+/// hints before returning an actionable [`Error::HashMismatch`].
+fn validate_file_anchors(
+    path: &str,
+    file_state: &FileState,
+    anchors: &[LineAnchor],
+) -> Result<(), Error> {
+    if anchors.is_empty() {
+        return Ok(());
+    }
+    let live_hashes: Vec<[u8; 2]> = file_state.lines.iter().map(|l| line_hash(l)).collect();
+    let total = file_state.lines.len();
+
+    let mut seen_mismatches: Vec<LineAnchor> = Vec::new();
+    let mut details: Vec<String> = Vec::new();
+    let mut context_lines: BTreeSet<usize> = BTreeSet::new();
+
+    for &anchor in anchors {
+        if anchor.line >= 1 && anchor.line <= total && live_hashes[anchor.line - 1] == anchor.hash {
+            continue;
+        }
+        if seen_mismatches.contains(&anchor) {
+            continue;
+        }
+        seen_mismatches.push(anchor);
+
+        let expected_hh = format_hash(anchor.hash);
+        let mut line_msg = if anchor.line >= 1 && anchor.line <= total {
+            let actual_hh = format_hash(live_hashes[anchor.line - 1]);
+            format!(
+                "  expected {}#{expected_hh}, found {}#{actual_hh}",
+                anchor.line, anchor.line
+            )
+        } else {
+            format!(
+                "  expected {}#{expected_hh}, but file only has {total} lines",
+                anchor.line
+            )
+        };
+
+        // Scan all live lines for moved-line hints.
+        let mut matches: Vec<usize> = live_hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &h)| (h == anchor.hash).then_some(idx + 1))
+            .collect();
+        let hinted_line = match matches.len() {
+            1 => {
+                let moved_line = matches[0];
+                let _ = write!(line_msg, " (hint: #{expected_hh} is at line {moved_line})");
+                Some(moved_line)
+            }
+            2..=3 => {
+                matches.sort_unstable_by_key(|&m| (m.abs_diff(anchor.line), m));
+                let list = matches
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(line_msg, " (hint: #{expected_hh} matches lines {list})");
+                Some(matches[0])
+            }
+            _ => None,
+        };
+        details.push(line_msg);
+
+        if total > 0 {
+            let center = anchor.line.clamp(1, total);
+            let lo = center.saturating_sub(MISMATCH_CONTEXT).max(1);
+            let hi = center.saturating_add(MISMATCH_CONTEXT).min(total);
+            context_lines.extend(lo..=hi);
+            if let Some(moved) = hinted_line {
+                let lo = moved.saturating_sub(MOVED_HINT_CONTEXT).max(1);
+                let hi = moved.saturating_add(MOVED_HINT_CONTEXT).min(total);
+                context_lines.extend(lo..=hi);
+            }
+        }
+    }
+
+    if details.is_empty() {
+        return Ok(());
+    }
+
+    let mut context = String::new();
+    let _ = writeln!(context, "{}", section_header(path));
+    if total == 0 {
+        let _ = write!(context, "(empty file)");
+    } else {
+        let mut prev = 0usize;
+        let mut emitted = 0usize;
+        let mut omitted = 0usize;
+        for line_no in context_lines {
+            if emitted >= MAX_MISMATCH_CONTEXT_LINES {
+                omitted += 1;
+                continue;
+            }
+            if prev != 0 && line_no > prev + 1 {
+                let _ = writeln!(context, "--");
+            }
+            let _ = writeln!(
+                context,
+                "{}",
+                hashed_line(line_no, &file_state.lines[line_no - 1])
+            );
+            prev = line_no;
+            emitted += 1;
+        }
+        if omitted > 0 {
+            let _ = writeln!(context, "... ({omitted} lines omitted)");
+        }
+        while context.ends_with('\n') {
+            context.pop();
+        }
+    }
+
+    Err(Error::HashMismatch {
+        path: PathBuf::from(path),
+        details: details.join("\n"),
+        context,
+    })
+}
+
+/// Compiles one op into `state`'s edit set and updates registers.
 fn compile_op(
     op: &Op,
     path: &str,
@@ -327,61 +615,81 @@ fn compile_op(
 ) -> Result<(), Error> {
     match op {
         Op::Replace { range, body } => {
-            state.bound_range(path, *range)?;
-            state.edits.insert(range.start - 1, body.iter().cloned());
-            state.edits.delete(path, *range)?;
+            let lines = range.lines();
+            state.bound_range(path, lines)?;
+            state.edits.insert(lines.start - 1, body.iter().cloned());
+            state.edits.delete(path, lines)?;
         }
-        Op::ReplaceBlock { line, body } => {
-            let span = block_at(path, state, *line, resolver)?;
+        Op::ReplaceBlock { anchor, body } => {
+            let span = block_at(path, state, anchor.line, resolver)?;
             state.edits.insert(span.start - 1, body.iter().cloned());
             state.edits.delete(path, span)?;
         }
-        Op::InsertBefore { line, body } => {
-            state.bound(path, *line)?;
-            state.edits.insert(line - 1, body.iter().cloned());
+        Op::InsertBeforeStart { body } => {
+            state.edits.insert(0, body.iter().cloned());
         }
-        Op::InsertAfter { line, body } => {
-            state.bound(path, *line)?;
-            state.edits.insert(*line, body.iter().cloned());
+        Op::InsertBefore { anchor, body } => {
+            state.bound(path, anchor.line)?;
+            state.edits.insert(anchor.line - 1, body.iter().cloned());
+        }
+        Op::InsertAfter { anchor, body } => {
+            state.bound(path, anchor.line)?;
+            state.edits.insert(anchor.line, body.iter().cloned());
         }
         Op::InsertEof { body } => {
             state.edits.insert(state.lines.len(), body.iter().cloned());
         }
-        Op::InsertAfterBlock { line, body } => {
-            let span = block_at(path, state, *line, resolver)?;
+        Op::InsertAfterBlock { anchor, body } => {
+            let span = block_at(path, state, anchor.line, resolver)?;
             state.edits.insert(span.end, body.iter().cloned());
         }
         Op::Cut { range, register } => {
-            state.bound_range(path, *range)?;
-            let captured: Vec<String> = state.lines[range.start - 1..range.end].to_vec();
+            let lines = range.lines();
+            state.bound_range(path, lines)?;
+            let captured: Vec<String> = state.lines[lines.start - 1..lines.end].to_vec();
             clipboard.capture(register.as_deref(), captured);
-            state.edits.delete(path, *range)?;
+            state.edits.delete(path, lines)?;
         }
-        Op::CutBlock { line, register } => {
-            let span = block_at(path, state, *line, resolver)?;
+        Op::CutBlock { anchor, register } => {
+            let span = block_at(path, state, anchor.line, resolver)?;
             let captured: Vec<String> = state.lines[span.start - 1..span.end].to_vec();
             clipboard.capture(register.as_deref(), captured);
             state.edits.delete(path, span)?;
         }
+        Op::Yank { register, range } => {
+            let lines = range.lines();
+            state.bound_range(path, lines)?;
+            let captured: Vec<String> = state.lines[lines.start - 1..lines.end].to_vec();
+            clipboard.capture(Some(register.as_str()), captured);
+        }
+        Op::YankBlock { register, anchor } => {
+            let span = block_at(path, state, anchor.line, resolver)?;
+            let captured: Vec<String> = state.lines[span.start - 1..span.end].to_vec();
+            clipboard.capture(Some(register.as_str()), captured);
+        }
         Op::Paste { target, register } => {
             let content = clipboard.paste(path, register.as_deref())?;
             let (gap, range) = match *target {
-                PasteTarget::Before(line) => {
-                    state.bound(path, line)?;
-                    (line - 1, None)
+                PasteTarget::BeforeStart => (0, None),
+                PasteTarget::Before(anchor) => {
+                    state.bound(path, anchor.line)?;
+                    (anchor.line - 1, None)
                 }
-                PasteTarget::After(line) => {
-                    state.bound(path, line)?;
-                    (line, None)
+                PasteTarget::After(anchor) => {
+                    state.bound(path, anchor.line)?;
+                    (anchor.line, None)
                 }
                 PasteTarget::Eof => (state.lines.len(), None),
-                PasteTarget::AfterBlock(line) => (block_at(path, state, line, resolver)?.end, None),
-                PasteTarget::Range(range) => {
-                    state.bound_range(path, range)?;
-                    (range.start - 1, Some(range))
+                PasteTarget::AfterBlock(anchor) => {
+                    (block_at(path, state, anchor.line, resolver)?.end, None)
                 }
-                PasteTarget::Block(line) => {
-                    let span = block_at(path, state, line, resolver)?;
+                PasteTarget::Range(range) => {
+                    let lines = range.lines();
+                    state.bound_range(path, lines)?;
+                    (lines.start - 1, Some(lines))
+                }
+                PasteTarget::Block(anchor) => {
+                    let span = block_at(path, state, anchor.line, resolver)?;
                     (span.start - 1, Some(span))
                 }
             };
@@ -424,7 +732,7 @@ fn compile_op(
     Ok(())
 }
 
-/// Resolves the block beginning at a 1-indexed line, or a [`Error::NoBlock`].
+/// Resolves the block beginning at a 1-indexed line, or [`Error::NoBlock`].
 fn block_at(
     path: &str,
     state: &FileState,
@@ -453,8 +761,9 @@ fn write_section(base: &Path, path: &str, state: &FileState) -> Result<SectionRe
         return Ok(SectionReport {
             path: PathBuf::from(path),
             outcome: FileOutcome::Removed,
-            new_tag: None,
             changed: None,
+            hunks: Vec::new(),
+            line_delta: -(state.lines.len() as isize),
         });
     }
     let new_text = state.new_text();
@@ -471,8 +780,18 @@ fn write_section(base: &Path, path: &str, state: &FileState) -> Result<SectionRe
             source,
         })?;
     }
-    let changed = state.changed_span(&new_text);
-    let outcome = match (&state.edits.move_to, changed.is_some()) {
+
+    let hunks = state.changed_hunks(&new_text);
+    let changed = (!hunks.is_empty()).then(|| Range {
+        start: hunks[0].start,
+        end: hunks[hunks.len() - 1].end,
+    });
+    let actually_changed = new_text != state.text;
+    let old_count = state.lines.len() as isize;
+    let new_count = split_display_lines(&new_text).len() as isize;
+    let line_delta = new_count - old_count;
+
+    let outcome = match (&state.edits.move_to, actually_changed) {
         (Some(_), _) => FileOutcome::Moved {
             dest: PathBuf::from(state.edits.move_to.clone().expect("checked")),
         },
@@ -482,8 +801,9 @@ fn write_section(base: &Path, path: &str, state: &FileState) -> Result<SectionRe
     Ok(SectionReport {
         path: PathBuf::from(path),
         outcome,
-        new_tag: Some(file_tag(&new_text)),
         changed,
+        hunks,
+        line_delta,
     })
 }
 
@@ -530,12 +850,183 @@ fn write_atomic(
     Ok(())
 }
 
-/// The `[path#TAG]` header a report's file gets in the edit response.
+/// Formats per-hunk `±2` hashed context windows (`N#HH|content`) for `hunks`,
+/// merging overlapping/adjacent windows, separating disjoint windows with `--`,
+/// and eliding any single window > 40 lines with head(25) + `... (N lines omitted)`
+/// + tail(10) without hiding subsequent hunks.
+#[must_use]
+pub fn format_hunk_echo(text: &str, hunks: &[Range]) -> String {
+    let lines = split_display_lines(text);
+    if lines.is_empty() || hunks.is_empty() {
+        return String::new();
+    }
+    let total = lines.len();
+    let mut windows: Vec<(usize, usize)> = hunks
+        .iter()
+        .filter_map(|range| {
+            let start = range.start.saturating_sub(ECHO_CONTEXT).max(1).min(total);
+            let end = range.end.saturating_add(ECHO_CONTEXT).min(total);
+            (start <= end).then_some((start, end))
+        })
+        .collect();
+    if windows.is_empty() {
+        return String::new();
+    }
+    windows.sort_unstable_by_key(|&(start, _)| start);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(windows.len());
+    for (start, end) in windows {
+        match merged.last_mut() {
+            Some((_, prev_end)) if start <= *prev_end + 1 => {
+                *prev_end = (*prev_end).max(end);
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let mut out = String::new();
+    for (win_idx, (start, end)) in merged.into_iter().enumerate() {
+        if win_idx > 0 {
+            let _ = writeln!(out, "--");
+        }
+        let count = end - start + 1;
+        if count <= ECHO_LIMIT {
+            for line_no in start..=end {
+                let _ = writeln!(out, "{}", hashed_line(line_no, lines[line_no - 1]));
+            }
+        } else {
+            for line_no in start..start + ECHO_HEAD {
+                let _ = writeln!(out, "{}", hashed_line(line_no, lines[line_no - 1]));
+            }
+            let omitted = count - ECHO_HEAD - ECHO_TAIL;
+            let _ = writeln!(out, "... ({omitted} lines omitted)");
+            let tail_start = end - ECHO_TAIL + 1;
+            for line_no in tail_start..=end {
+                let _ = writeln!(out, "{}", hashed_line(line_no, lines[line_no - 1]));
+            }
+        }
+    }
+    out
+}
+
+/// The `[path]` header a report's file gets in the edit response, annotated
+/// with `(+N lines)` / `(-N lines)` when the line count changed.
 #[must_use]
 pub fn report_header(report: &SectionReport) -> String {
-    report
-        .new_tag
-        .as_deref()
-        .map(|tag| section_header(&report.path.to_string_lossy(), tag))
-        .unwrap_or_else(|| format!("[{}#----]", report.path.to_string_lossy()))
+    let display = match &report.outcome {
+        FileOutcome::Moved { dest } => dest.to_string_lossy(),
+        _ => report.path.to_string_lossy(),
+    };
+    let base = section_header(&display);
+    if matches!(report.outcome, FileOutcome::Removed) {
+        return format!("{base} (removed)");
+    }
+    if report.line_delta == 0 {
+        return base;
+    }
+    let abs_delta = report.line_delta.unsigned_abs();
+    let unit = if abs_delta == 1 { "line" } else { "lines" };
+    if report.line_delta > 0 {
+        format!("{base} (+{abs_delta} {unit})")
+    } else {
+        format!("{base} (-{abs_delta} {unit})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_hunk_echo_elides_giant_hunk_with_25_and_10_without_hiding_next_hunk() {
+        let mut lines = Vec::new();
+        for i in 1..=140 {
+            lines.push(format!("line_{i}"));
+        }
+        let text = format!("{}\n", lines.join("\n"));
+
+        // Giant hunk spanning 10..=70 (expanded 8..=72 = 65 lines > 40) plus disjoint hunk at 130.
+        let echo = format_hunk_echo(
+            &text,
+            &[
+                Range { start: 10, end: 70 },
+                Range {
+                    start: 130,
+                    end: 130,
+                },
+            ],
+        );
+
+        // Head(25): 8..=32, omitted: 65 - 25 - 10 = 30, tail(10): 63..=72.
+        assert!(
+            echo.contains(&format!("{}\n", hashed_line(8, "line_8"))),
+            "echo:\n{echo}"
+        );
+        assert!(
+            echo.contains(&format!("{}\n", hashed_line(32, "line_32"))),
+            "echo:\n{echo}"
+        );
+        assert!(
+            !echo.contains(&format!("{}\n", hashed_line(33, "line_33"))),
+            "echo:\n{echo}"
+        );
+        assert!(echo.contains("... (30 lines omitted)\n"), "echo:\n{echo}");
+        assert!(
+            !echo.contains(&format!("{}\n", hashed_line(62, "line_62"))),
+            "echo:\n{echo}"
+        );
+        assert!(
+            echo.contains(&format!("{}\n", hashed_line(63, "line_63"))),
+            "echo:\n{echo}"
+        );
+        assert!(
+            echo.contains(&format!("{}\n", hashed_line(72, "line_72"))),
+            "echo:\n{echo}"
+        );
+        // Separate disjoint hunk at 130 (expanded 128..=132) is NEVER hidden!
+        assert!(
+            echo.contains(&format!("\n--\n{}\n", hashed_line(128, "line_128"))),
+            "echo:\n{echo}"
+        );
+        assert!(
+            echo.contains(&format!("{}\n", hashed_line(132, "line_132"))),
+            "echo:\n{echo}"
+        );
+    }
+
+    #[test]
+    fn report_header_formats_positive_negative_zero_and_removed() {
+        let base = SectionReport {
+            path: PathBuf::from("a.rs"),
+            outcome: FileOutcome::Modified,
+            changed: None,
+            hunks: Vec::new(),
+            line_delta: 0,
+        };
+        assert_eq!(report_header(&base), "[a.rs]");
+
+        let added = SectionReport {
+            line_delta: 11,
+            ..base
+        };
+        assert_eq!(report_header(&added), "[a.rs] (+11 lines)");
+
+        let removed = SectionReport {
+            line_delta: -3,
+            ..added
+        };
+        assert_eq!(report_header(&removed), "[a.rs] (-3 lines)");
+
+        let one = SectionReport {
+            line_delta: 1,
+            ..removed
+        };
+        assert_eq!(report_header(&one), "[a.rs] (+1 line)");
+
+        let deleted_file = SectionReport {
+            outcome: FileOutcome::Removed,
+            line_delta: -10,
+            ..one
+        };
+        assert_eq!(report_header(&deleted_file), "[a.rs] (removed)");
+    }
 }
