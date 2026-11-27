@@ -567,8 +567,8 @@ const SOURCE_DRAIN_LIMIT: usize = 256;
 
 /// Promote the calling thread's OS scheduling priority on macOS so interactive
 /// TUI input and rendering stay ahead of background CPU-bound builds.
+#[cfg(target_os = "macos")]
 pub fn promote_thread_qos() {
-    #[cfg(target_os = "macos")]
     // SAFETY: `pthread_set_qos_class_self_np` only adjusts the calling
     // thread's QoS class; `QOS_CLASS_USER_INTERACTIVE` with relative priority
     // `0` is a documented valid invocation.
@@ -577,6 +577,11 @@ pub fn promote_thread_qos() {
             libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
+
+/// Promote the calling thread's OS scheduling priority on macOS so interactive
+/// TUI input and rendering stay ahead of background CPU-bound builds.
+#[cfg(not(target_os = "macos"))]
+pub const fn promote_thread_qos() {}
 
 #[derive(Clone, Copy)]
 struct PendingScroll {
