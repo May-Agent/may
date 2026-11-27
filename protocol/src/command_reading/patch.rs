@@ -11,6 +11,11 @@ use std::path::Path;
 
 use may_patch::{Action, HunkLine, locate_hunks};
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
+
+/// Context lines kept around each change cluster when diffing a shell file
+/// write against an existing file.
+const UNIFIED_CONTEXT_LINES: usize = 3;
 
 /// One file a patch changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
@@ -90,6 +95,97 @@ pub struct DiffLine {
 pub(super) fn parse(text: &str, dir: Option<&Path>) -> Option<Vec<FileEdit>> {
     let actions = may_patch::parse(text).ok()?;
     (!actions.is_empty()).then(|| actions.iter().map(|action| edit(action, dir)).collect())
+}
+
+/// Builds a [`FileEdit`] for a shell write (`>`) or append (`>>`) of literal
+/// `content` to `path`.
+///
+/// When `dir` is present and `dir.join(&path)` is an existing readable UTF-8
+/// file, diffs against its current contents with unified context hunks and
+/// emits [`FileChange::Update`]; otherwise emits [`FileChange::Add`] with
+/// 1-based added lines.
+pub(super) fn write_file(
+    path: String,
+    content: &str,
+    append: bool,
+    dir: Option<&Path>,
+) -> FileEdit {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous pre-edit file diff helper called off the event loop"
+    )]
+    let existing = dir.and_then(|dir| std::fs::read_to_string(dir.join(&path)).ok());
+    if let Some(existing) = existing {
+        let updated: std::borrow::Cow<'_, str> = if append {
+            let mut combined = String::with_capacity(existing.len() + content.len());
+            combined.push_str(&existing);
+            combined.push_str(content);
+            std::borrow::Cow::Owned(combined)
+        } else {
+            std::borrow::Cow::Borrowed(content)
+        };
+        let hunks = diff_hunks(&existing, &updated);
+        return FileEdit {
+            path,
+            change: FileChange::Update {
+                moved_to: None,
+                hunks,
+            },
+        };
+    }
+    let lines = content
+        .lines()
+        .zip(1u32..)
+        .map(|(text, number)| DiffLine {
+            op: DiffOp::Added,
+            text: text.to_owned(),
+            old: None,
+            new: Some(number),
+        })
+        .collect();
+    FileEdit {
+        path,
+        change: FileChange::Add { lines },
+    }
+}
+
+/// Computes unified diff hunks between `old` and `new` with 1-based line
+/// numbers and [`UNIFIED_CONTEXT_LINES`] lines of context.
+fn diff_hunks(old: &str, new: &str) -> Vec<Hunk> {
+    let diff = TextDiff::from_lines(old, new);
+    diff.grouped_ops(UNIFIED_CONTEXT_LINES)
+        .into_iter()
+        .map(|group| {
+            let lines = group
+                .iter()
+                .flat_map(|op| diff.iter_changes(op))
+                .map(|change| {
+                    let op = match change.tag() {
+                        ChangeTag::Equal => DiffOp::Context,
+                        ChangeTag::Delete => DiffOp::Removed,
+                        ChangeTag::Insert => DiffOp::Added,
+                    };
+                    let raw = change.value();
+                    let text = raw
+                        .strip_suffix("\r\n")
+                        .or_else(|| raw.strip_suffix('\n'))
+                        .unwrap_or(raw)
+                        .to_owned();
+                    let old = change
+                        .old_index()
+                        .and_then(|index| u32::try_from(index + 1).ok());
+                    let new = change
+                        .new_index()
+                        .and_then(|index| u32::try_from(index + 1).ok());
+                    DiffLine { op, text, old, new }
+                })
+                .collect();
+            Hunk {
+                anchor: None,
+                lines,
+            }
+        })
+        .collect()
 }
 
 fn edit(action: &Action, dir: Option<&Path>) -> FileEdit {

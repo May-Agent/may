@@ -81,8 +81,9 @@ const html = (reading: CommandReading) => renderToStaticMarkup(<CommandReadingVi
 describe('CommandReadingView', () => {
   test('an edit shows each file with a line-numbered diff', () => {
     const markup = html(edit);
-    expect(markup).toContain('~ src/a.rs');
-    expect(markup).toContain('+ b.txt (new file)');
+    const plain = markup.replace(/<[^>]+>/g, '');
+    expect(plain).toContain('Edited src/a.rs');
+    expect(plain).toContain('Created b.txt');
     expect(markup).toContain('@@ fn main');
     expect(markup).toContain('old line');
     expect(markup).toContain('data-op="removed"');
@@ -90,6 +91,24 @@ describe('CommandReadingView', () => {
     // the removed line keeps its old number, the added line its new one
     expect(markup).toContain('>2</span><span');
     expect(markup).toContain('>new line<');
+  });
+
+  test('a deleted file shows Deleted <path>', () => {
+    const deleted: CommandReading = {
+      steps: [
+        {
+          link: 'start',
+          line: 'Delete stale.txt',
+          intent: {
+            kind: 'edit',
+            files: [{ path: 'stale.txt', change: { kind: 'delete' } }],
+          },
+        },
+      ],
+    };
+    const plain = html(deleted).replace(/<[^>]+>/g, '');
+    expect(plain).toContain('Deleted stale.txt');
+    expect(plain).not.toContain('Delete stale.txt');
   });
 
   test('a read and a search show one line in plain words', () => {
@@ -123,7 +142,8 @@ describe('PermissionBody', () => {
 
   test('an approval for an edit shows the file and diff', () => {
     const markup = renderToStaticMarkup(<PermissionBody request={request} showScript={false} />);
-    expect(markup).toContain('~ src/a.rs');
+    const plain = markup.replace(/<[^>]+>/g, '');
+    expect(plain).toContain('Edited src/a.rs');
     expect(markup).toContain('old line');
     expect(markup).not.toContain('*** Begin Patch');
   });
@@ -131,7 +151,7 @@ describe('PermissionBody', () => {
   test('the raw script is one step away', () => {
     const markup = renderToStaticMarkup(<PermissionBody request={request} showScript />);
     expect(markup).toContain('*** Begin Patch');
-    expect(markup).not.toContain('~ src/a.rs');
+    expect(markup.replace(/<[^>]+>/g, '')).not.toContain('Edited src/a.rs');
   });
 
   test('a request nothing recognised shows its script', () => {

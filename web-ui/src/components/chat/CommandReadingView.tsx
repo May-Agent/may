@@ -8,17 +8,22 @@ const LINK_MARKER: Record<CommandStep['link'], string> = {
   then: ';',
 };
 
-function fileHeading(file: FileEdit): string {
+function fileVerb(file: FileEdit): { label: string; className: string } {
   switch (file.change.kind) {
     case 'add':
-      return `+ ${file.path} (new file)`;
+      return { label: 'Created', className: 'text-emerald-700 dark:text-emerald-400' };
     case 'delete':
-      return `- ${file.path} (deleted)`;
+      return { label: 'Deleted', className: 'text-red-700 dark:text-red-400' };
     case 'update':
-      return file.change.movedTo
-        ? `~ ${file.path} → ${file.change.movedTo}`
-        : `~ ${file.path}`;
+      return { label: 'Edited', className: 'text-cyan-700 dark:text-cyan-400' };
   }
+}
+
+function fileTarget(file: FileEdit): string {
+  if (file.change.kind === 'update' && file.change.movedTo) {
+    return `${file.path} → ${file.change.movedTo}`;
+  }
+  return file.path;
 }
 
 function fileHunks(file: FileEdit): DiffHunk[] {
@@ -55,9 +60,12 @@ function DiffRow({ line }: { line: DiffLine }) {
 }
 
 function FileDiff({ file }: { file: FileEdit }) {
+  const verb = fileVerb(file);
   return (
     <div className="space-y-0.5">
-      <div className="font-medium text-foreground/90">{fileHeading(file)}</div>
+      <div className="font-medium text-foreground/90">
+        <span className={verb.className}>{verb.label}</span> {fileTarget(file)}
+      </div>
       {fileHunks(file).map((hunk, index) => (
         <div key={index} className="rounded border border-border/60 bg-muted/20 py-0.5">
           {hunk.anchor && (
@@ -80,29 +88,41 @@ function FileDiff({ file }: { file: FileEdit }) {
 export function CommandReadingView({ reading }: { reading: CommandReading }) {
   return (
     <div className="space-y-1 text-xs font-mono leading-relaxed" data-testid="command-reading">
-      {reading.steps.map((step, index) => (
-        <div key={index} className="space-y-1">
-          <div className="flex gap-2">
-            <span className="w-5 shrink-0 select-none text-muted-foreground">
-              {LINK_MARKER[step.link]}
-            </span>
-            {step.intent.kind === 'unknown' ? (
-              <span className="min-w-0 whitespace-pre-wrap break-all text-amber-700 dark:text-amber-400">
-                {`$ ${step.intent.source}`}
-              </span>
-            ) : (
-              <span className="min-w-0 text-foreground/90">{step.line}</span>
+      {reading.steps.map((step, index) => {
+        const singleFileEdit = step.intent.kind === 'edit' && step.intent.files.length === 1;
+        return (
+          <div key={index} className="space-y-1">
+            {!singleFileEdit && (
+              <div className="flex gap-2">
+                <span className="w-5 shrink-0 select-none text-muted-foreground">
+                  {LINK_MARKER[step.link]}
+                </span>
+                {step.intent.kind === 'unknown' ? (
+                  <span className="min-w-0 whitespace-pre-wrap break-all text-amber-700 dark:text-amber-400">
+                    {`$ ${step.intent.source}`}
+                  </span>
+                ) : (
+                  <span className="min-w-0 text-foreground/90">{step.line}</span>
+                )}
+              </div>
+            )}
+            {step.intent.kind === 'edit' && (
+              <div className={singleFileEdit ? 'flex gap-2' : 'ml-7 space-y-1.5'}>
+                {singleFileEdit && (
+                  <span className="w-5 shrink-0 select-none text-muted-foreground">
+                    {LINK_MARKER[step.link]}
+                  </span>
+                )}
+                <div className="min-w-0 flex-1 space-y-1.5">
+                  {step.intent.files.map((file, fileIndex) => (
+                    <FileDiff key={fileIndex} file={file} />
+                  ))}
+                </div>
+              </div>
             )}
           </div>
-          {step.intent.kind === 'edit' && (
-            <div className="ml-7 space-y-1.5">
-              {step.intent.files.map((file, fileIndex) => (
-                <FileDiff key={fileIndex} file={file} />
-              ))}
-            </div>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

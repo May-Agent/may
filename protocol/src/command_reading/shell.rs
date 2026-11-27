@@ -32,12 +32,24 @@ impl Arg {
     }
 }
 
+/// Where a simple command redirects standard output when the target is a
+/// literal file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OutputRedirect {
+    /// `>` or `>|`: creates or truncates the file.
+    Write(String),
+    /// `>>`: creates or appends to the file.
+    Append(String),
+}
+
 /// A simple command with its words resolved.
 struct Simple {
     name: String,
     args: Vec<Arg>,
     /// Text fed to standard input by a here-document or here-string.
     stdin: Option<String>,
+    /// Literal file path standard output is redirected to.
+    stdout: Option<OutputRedirect>,
 }
 
 pub(super) fn read(script: &str, dir: Option<&Path>) -> CommandReading {
@@ -100,9 +112,11 @@ fn pipeline(pipeline: &Pipeline, first: Link, dir: Option<&Path>, steps: &mut Ve
         if let (Some(Some(feed)), Some(Some(sink))) = (stages.get(index), stages.get(index + 1))
             && feed.name == "cat"
             && feed.args.is_empty()
+            && feed.stdout.is_none()
             && sink.name == "apply_patch"
             && sink.args.is_empty()
             && sink.stdin.is_none()
+            && sink.stdout.is_none()
             && let Some(text) = &feed.stdin
         {
             let intent = patch::parse(text, dir).map_or_else(
@@ -115,8 +129,32 @@ fn pipeline(pipeline: &Pipeline, first: Link, dir: Option<&Path>, steps: &mut Ve
             index += 2;
             continue;
         }
+        // A literal heredoc piped into `tee`: `cat <<'EOF' | tee [-a] path...`.
+        if let (Some(Some(feed)), Some(Some(sink))) = (stages.get(index), stages.get(index + 1))
+            && feed.name == "cat"
+            && feed.args.is_empty()
+            && feed.stdout.is_none()
+            && sink.name == "tee"
+            && sink.stdin.is_none()
+            && sink.stdout.is_none()
+            && let Some(text) = &feed.stdin
+            && let Some(intents) = recognise::recognise("tee", &sink.args, Some(text), None, dir)
+        {
+            for (offset, intent) in intents.into_iter().enumerate() {
+                let link = if offset == 0 { link } else { Link::Then };
+                steps.push(Step::new(link, intent));
+            }
+            index += 2;
+            continue;
+        }
         let intents = stages[index].as_ref().and_then(|simple| {
-            recognise::recognise(&simple.name, &simple.args, simple.stdin.as_deref(), dir)
+            recognise::recognise(
+                &simple.name,
+                &simple.args,
+                simple.stdin.as_deref(),
+                simple.stdout.as_ref(),
+                dir,
+            )
         });
         match intents {
             Some(intents) => {
@@ -132,7 +170,7 @@ fn pipeline(pipeline: &Pipeline, first: Link, dir: Option<&Path>, steps: &mut Ve
 }
 
 /// Resolves a simple command, or `None` when something about it (an
-/// assignment, a redirect to a file, a process substitution) is beyond
+/// assignment, a dynamic redirect, a process substitution) is beyond
 /// what a recognised command may carry.
 fn simple_command(command: &SimpleCommand) -> Option<Simple> {
     let name = match resolve(&command.word_or_name.as_ref()?.value) {
@@ -141,6 +179,7 @@ fn simple_command(command: &SimpleCommand) -> Option<Simple> {
     };
     let mut args = Vec::new();
     let mut stdin = None;
+    let mut stdout = None;
     let items = command
         .prefix
         .iter()
@@ -149,60 +188,124 @@ fn simple_command(command: &SimpleCommand) -> Option<Simple> {
     for item in items {
         match item {
             CommandPrefixOrSuffixItem::Word(word) => args.push(resolve(&word.value)),
-            CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
-                if let Redirect::Stdin(text) = redirect_effect(redirect)?
-                    && stdin.replace(text).is_some()
-                {
-                    return None;
+            CommandPrefixOrSuffixItem::IoRedirect(redirect) => match redirect_effect(redirect)? {
+                Redirect::Stdin(text) => {
+                    if stdin.replace(text).is_some() {
+                        return None;
+                    }
                 }
-            }
+                Redirect::Stdout(output) => {
+                    if stdout.replace(output).is_some() {
+                        return None;
+                    }
+                }
+                Redirect::Ignored => {}
+            },
             CommandPrefixOrSuffixItem::AssignmentWord(..)
             | CommandPrefixOrSuffixItem::ProcessSubstitution(..) => return None,
         }
     }
-    Some(Simple { name, args, stdin })
+    Some(Simple {
+        name,
+        args,
+        stdin,
+        stdout,
+    })
 }
 
 /// What a redirect does that May reads.
 enum Redirect {
     /// It feeds this text to standard input.
     Stdin(String),
+    /// It writes or appends standard output to a literal file path.
+    Stdout(OutputRedirect),
     /// It only routes output away from the terminal.
     Ignored,
+}
+
+/// Removes leading tab characters from every line of a `<<-` here-document.
+fn strip_heredoc_tabs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        out.push_str(line.trim_start_matches('\t'));
+    }
+    out
 }
 
 /// The effect of a redirect, or `None` for one May cannot read.
 fn redirect_effect(redirect: &IoRedirect) -> Option<Redirect> {
     match redirect {
         IoRedirect::HereDocument(
-            _,
+            fd,
             IoHereDocument {
+                remove_tabs,
                 requires_expansion,
                 doc,
                 ..
             },
-        ) => {
+        ) if fd.is_none() || *fd == Some(0) => {
             if *requires_expansion && doc.value.contains(['$', '`', '\\']) {
                 return None;
             }
-            Some(Redirect::Stdin(doc.value.clone()))
+            let text = if *remove_tabs {
+                strip_heredoc_tabs(&doc.value)
+            } else {
+                doc.value.clone()
+            };
+            Some(Redirect::Stdin(text))
         }
-        IoRedirect::HereString(_, word) => match resolve(&word.value) {
-            Arg::Literal(text) => Some(Redirect::Stdin(text)),
-            Arg::Pattern | Arg::Dynamic => None,
-        },
-        // `2>&1` and `>/dev/null` only route output away from the terminal.
+        IoRedirect::HereString(fd, word) if fd.is_none() || *fd == Some(0) => {
+            match resolve(&word.value) {
+                Arg::Literal(mut text) => {
+                    // Bash appends a trailing newline to every here-string.
+                    text.push('\n');
+                    Some(Redirect::Stdin(text))
+                }
+                Arg::Pattern | Arg::Dynamic => None,
+            }
+        }
+        // `2>&1` only routes output away from the terminal.
         IoRedirect::File(
             _,
             IoFileRedirectKind::DuplicateOutput,
             IoFileRedirectTarget::Duplicate(_) | IoFileRedirectTarget::Fd(_),
         ) => Some(Redirect::Ignored),
+        // `2>/dev/null` discards standard error without touching any file.
         IoRedirect::File(
-            _,
-            IoFileRedirectKind::Write | IoFileRedirectKind::Append,
+            Some(2),
+            IoFileRedirectKind::Write | IoFileRedirectKind::Clobber | IoFileRedirectKind::Append,
             IoFileRedirectTarget::Filename(word),
-        ) if word.value == "/dev/null" => Some(Redirect::Ignored),
-        IoRedirect::File(..) | IoRedirect::OutputAndError(..) => None,
+        ) if resolve(&word.value).literal() == Some("/dev/null") => Some(Redirect::Ignored),
+        // Standard output (`>` / `>|` / `>>`) to a literal file path.
+        IoRedirect::File(
+            fd,
+            kind @ (IoFileRedirectKind::Write
+            | IoFileRedirectKind::Clobber
+            | IoFileRedirectKind::Append),
+            IoFileRedirectTarget::Filename(word),
+        ) if fd.is_none() || *fd == Some(1) => {
+            let Arg::Literal(path) = resolve(&word.value) else {
+                return None;
+            };
+            if path.is_empty() {
+                return None;
+            }
+            if path == "/dev/null" {
+                return Some(Redirect::Ignored);
+            }
+            let output = match kind {
+                IoFileRedirectKind::Write | IoFileRedirectKind::Clobber => {
+                    OutputRedirect::Write(path)
+                }
+                IoFileRedirectKind::Append => OutputRedirect::Append(path),
+                _ => return None,
+            };
+            Some(Redirect::Stdout(output))
+        }
+        IoRedirect::HereDocument(..)
+        | IoRedirect::HereString(..)
+        | IoRedirect::File(..)
+        | IoRedirect::OutputAndError(..) => None,
     }
 }
 

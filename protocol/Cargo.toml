@@ -42,6 +42,7 @@ schemars = { version = "1.0", default-features = false, features = ["derive", "s
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.1", default-features = false }
+similar = { version = "3.2.1", default-features = false, features = ["std", "text"] }
 skyzen = { version = "0.5.2", default-features = false, features = ["openapi"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }

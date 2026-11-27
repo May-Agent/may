@@ -89,7 +89,7 @@ fn wrap_entry_line(line: &Line<'_>, width: u16) -> (WrappedLine, usize) {
     if width == 0 {
         return (WrappedLine::Multi(Vec::new()), 0);
     }
-    if line.width() <= usize::from(width) {
+    if !wrap::has_newline(line) && line.width() <= usize::from(width) {
         return (WrappedLine::Single, 1);
     }
     let rows = wrap::wrap_line(line, width);
@@ -305,7 +305,7 @@ impl Entry {
         assets: &super::chat::ChatAssets,
         tilde_root: Option<&std::path::Path>,
     ) -> Self {
-        let laid = element_lines(elem, state, images_supported, assets, width);
+        let laid = element_lines(elem, state, images_supported, assets, width, tilde_root);
         let mut wrapped = Vec::with_capacity(laid.lines.len());
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;

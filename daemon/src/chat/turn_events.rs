@@ -105,6 +105,9 @@ pub struct TurnEvents<'t, 's, S> {
     pub hosted_calls: std::collections::HashSet<String>,
     pub tool_started_at: HashMap<String, jiff::Timestamp>,
     pub pending_tool_streams: HashMap<String, PendingToolStream>,
+    /// Pre-execution located readings cached per tool call id so `tool_end`
+    /// keeps the pre-edit diff after the command has mutated files on disk.
+    pub located_readings: HashMap<String, CommandReading>,
     pub last_todo_hash: Option<u64>,
     /// The tasks.md content the issue ownership rule accepted last.
     pub tasks_accepted: Option<String>,
@@ -560,6 +563,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             None,
                             false,
                         );
+                        let summary = locate_reading(self.workdir, summary).await;
                         self.sink
                             .on_tool_delta(&id, &name, &arguments_fragment, summary)
                             .await
@@ -609,37 +613,30 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 self.flush_segment();
 
                 // The reading is stored with the call: a located edit's line
-                // numbers come from files the call changes.
-                let visible = match normalize_tool_start_for_sink(
+                // numbers and pre-edit diffs come from files the call changes
+                // before it runs.
+                let start_event = normalize_tool_start_for_sink(
                     &mut self.pending_tool_streams,
                     &id,
                     &name,
                     &arguments,
-                ) {
-                    Some(SinkToolEvent::Start {
-                        id,
-                        name,
-                        arguments,
-                    }) => {
-                        let summary = project_tool_summary_for_sink(
-                            &self.pending_tool_streams,
-                            &id,
-                            &name,
-                            Some(arguments.as_str()),
-                            false,
-                        );
-                        let summary = locate_reading(self.workdir, summary).await;
-                        Some((id, name, arguments, summary))
-                    }
-                    _ => None,
-                };
+                );
+                let summary = project_tool_summary_for_sink(
+                    &self.pending_tool_streams,
+                    &id,
+                    &name,
+                    Some(arguments.as_str()),
+                    false,
+                );
+                let summary = locate_reading(self.workdir, summary).await;
+                if let Some(reading) = summary.reading.clone() {
+                    self.located_readings.insert(id.clone(), reading);
+                }
                 let record = ToolEventRecord::Start {
                     id: id.clone(),
                     name: name.clone(),
                     arguments: arguments.clone(),
-                    reading: visible
-                        .as_ref()
-                        .and_then(|(_, _, _, summary)| summary.reading.clone()),
+                    reading: summary.reading.clone(),
                 };
                 let serialized = serde_json::to_string(&record)
                     .map_err(|e| ChatDbError::Storage(e.to_string()))?;
@@ -653,14 +650,45 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 if name == "terminal" {
                     self.note_tasks_edit(&id, &arguments).await;
                 }
-                if let Some((id, name, arguments, summary)) = visible {
-                    self.log_first_visible_tool_event(&id, &name, "canonical_start");
-                    if !self
-                        .sink
-                        .on_tool_start(&id, &name, &arguments, summary)
-                        .await
-                    {
-                        return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                match start_event {
+                    Some(SinkToolEvent::Start {
+                        id,
+                        name,
+                        arguments,
+                    }) => {
+                        self.log_first_visible_tool_event(&id, &name, "canonical_start");
+                        if !self
+                            .sink
+                            .on_tool_start(&id, &name, &arguments, summary)
+                            .await
+                        {
+                            return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                        }
+                    }
+                    Some(SinkToolEvent::Delta {
+                        id,
+                        name,
+                        arguments_fragment,
+                    }) => {
+                        if let Some(reading) = &summary.reading
+                            && !self.sink.on_tool_reading(&id, reading).await
+                        {
+                            return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                        }
+                        if !self
+                            .sink
+                            .on_tool_delta(&id, &name, &arguments_fragment, summary)
+                            .await
+                        {
+                            return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                        }
+                    }
+                    None => {
+                        if let Some(reading) = &summary.reading
+                            && !self.sink.on_tool_reading(&id, reading).await
+                        {
+                            return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                        }
                     }
                 }
                 Ok(ControlFlow::Continue(()))
@@ -700,13 +728,16 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     record_tool_interval(self.state, self.session_id.as_str(), started, at).await;
                 }
                 let arguments = self.tool_arguments_by_id.remove(&id);
-                let summary = project_tool_summary_for_sink(
+                let mut summary = project_tool_summary_for_sink(
                     &self.pending_tool_streams,
                     &id,
                     &name,
                     arguments.as_deref(),
                     true,
                 );
+                if let Some(reading) = self.located_readings.remove(&id) {
+                    summary.reading = Some(reading);
+                }
                 self.pending_tool_streams.remove(&id);
                 if !self
                     .sink

@@ -2559,6 +2559,20 @@ fn push_image_rows(lines: &mut Vec<Line<'_>>) -> usize {
     index
 }
 
+/// Compact character-count label for a pasted-text attachment, bounded at
+/// [`may_config::pasted_text::REPASTE_INLINE_CHAR_LIMIT`] so very large pastes
+/// never stall the draw path.
+fn pasted_char_label(content: &str) -> String {
+    match may_config::pasted_text::bounded_char_count(
+        content,
+        may_config::pasted_text::REPASTE_INLINE_CHAR_LIMIT,
+    ) {
+        Some(1) => "1 char".to_string(),
+        Some(count) => format!("{count} chars"),
+        None => ">10k chars".to_string(),
+    }
+}
+
 /// One-line text marker for an attachment, matching the historical markers.
 fn attachment_label(attachment: &Attachment) -> String {
     match attachment {
@@ -2568,10 +2582,10 @@ fn attachment_label(attachment: &Attachment) -> String {
             content,
             saved_path,
         } => {
-            let size = content.len();
+            let label = pasted_char_label(content);
             saved_path.as_ref().map_or_else(
-                || format!("[pasted text: {size} bytes]"),
-                |path| format!("[pasted text: {size} bytes -> {}]", path.display()),
+                || format!("[pasted text: {label}]"),
+                |path| format!("[pasted text: {label} -> {}]", path.display()),
             )
         }
     }
@@ -3457,6 +3471,7 @@ pub(super) fn element_lines(
     images_supported: bool,
     assets: &ChatAssets,
     width: u16,
+    tilde_root: Option<&std::path::Path>,
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
@@ -3559,6 +3574,7 @@ pub(super) fn element_lines(
                 &mut images,
                 state.open,
                 &assets.highlighting,
+                tilde_root,
                 Some(&mut stage_marks),
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
@@ -3798,7 +3814,14 @@ pub(super) fn element_lines(
                     // Members carry their own expansion state — the group's
                     // `state` describes the group row itself.
                     let inner_state = ElementState::of(inner, None, state.hide_todos);
-                    let sub = element_lines(inner, inner_state, images_supported, assets, width);
+                    let sub = element_lines(
+                        inner,
+                        inner_state,
+                        images_supported,
+                        assets,
+                        width,
+                        tilde_root,
+                    );
                     let offset = lines.len();
                     let target_base = u32::try_from(stage_targets.len()).unwrap_or(0);
                     lines.extend(sub.lines);
@@ -3925,8 +3948,8 @@ fn render_impl(
         lines: tail,
         band_start,
         greeting_idx: greeting_line_idx,
-        input_idx: input_line_idx,
-        caret_line,
+        input_lines: input_line_range,
+        caret_lines,
         images: tail_images,
     } = build_tail(
         queue_ctx.as_ref(),
@@ -4006,7 +4029,10 @@ fn render_impl(
         ..inner
     };
     // Visible rows come pre-wrapped from the cached layout and `tail_wrapped`
-    // so nothing re-wraps unchanged elements on every frame.
+    // so nothing re-wraps unchanged elements on every frame. Fill trailing
+    // line backgrounds before handing `visible_rows` to `Paragraph` (which
+    // starts with `Style::default()` and only styles cells holding graphemes),
+    // avoiding a per-frame clone of the visible row slice.
     {
         let mut visible_rows = layout.visible_wrapped_lines(top, view_height);
         if top + view_height > element_rows {
@@ -4020,6 +4046,7 @@ fn render_impl(
                     .map(chat_layout::borrow_line),
             );
         }
+        super::wrap::paint_line_backgrounds(&visible_rows, 0, body, frame.buffer_mut());
         Paragraph::new(visible_rows).render(body, frame.buffer_mut());
     }
     // Patch running tool spinners and active pipeline sweep directly into the
@@ -4059,22 +4086,23 @@ fn render_impl(
     layout.set_greeting_row(
         greeting_line_idx.map(|index| element_rows + tail_starts.get(index).copied().unwrap_or(0)),
     );
-    layout.set_input_span(input_line_idx.map(|index| {
-        (
-            element_rows + tail_starts.get(index).copied().unwrap_or(0),
-            tail_line_rows.get(index).copied().unwrap_or(0),
-        )
+    layout.set_input_span(input_line_range.as_ref().map(|range| {
+        let start = element_rows + tail_starts.get(range.start).copied().unwrap_or(0);
+        let rows: usize = tail_line_rows
+            .get(range.clone())
+            .map_or(0, |counts| counts.iter().sum());
+        (start, rows)
     }));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
-    if let (Some(caret_line), Some(input_idx)) = (caret_line, input_line_idx)
-        && let Some((cx, cy)) = wrapped_tail_cell(&caret_line, inner.width)
+    if let (Some(caret_lines), Some(input_range)) = (caret_lines, input_line_range)
+        && let Some((cx, cy)) = wrapped_caret_cell(&caret_lines, inner.width)
     {
         let caret_row = top_padding
             + element_rows
-            + tail_starts.get(input_idx).copied().unwrap_or(0)
-            + usize::from(cy);
+            + tail_starts.get(input_range.start).copied().unwrap_or(0)
+            + cy;
         if caret_row >= top && caret_row - top < usize::from(area.height) {
             frame.set_cursor_position((
                 inner.x + cx,
@@ -4093,9 +4121,11 @@ struct Tail {
     /// the last row. `None` when there is no band.
     band_start: Option<usize>,
     greeting_idx: Option<usize>,
-    input_idx: Option<usize>,
-    /// The input up to the caret, when the caret owns the terminal cursor.
-    caret_line: Option<Line<'static>>,
+    /// Range in `lines` covering every logical line of the composer input.
+    input_lines: Option<std::ops::Range<usize>>,
+    /// The input logical lines up to the caret, when the caret owns the
+    /// terminal cursor.
+    caret_lines: Option<Vec<Line<'static>>>,
     /// Attached image blocks: `(key, index in lines, caption)`.
     images: Vec<(String, usize, String)>,
 }
@@ -4120,7 +4150,7 @@ fn build_tail(
         render_queue_lines(&mut lines, ctx, width);
     }
     let mut band_start = None;
-    let (mut greeting_idx, mut input_idx, mut caret_line) = (None, None, None);
+    let (mut greeting_idx, mut input_lines, mut caret_lines) = (None, None, None);
     if input_ctx.is_some() || status_ctx.is_some() {
         lines.push(Line::from(""));
         band_start = Some(lines.len());
@@ -4132,9 +4162,9 @@ fn build_tail(
             lines.push(greeting_line(text));
         }
         if caret_active {
-            caret_line = Some(input_caret_line(ctx));
+            caret_lines = Some(input_caret_lines(ctx));
         }
-        input_idx = Some(render_input_line(
+        input_lines = Some(render_input_line(
             &mut lines,
             ctx,
             width,
@@ -4155,8 +4185,8 @@ fn build_tail(
         lines: lines.into_iter().map(line_into_static).collect(),
         band_start,
         greeting_idx,
-        input_idx,
-        caret_line,
+        input_lines,
+        caret_lines,
         images,
     }
 }
@@ -4280,9 +4310,9 @@ fn input_prefix_spans(input: &str, attachments: &[Attachment]) -> Vec<Span<'stat
     // Pasted text attachments
     for att in attachments {
         if let Attachment::PastedText { content, .. } = att {
-            let size = content.len();
+            let label = pasted_char_label(content);
             spans.push(Span::styled(
-                format!("[pasted: {size} bytes] "),
+                format!("[pasted: {label}] "),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -4290,53 +4320,183 @@ fn input_prefix_spans(input: &str, attachments: &[Attachment]) -> Vec<Span<'stat
     spans
 }
 
-/// The byte offset of the cursor a click `column` cells into the input lands on.
+/// The byte offset of the cursor a click at wrapped `(row, column)` inside
+/// the composer lands on.
 ///
-/// `column` counts from the left edge of the input line's first row, the
-/// widths of the rows above the clicked one included. The result is the
-/// boundary before the grapheme the click hits, measured with the widths the
-/// renderer draws, and `input.len()` past the end.
+/// `row` counts wrapped rows from the top of the composer, `column` counts
+/// display cells from the left edge of `row`, and `width` is the composer's
+/// inner wrap width. The result is the grapheme boundary before the clicked
+/// cluster, clamped to the end of the clicked logical line (or `input.len()`
+/// past the last row).
 #[must_use]
-pub fn caret_at_column(input: &str, attachments: &[Attachment], column: usize) -> usize {
-    let prefix_width: usize = input_prefix_spans(input, attachments)
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    let target = column.saturating_sub(prefix_width);
-    // The leading `!` of a bash-mode input is drawn as part of the prefix.
-    let first = usize::from(bash_mode(input));
+pub fn caret_at_position(
+    input: &str,
+    attachments: &[Attachment],
+    width: u16,
+    row: usize,
+    column: usize,
+) -> usize {
     let secret_start = secret_value_start(input);
-    let mut covered = 0usize;
-    for (offset, cluster) in input[first..].grapheme_indices(true) {
-        let at = first + offset;
-        let masked = secret_start.is_some_and(|start| at >= start)
-            && !cluster.chars().all(char::is_whitespace);
-        let width = if masked {
-            UnicodeWidthStr::width("•")
+    let bash = bash_mode(input);
+    let mut remaining_row = row;
+    let mut line_start = 0usize;
+    let mut line_index = 0usize;
+    let mut parts = input.split('\n').peekable();
+    while let Some(part) = parts.next() {
+        let line_end = line_start + part.len();
+        let prefix_spans = if line_index == 0 {
+            input_prefix_spans(input, attachments)
         } else {
-            drawn_width(cluster)
+            Vec::new()
         };
-        if covered + width > target {
-            return at;
+        // The leading `!` of a bash-mode input is drawn as part of the prefix.
+        let text_start = if line_index == 0 && bash {
+            line_start + 1
+        } else {
+            line_start
+        };
+        let visible = composer_segment(&input[text_start..line_end], text_start, secret_start);
+        let mut line_spans = prefix_spans.clone();
+        line_spans.push(Span::raw(visible.into_owned()));
+        let rendered = Line::from(line_spans);
+        let wrapped = super::wrap::wrap_line(&rendered, width);
+        if remaining_row < wrapped.len() || parts.peek().is_none() {
+            let target_row = remaining_row.min(wrapped.len().saturating_sub(1));
+            return caret_on_wrapped_line(
+                input,
+                text_start..line_end,
+                secret_start,
+                &prefix_spans,
+                &wrapped,
+                target_row,
+                column,
+            );
         }
-        covered += width;
+        remaining_row -= wrapped.len();
+        line_start = line_end + 1;
+        line_index += 1;
     }
     input.len()
 }
 
-/// The input `Line` up to and including the caret marker: prompt,
-/// attachment chips and the text before the caret. The caret marker's
-/// cell is where the terminal cursor — and therefore IME composition —
-/// anchors.
-fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
-    let mut spans = input_prefix_spans(ctx.input, ctx.attachments);
+/// Map a click at `(target_row, column)` on one logical composer line back to
+/// its byte offset in `input`.
+fn caret_on_wrapped_line(
+    input: &str,
+    range: std::ops::Range<usize>,
+    secret_start: Option<usize>,
+    prefix_spans: &[Span<'static>],
+    wrapped: &[Line<'static>],
+    target_row: usize,
+    column: usize,
+) -> usize {
+    let text_start = range.start;
+    let line_end = range.end;
+    let mut stream: Vec<(&str, Option<usize>, usize)> = Vec::new();
+    for span in prefix_spans {
+        for g in span.content.graphemes(true) {
+            stream.push((g, None, text_start));
+        }
+    }
+    for (offset, cluster) in input[text_start..line_end].grapheme_indices(true) {
+        let at = text_start + offset;
+        let end = at + cluster.len();
+        let masked = secret_start.is_some_and(|start| at >= start)
+            && !cluster.chars().all(char::is_whitespace);
+        let drawn = if masked { "•" } else { cluster };
+        stream.push((drawn, Some(at), end));
+    }
+
+    let mut stream_idx = 0usize;
+    for wrapped_row in wrapped.iter().take(target_row) {
+        for span in &wrapped_row.spans {
+            for wg in span.content.graphemes(true) {
+                while stream_idx < stream.len() && stream[stream_idx].0 != wg {
+                    stream_idx += 1;
+                }
+                if stream_idx < stream.len() {
+                    stream_idx += 1;
+                }
+            }
+        }
+    }
+
+    let Some(clicked_row) = wrapped.get(target_row) else {
+        return line_end;
+    };
+    let mut covered = 0usize;
+    let mut last_end = stream
+        .get(stream_idx)
+        .and_then(|&(_, start, _)| start)
+        .unwrap_or(text_start);
+    let mut matched_any = false;
+    for span in &clicked_row.spans {
+        for wg in span.content.graphemes(true) {
+            while stream_idx < stream.len() && stream[stream_idx].0 != wg {
+                stream_idx += 1;
+            }
+            let Some(&(_, start, end)) = stream.get(stream_idx) else {
+                break;
+            };
+            stream_idx += 1;
+            matched_any = true;
+            let w = drawn_width(wg);
+            if covered + w > column {
+                return start.unwrap_or(text_start);
+            }
+            covered += w;
+            last_end = end;
+        }
+    }
+    if target_row + 1 >= wrapped.len() {
+        line_end
+    } else if matched_any {
+        last_end
+    } else {
+        text_start
+    }
+}
+
+/// The logical input `Line`s up to and including the caret marker: prompt,
+/// attachment chips and the text before the caret, split on explicit `\n`
+/// breaks. The caret marker's cell on the last line is where the terminal
+/// cursor — and therefore IME composition — anchors.
+fn input_caret_lines(ctx: &InputContext<'_>) -> Vec<Line<'static>> {
     let bash = bash_mode(ctx.input);
     let (before, _) = composer_display_split(ctx.input, ctx.cursor);
     // The bash prompt already draws the leading `!`.
     let start = usize::from(bash);
-    spans.push(Span::raw(before.get(start..).unwrap_or("").to_string()));
-    spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
-    Line::from(spans)
+    let visible_before = before.get(start..).unwrap_or("");
+    let mut out = Vec::new();
+    let mut parts = visible_before.split('\n').enumerate().peekable();
+    while let Some((idx, part)) = parts.next() {
+        let mut spans = if idx == 0 {
+            input_prefix_spans(ctx.input, ctx.attachments)
+        } else {
+            Vec::new()
+        };
+        spans.push(Span::raw(part.to_string()));
+        if parts.peek().is_none() {
+            spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Cell `(x, y)` of the caret marker across wrapped logical `lines`, where
+/// `y` is the wrapped-row offset from the first line of the composer.
+fn wrapped_caret_cell(lines: &[Line<'static>], width: u16) -> Option<(u16, usize)> {
+    if width == 0 {
+        return None;
+    }
+    let (last, above) = lines.split_last()?;
+    let rows_above: usize = above
+        .iter()
+        .map(|line| super::wrap::line_rows(line, width))
+        .sum();
+    let (cx, cy) = wrapped_tail_cell(last, width)?;
+    Some((cx, rows_above + usize::from(cy)))
 }
 
 /// Column of the last non-blank grapheme in one pre-wrapped `row` within
@@ -4380,17 +4540,17 @@ fn wrapped_tail_cell(line: &Line<'static>, width: u16) -> Option<(u16, u16)> {
     None
 }
 
-/// Render the input line into the lines vector and return its index.
-/// Attached images get a placeholder block above the input row — the
-/// overlay paints the preview into it — when the terminal supports
-/// graphics.
+/// Render the input line(s) into the lines vector and return the index range
+/// covering the composer's logical lines. Attached images get a placeholder
+/// block above the input row — the overlay paints the preview into it — when
+/// the terminal supports graphics.
 fn render_input_line(
     lines: &mut Vec<Line<'_>>,
     ctx: &InputContext<'_>,
     width: u16,
     images_supported: bool,
     mut image_positions: Option<&mut Vec<(String, usize, String)>>,
-) -> usize {
+) -> std::ops::Range<usize> {
     if images_supported {
         for att in ctx.attachments {
             if let Attachment::Image { path, .. } = att {
@@ -4404,31 +4564,12 @@ fn render_input_line(
         }
     }
 
-    // Input text with caret (a byte offset on a grapheme boundary). The real
-    // terminal cursor marks the caret — the `│` stays only in the
-    // scratch anchor used for cursor placement.
-    let mut line = input_caret_line(ctx);
-    line.spans.pop();
     let display = composer_display(ctx.input);
-    let (before, after) = composer_display_split(ctx.input, ctx.cursor);
-    // The bash prompt already draws the leading `!`, which sits before the
-    // caret unless the caret is at the very start.
-    let skipped = usize::from(bash_mode(&display)).saturating_sub(before.len());
-    line.spans
-        .push(Span::raw(after.get(skipped..).unwrap_or("").to_string()));
-
-    // Ghost text trails the caret of an empty input.
-    if display.is_empty()
-        && let Some(suggestion) = ctx.suggestion
-    {
-        let ghost = format!("{suggestion}  (tab to accept)");
-        line.spans
-            .push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
-    }
+    let bash = bash_mode(&display);
 
     // The bash-mode affordance hugs the input line, below any attachment
     // previews.
-    if bash_mode(&display) {
+    if bash {
         const LABEL: &str = " (bash mode) ";
         let fill = usize::from(width).saturating_sub(UnicodeWidthStr::width(LABEL));
         lines.push(Line::from(Span::styled(
@@ -4437,9 +4578,29 @@ fn render_input_line(
         )));
     }
 
-    let index = lines.len();
-    lines.push(line);
-    index
+    let start_index = lines.len();
+    // The bash prompt already draws the leading `!`.
+    let body = display.get(usize::from(bash)..).unwrap_or("");
+    for (idx, part) in body.split('\n').enumerate() {
+        let mut spans = if idx == 0 {
+            input_prefix_spans(ctx.input, ctx.attachments)
+        } else {
+            Vec::new()
+        };
+        spans.push(Span::raw(part.to_string()));
+
+        // Ghost text trails the caret of an empty input.
+        if idx == 0
+            && display.is_empty()
+            && let Some(suggestion) = ctx.suggestion
+        {
+            let ghost = format!("{suggestion}  (tab to accept)");
+            spans.push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+    start_index..lines.len()
 }
 
 /// Render queued messages into the lines vector.
@@ -5036,6 +5197,7 @@ fn render_tool_inline<'a>(
         open,
         &super::highlight::Highlighting::default(),
         None,
+        None,
     );
 }
 
@@ -5049,6 +5211,7 @@ fn render_tool_inline_at<'a>(
     image_positions: &mut Vec<(String, usize, String)>,
     open: bool,
     highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
     stage_marks: Option<&mut StageMarks<'_>>,
 ) {
     let selection_style = if is_selected {
@@ -5081,7 +5244,12 @@ fn render_tool_inline_at<'a>(
             ..
         } = display
         {
-            lines.extend(edit_preview_lines(reading, selection_style));
+            lines.extend(edit_preview_lines(
+                reading,
+                selection_style,
+                highlighting,
+                tilde_root,
+            ));
         }
         return;
     }
@@ -5132,7 +5300,12 @@ fn render_tool_inline_at<'a>(
             }
             .into_iter();
             if let Some(reading) = recognised {
-                lines.extend(reading_lines(reading, selection_style));
+                lines.extend(reading_lines(
+                    reading,
+                    selection_style,
+                    highlighting,
+                    tilde_root,
+                ));
             } else if let Some(first) = command_rows.next() {
                 let mut first_spans = vec![
                     Span::styled(
@@ -5788,25 +5961,115 @@ pub fn card_lines(card: &Card, selection_style: Style, open: bool) -> Vec<Line<'
     lines
 }
 
+/// Subtle dark code-block surface for diff context and framing rows.
+const DIFF_CODE_BG: Color = Color::Rgb(26, 29, 36);
+/// Subtle dark green row tint for added diff lines.
+const DIFF_ADD_BG: Color = Color::Rgb(22, 46, 32);
+/// Brighter green inline tint for emphasized changed tokens on added lines.
+const DIFF_ADD_EMPH_BG: Color = Color::Rgb(36, 86, 52);
+/// Subtle dark red row tint for removed diff lines.
+const DIFF_DEL_BG: Color = Color::Rgb(54, 24, 28);
+/// Brighter red inline tint for emphasized changed tokens on removed lines.
+const DIFF_DEL_EMPH_BG: Color = Color::Rgb(96, 36, 42);
+/// Muted gray line-number foreground on context lines.
+const DIFF_LINE_NUM_CTX: Color = Color::Rgb(110, 118, 129);
+/// Muted green line-number foreground on added lines.
+const DIFF_LINE_NUM_ADD: Color = Color::Rgb(98, 168, 118);
+/// Muted red line-number foreground on removed lines.
+const DIFF_LINE_NUM_DEL: Color = Color::Rgb(186, 102, 108);
+/// Muted blue-gray foreground for hunk `@@` anchor lines.
+const DIFF_ANCHOR_FG: Color = Color::Rgb(128, 146, 170);
+/// Default code foreground when no syntax highlighter matches a file extension.
+const DIFF_CODE_FG: Color = Color::Rgb(192, 197, 206);
+/// Minimum column width for right-aligned diff line numbers.
+const MIN_DIFF_LINE_NUM_WIDTH: usize = 3;
+
 /// The rows a recognised script renders as: one line per step in plain
-/// words (an unknown step as its raw command), and a line-numbered diff
-/// under every edit.
+/// words (an unknown step as its raw command), and a syntax-highlighted,
+/// line-numbered diff under every edit.
 #[must_use]
-pub fn reading_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
-    reading_rows(reading, selection_style, false, EDIT_PREVIEW_ROWS)
+pub fn reading_lines(
+    reading: &CommandReading,
+    selection_style: Style,
+    highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
+) -> Vec<Line<'static>> {
+    reading_rows(
+        reading,
+        selection_style,
+        highlighting,
+        tilde_root,
+        false,
+        EDIT_PREVIEW_ROWS,
+    )
+}
+
+/// Row count [`reading_lines`] produces for `reading`, computed without
+/// running syntax highlighting or inline diff refinement.
+#[must_use]
+pub fn reading_line_count(reading: &CommandReading) -> usize {
+    let mut rows = 0usize;
+    let mut diff_rows = 0usize;
+    for step in &reading.steps {
+        match &step.intent {
+            Intent::Unknown { source } => {
+                rows += source.lines().count().max(1);
+            }
+            Intent::Edit { files } => {
+                if files.len() > 1 {
+                    rows += 1;
+                }
+                for file in files {
+                    rows += 1;
+                    for (anchor, hunk_rows) in file_hunks(&file.change) {
+                        if anchor.is_some() && diff_rows < EDIT_PREVIEW_ROWS {
+                            rows += 1;
+                        }
+                        for _ in hunk_rows {
+                            if diff_rows == EDIT_PREVIEW_ROWS {
+                                rows += 1;
+                            }
+                            diff_rows += 1;
+                            if diff_rows <= EDIT_PREVIEW_ROWS {
+                                rows += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                rows += 1;
+            }
+        }
+    }
+    rows
 }
 
 /// What a finished, collapsed call keeps of its edits: each file and a
 /// compact diff preview capped at [`DIFF_PREVIEW_LINES`] rows. Empty when
 /// the script edits nothing.
 #[must_use]
-pub fn edit_preview_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
-    reading_rows(reading, selection_style, true, DIFF_PREVIEW_LINES)
+pub fn edit_preview_lines(
+    reading: &CommandReading,
+    selection_style: Style,
+    highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
+) -> Vec<Line<'static>> {
+    reading_rows(
+        reading,
+        selection_style,
+        highlighting,
+        tilde_root,
+        true,
+        DIFF_PREVIEW_LINES,
+    )
 }
 
 fn reading_rows(
     reading: &CommandReading,
     selection_style: Style,
+    highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
     edits_only: bool,
     max_diff_rows: usize,
 ) -> Vec<Line<'static>> {
@@ -5828,14 +6091,12 @@ fn reading_rows(
         if edits_only && !matches!(step.intent, Intent::Edit { .. }) {
             continue;
         }
-        let marker = Span::styled(
-            if edits_only {
-                ""
-            } else {
-                link_marker(step.link)
-            },
-            dim.patch(selection_style),
-        );
+        let marker_text = if edits_only {
+            ""
+        } else {
+            link_marker(step.link)
+        };
+        let marker = Span::styled(marker_text, dim.patch(selection_style));
         if let Intent::Unknown { source } = &step.intent {
             let mut rows = source.lines();
             let first = rows.next().unwrap_or_default();
@@ -5855,6 +6116,51 @@ fn reading_rows(
             }
             continue;
         }
+        if let Intent::Edit { files } = &step.intent {
+            let single_file = files.len() == 1;
+            if !edits_only && !single_file {
+                lines.push(Line::from(vec![
+                    marker.clone(),
+                    Span::styled(
+                        step.line.clone(),
+                        Style::default().fg(Color::Cyan).patch(selection_style),
+                    ),
+                ]));
+            }
+            for file in files {
+                let header_marker =
+                    (!edits_only && single_file && !marker_text.is_empty()).then(|| marker.clone());
+                lines.push(file_heading_line(
+                    file,
+                    header_marker,
+                    tilde_root,
+                    selection_style,
+                ));
+                let body = render_file_diff_body(
+                    file,
+                    highlighting,
+                    selection_style,
+                    &mut diff_rows,
+                    max_diff_rows,
+                    total_diff_rows,
+                );
+                let last_idx = body.len().saturating_sub(1);
+                let rail_style = Style::default()
+                    .fg(Color::DarkGray)
+                    .bg(Color::Reset)
+                    .patch(selection_style);
+                for (idx, (row_spans, row_bg)) in body.into_iter().enumerate() {
+                    let rail = if idx == last_idx { "└ " } else { "│ " };
+                    let mut spans = Vec::with_capacity(row_spans.len() + 1);
+                    spans.push(Span::styled(rail, rail_style));
+                    spans.extend(row_spans);
+                    lines.push(
+                        Line::from(spans).style(Style::default().bg(row_bg).patch(selection_style)),
+                    );
+                }
+            }
+            continue;
+        }
         if !edits_only {
             lines.push(Line::from(vec![
                 marker,
@@ -5864,48 +6170,71 @@ fn reading_rows(
                 ),
             ]));
         }
-        if let Intent::Edit { files } = &step.intent {
-            for file in files {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", file_heading(file)),
-                    Style::default().bold().patch(selection_style),
-                )));
-                for (anchor, rows) in file_hunks(&file.change) {
-                    if let Some(anchor) = anchor {
-                        lines.push(Line::from(Span::styled(
-                            format!("  @@ {anchor}"),
-                            dim.patch(selection_style),
-                        )));
-                    }
-                    for row in rows {
-                        if diff_rows == max_diff_rows {
-                            lines.push(Line::from(Span::styled(
-                                format!("  … {} more lines", total_diff_rows - max_diff_rows),
-                                dim.italic().patch(selection_style),
-                            )));
-                        }
-                        diff_rows += 1;
-                        if diff_rows > max_diff_rows {
-                            continue;
-                        }
-                        lines.push(diff_row(row, selection_style));
-                    }
-                }
-            }
-        }
     }
     lines
 }
 
-fn file_heading(file: &FileEdit) -> String {
-    match &file.change {
-        FileChange::Add { .. } => format!("+ {} (new file)", file.path),
-        FileChange::Delete => format!("- {} (deleted)", file.path),
-        FileChange::Update {
-            moved_to: Some(to), ..
-        } => format!("~ {} → {to}", file.path),
-        FileChange::Update { .. } => format!("~ {}", file.path),
+/// Shortens `path` against `tilde_root` (`~` or `~/...`), matching link
+/// resolution so clickable file hyperlinks resolve to the same target.
+fn shorten_path<'a>(path: &'a str, tilde_root: Option<&std::path::Path>) -> Cow<'a, str> {
+    let Some(root) = tilde_root else {
+        return Cow::Borrowed(path);
+    };
+    let Ok(rel) = std::path::Path::new(path).strip_prefix(root) else {
+        return Cow::Borrowed(path);
+    };
+    if rel.as_os_str().is_empty() {
+        Cow::Borrowed("~")
+    } else {
+        Cow::Owned(format!("~/{}", rel.display()))
     }
+}
+
+fn file_heading_line(
+    file: &FileEdit,
+    marker: Option<Span<'static>>,
+    tilde_root: Option<&std::path::Path>,
+    selection_style: Style,
+) -> Line<'static> {
+    let path = shorten_path(&file.path, tilde_root).into_owned();
+    let (verb, verb_color, moved_to) = match &file.change {
+        FileChange::Add { .. } => ("Created", Color::Green, None),
+        FileChange::Delete => ("Deleted", Color::Red, None),
+        FileChange::Update { moved_to, .. } => (
+            "Edited",
+            Color::Cyan,
+            moved_to
+                .as_deref()
+                .map(|to| shorten_path(to, tilde_root).into_owned()),
+        ),
+    };
+    let mut spans = Vec::new();
+    if let Some(marker) = marker {
+        spans.push(marker);
+    }
+    spans.push(Span::styled(
+        verb,
+        Style::default()
+            .fg(verb_color)
+            .bold()
+            .patch(selection_style),
+    ));
+    spans.push(Span::styled(" ", selection_style));
+    spans.push(Span::styled(
+        path,
+        Style::default().bold().patch(selection_style),
+    ));
+    if let Some(to) = moved_to {
+        spans.push(Span::styled(
+            " → ",
+            Style::default().fg(Color::DarkGray).patch(selection_style),
+        ));
+        spans.push(Span::styled(
+            to,
+            Style::default().bold().patch(selection_style),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// A file change's hunks as `(anchor, lines)`; a new file is one hunk.
@@ -5920,24 +6249,301 @@ fn file_hunks(change: &FileChange) -> Vec<(Option<&str>, &[DiffLine])> {
     }
 }
 
-fn diff_row(row: &DiffLine, selection_style: Style) -> Line<'static> {
-    let (sign, color) = match row.op {
-        DiffOp::Context => (' ', Color::Gray),
-        DiffOp::Added => ('+', Color::Green),
-        DiffOp::Removed => ('-', Color::Red),
+/// Single display line number for `row`: `old` on removed lines, `new` (or
+/// fallback `old`) on added and context lines.
+const fn display_line_number(row: &DiffLine) -> Option<u32> {
+    match row.op {
+        DiffOp::Removed => row.old,
+        DiffOp::Added | DiffOp::Context => match row.new {
+            Some(n) => Some(n),
+            None => row.old,
+        },
+    }
+}
+
+/// Column width for right-aligned line numbers in `file`, or `None` when
+/// every line is unnumbered.
+fn file_line_number_width(hunks: &[(Option<&str>, &[DiffLine])]) -> Option<usize> {
+    let max_num = hunks
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .filter_map(display_line_number)
+        .max()?;
+    let digits = max_num.to_string().len();
+    Some(digits.max(MIN_DIFF_LINE_NUM_WIDTH))
+}
+
+/// Computes inline emphasized UTF-8 byte ranges for every contiguous
+/// `Removed` + `Added` run inside a hunk.
+fn compute_inline_emphasis(rows: &[DiffLine]) -> Vec<Vec<std::ops::Range<usize>>> {
+    let mut emphasis: Vec<Vec<std::ops::Range<usize>>> = vec![Vec::new(); rows.len()];
+    let mut i = 0usize;
+    while i < rows.len() {
+        if rows[i].op != DiffOp::Removed {
+            i += 1;
+            continue;
+        }
+        let mut rem_end = i;
+        while rem_end < rows.len() && rows[rem_end].op == DiffOp::Removed {
+            rem_end += 1;
+        }
+        let mut add_end = rem_end;
+        while add_end < rows.len() && rows[add_end].op == DiffOp::Added {
+            add_end += 1;
+        }
+        if add_end > rem_end {
+            let mut old_block = String::new();
+            for row in &rows[i..rem_end] {
+                old_block.push_str(&row.text);
+                old_block.push('\n');
+            }
+            let mut new_block = String::new();
+            for row in &rows[rem_end..add_end] {
+                new_block.push_str(&row.text);
+                new_block.push('\n');
+            }
+            let diff = similar::TextDiff::from_lines(&old_block, &new_block);
+            let mut opts = similar::InlineChangeOptions::new();
+            opts.semantic_cleanup(true);
+            for change in diff.iter_all_inline_changes_with_options(opts) {
+                let target = match change.tag() {
+                    similar::ChangeTag::Delete => change.old_index().map(|idx| i + idx),
+                    similar::ChangeTag::Insert => change.new_index().map(|idx| rem_end + idx),
+                    similar::ChangeTag::Equal => None,
+                };
+                let Some(target) = target else {
+                    continue;
+                };
+                if target >= emphasis.len() {
+                    continue;
+                }
+                let mut byte_pos = 0usize;
+                for &(emphasized, slice) in change.values() {
+                    let seg = slice.strip_suffix('\n').unwrap_or(slice);
+                    if emphasized && !seg.is_empty() {
+                        emphasis[target].push(byte_pos..byte_pos + seg.len());
+                    }
+                    byte_pos += seg.len();
+                }
+            }
+            i = add_end;
+        } else {
+            i = rem_end;
+        }
+    }
+    emphasis
+}
+
+/// Applies diff row and inline-emphasis backgrounds across syntax-highlighted
+/// spans without dropping syntax foreground colors or modifiers.
+fn apply_diff_backgrounds(
+    spans: Vec<Span<'static>>,
+    base_bg: Color,
+    emph_bg: Color,
+    emph_ranges: &[std::ops::Range<usize>],
+    selection_style: Style,
+) -> Vec<Span<'static>> {
+    if emph_ranges.is_empty() {
+        return spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, span.style.bg(base_bg).patch(selection_style)))
+            .collect();
+    }
+    let mut out = Vec::with_capacity(spans.len() + emph_ranges.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        let text = span.content.as_ref();
+        let span_start = cursor;
+        let span_end = cursor + text.len();
+        cursor = span_end;
+        let mut pos = span_start;
+        for range in emph_ranges {
+            if range.end <= pos {
+                continue;
+            }
+            if range.start >= span_end {
+                break;
+            }
+            let hit_start = range.start.max(pos);
+            let hit_end = range.end.min(span_end);
+            if hit_start > pos
+                && let Some(piece) = text.get(pos - span_start..hit_start - span_start)
+            {
+                out.push(Span::styled(
+                    piece.to_owned(),
+                    span.style.bg(base_bg).patch(selection_style),
+                ));
+            }
+            if hit_end > hit_start
+                && let Some(piece) = text.get(hit_start - span_start..hit_end - span_start)
+            {
+                out.push(Span::styled(
+                    piece.to_owned(),
+                    span.style.bg(emph_bg).patch(selection_style),
+                ));
+            }
+            pos = hit_end;
+        }
+        if pos < span_end
+            && let Some(piece) = text.get(pos - span_start..span_end - span_start)
+        {
+            out.push(Span::styled(
+                piece.to_owned(),
+                span.style.bg(base_bg).patch(selection_style),
+            ));
+        }
+    }
+    out
+}
+
+/// Renders every framed body row of `file` as `(spans_after_rail, row_bg)`.
+fn render_file_diff_body(
+    file: &FileEdit,
+    highlighting: &super::highlight::Highlighting,
+    selection_style: Style,
+    diff_rows: &mut usize,
+    max_diff_rows: usize,
+    total_diff_rows: usize,
+) -> Vec<(Vec<Span<'static>>, Color)> {
+    let hunks = file_hunks(&file.change);
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+    let num_width = file_line_number_width(&hunks);
+    let mut out = Vec::new();
+    let mut old_hl = highlighting.highlighter_for_path(&file.path);
+    let mut new_hl = old_hl.clone();
+
+    for (anchor, rows) in hunks {
+        if let Some(anchor) = anchor
+            && *diff_rows < max_diff_rows
+        {
+            out.push((
+                vec![Span::styled(
+                    format!(" @@ {anchor}"),
+                    Style::default()
+                        .fg(DIFF_ANCHOR_FG)
+                        .bg(DIFF_CODE_BG)
+                        .patch(selection_style),
+                )],
+                DIFF_CODE_BG,
+            ));
+        }
+        let emphasis = compute_inline_emphasis(rows);
+        for (row_idx, row) in rows.iter().enumerate() {
+            if *diff_rows == max_diff_rows {
+                out.push((
+                    vec![Span::styled(
+                        format!(" … {} more lines", total_diff_rows - max_diff_rows),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .bg(DIFF_CODE_BG)
+                            .italic()
+                            .patch(selection_style),
+                    )],
+                    DIFF_CODE_BG,
+                ));
+            }
+            *diff_rows += 1;
+            if *diff_rows > max_diff_rows {
+                continue;
+            }
+            let code_spans = match row.op {
+                DiffOp::Context => {
+                    if let Some(hl) = old_hl.as_mut() {
+                        let _ = highlighting.diff_line_spans(hl, &row.text);
+                    }
+                    new_hl
+                        .as_mut()
+                        .map(|hl| highlighting.diff_line_spans(hl, &row.text))
+                }
+                DiffOp::Removed => old_hl
+                    .as_mut()
+                    .map(|hl| highlighting.diff_line_spans(hl, &row.text)),
+                DiffOp::Added => new_hl
+                    .as_mut()
+                    .map(|hl| highlighting.diff_line_spans(hl, &row.text)),
+            }
+            .unwrap_or_else(|| {
+                vec![Span::styled(
+                    row.text.clone(),
+                    Style::default().fg(DIFF_CODE_FG),
+                )]
+            });
+            out.push(diff_row_spans(
+                row,
+                num_width,
+                code_spans,
+                &emphasis[row_idx],
+                selection_style,
+            ));
+        }
+    }
+    out
+}
+
+fn diff_row_spans(
+    row: &DiffLine,
+    num_width: Option<usize>,
+    code_spans: Vec<Span<'static>>,
+    emph_ranges: &[std::ops::Range<usize>],
+    selection_style: Style,
+) -> (Vec<Span<'static>>, Color) {
+    let (sign, sign_color, num_color, base_bg, emph_bg) = match row.op {
+        DiffOp::Context => (
+            ' ',
+            Color::DarkGray,
+            DIFF_LINE_NUM_CTX,
+            DIFF_CODE_BG,
+            DIFF_CODE_BG,
+        ),
+        DiffOp::Added => (
+            '+',
+            Color::Green,
+            DIFF_LINE_NUM_ADD,
+            DIFF_ADD_BG,
+            DIFF_ADD_EMPH_BG,
+        ),
+        DiffOp::Removed => (
+            '-',
+            Color::Red,
+            DIFF_LINE_NUM_DEL,
+            DIFF_DEL_BG,
+            DIFF_DEL_EMPH_BG,
+        ),
     };
-    let number =
-        |value: Option<u32>| value.map_or_else(|| "    ".to_string(), |n| format!("{n:>4}"));
-    Line::from(vec![
-        Span::styled(
-            format!("  {} {} ", number(row.old), number(row.new)),
-            Style::default().fg(Color::DarkGray).patch(selection_style),
-        ),
-        Span::styled(
-            format!("{sign} {}", row.text),
-            Style::default().fg(color).patch(selection_style),
-        ),
-    ])
+    let mut spans = Vec::with_capacity(code_spans.len() + 3);
+    if let Some(width) = num_width {
+        let num_text = display_line_number(row)
+            .map_or_else(|| format!(" {:>width$} ", ""), |n| format!(" {n:>width$} "));
+        spans.push(Span::styled(
+            num_text,
+            Style::default()
+                .fg(num_color)
+                .bg(base_bg)
+                .patch(selection_style),
+        ));
+    } else {
+        spans.push(Span::styled(
+            " ",
+            Style::default().bg(base_bg).patch(selection_style),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("{sign} "),
+        Style::default()
+            .fg(sign_color)
+            .bg(base_bg)
+            .patch(selection_style),
+    ));
+    spans.extend(apply_diff_backgrounds(
+        code_spans,
+        base_bg,
+        emph_bg,
+        emph_ranges,
+        selection_style,
+    ));
+    (spans, base_bg)
 }
 
 /// Render full-screen tool detail view.
@@ -7234,6 +7840,7 @@ mod tests {
                     true,
                     chat.assets(),
                     inner,
+                    None,
                 )
                 .lines,
             );
@@ -7330,17 +7937,110 @@ mod tests {
         let rows = call_rows(&display);
         assert_eq!(rows[0], "▾ ⠋ work");
         assert_eq!(rows[1], "Edit 2 files");
-        assert_eq!(rows[2], "  ~ src/a.rs");
-        assert_eq!(rows[3], "  @@ fn main() {");
-        assert_eq!(rows[4], "     2    2       keep");
-        assert_eq!(rows[5], "     3      -     old line");
-        assert_eq!(rows[6], "          3 +     new line");
-        assert_eq!(rows[7], "  + b.txt (new file)");
-        assert_eq!(rows[8], "          1 + one");
+        assert_eq!(rows[2], "Edited src/a.rs");
+        assert_eq!(rows[3], "│  @@ fn main() {");
+        assert_eq!(rows[4], "│    2       keep");
+        assert_eq!(rows[5], "│    3 -     old line");
+        assert_eq!(rows[6], "└    3 +     new line");
+        assert_eq!(rows[7], "Created b.txt");
+        assert_eq!(rows[8], "└    1 + one");
         assert!(
             rows.iter().all(|row| !row.contains("$ apply_patch")),
             "the raw script is not the body of a recognised call"
         );
+    }
+
+    #[test]
+    fn shell_file_edit_renders_created_edited_deleted_with_syntax_and_inline_emphasis() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn greet() {\n    let msg = \"old\";\n}\n",
+        )
+        .expect("write");
+
+        // 1. Overwriting an existing Rust file produces Edited + syntax fg + red/green bg + inline emphasis.
+        let edit_script = "cat > lib.rs <<'EOF'\nfn greet() {\n    let msg = \"new\";\n}\nEOF\n";
+        let reading = may_protocol::command_reading::CommandReading::of_in(edit_script, dir.path());
+        let hl = super::super::highlight::Highlighting::default();
+        let lines = super::reading_lines(&reading, Style::default(), &hl, None);
+        assert_eq!(lines.len(), super::reading_line_count(&reading));
+        let text = rendered_text(&lines);
+        assert_eq!(text[0], "Edited lib.rs");
+        assert_eq!(text[1], "│    1   fn greet() {");
+        assert_eq!(text[2], "│    2 -     let msg = \"old\";");
+        assert_eq!(text[3], "│    2 +     let msg = \"new\";");
+        assert_eq!(text[4], "└    3   }");
+
+        // Syntax highlighting applies RGB foregrounds from syntect.
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("fn")
+                    && matches!(span.style.fg, Some(Color::Rgb(..)))),
+            "expected syntect fg on Rust keyword: {:?}",
+            lines[1].spans
+        );
+        // Removed and Added rows carry their dark red/green row backgrounds and inline emphasis on changed tokens.
+        assert_eq!(lines[2].style.bg, Some(super::DIFF_DEL_BG));
+        assert_eq!(lines[3].style.bg, Some(super::DIFF_ADD_BG));
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("old")
+                    && span.style.bg == Some(super::DIFF_DEL_EMPH_BG)),
+            "expected inline red emphasis on 'old': {:?}",
+            lines[2].spans
+        );
+        assert!(
+            lines[3]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("new")
+                    && span.style.bg == Some(super::DIFF_ADD_EMPH_BG)),
+            "expected inline green emphasis on 'new': {:?}",
+            lines[3].spans
+        );
+        // Left rail keeps Reset background while code block extends to the right edge of the column.
+        let area = ratatui::layout::Rect::new(0, 0, 50, u16::try_from(lines.len()).unwrap());
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let wrapped = super::super::wrap::wrap_lines(&lines, area.width);
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(wrapped.clone()),
+            area,
+            &mut buf,
+        );
+        super::super::wrap::paint_line_backgrounds(&wrapped, 0, area, &mut buf);
+        assert_eq!(buf[(0, 3)].symbol(), "│");
+        assert_eq!(buf[(0, 3)].bg, Color::Reset);
+        assert_eq!(buf[(2, 3)].bg, super::DIFF_ADD_BG);
+        assert_eq!(buf[(49, 3)].bg, super::DIFF_ADD_BG);
+
+        // 2. Multi-step script with file creation + trailing echo renders Created + diff + unknown echo.
+        let brief = dir.path().join("tmp/brief.md");
+        let create_script = format!(
+            "cat > {} <<'EOF'\n# Brief\n你好 こんにちは 안녕\nEOF\necho written\n",
+            brief.display()
+        );
+        let create_reading = may_protocol::command_reading::CommandReading::of(&create_script);
+        let create_lines =
+            super::reading_lines(&create_reading, Style::default(), &hl, Some(dir.path()));
+        let create_text = rendered_text(&create_lines);
+        assert_eq!(create_text[0], "Created ~/tmp/brief.md");
+        assert_eq!(create_lines[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(create_text[1], "│    1 + # Brief");
+        assert_eq!(create_text[2], "└    2 + 你好 こんにちは 안녕");
+        assert_eq!(create_text[3], "; $ echo written");
+
+        // 3. Deletion renders red Deleted <path> with tilde shortening.
+        let rm_script = format!("rm -f {}", brief.display());
+        let rm_reading = may_protocol::command_reading::CommandReading::of(&rm_script);
+        let rm_lines = super::reading_lines(&rm_reading, Style::default(), &hl, Some(dir.path()));
+        let rm_text = rendered_text(&rm_lines);
+        assert_eq!(rm_text, ["Deleted ~/tmp/brief.md"]);
+        assert_eq!(rm_lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -7508,10 +8208,10 @@ mod tests {
         );
         let rows = call_rows(&finished(read_call(&script)));
         assert!(rows[0].ends_with("work"), "{rows:?}");
-        assert_eq!(rows[1], "  + big.txt (new file)");
+        assert_eq!(rows[1], "Created big.txt");
         let diff = rows.iter().filter(|row| row.contains("+ line")).count();
         assert_eq!(diff, super::DIFF_PREVIEW_LINES);
-        assert_eq!(rows.last().unwrap(), "  … 4 more lines");
+        assert_eq!(rows.last().unwrap(), "└  … 4 more lines");
     }
 
     #[test]
@@ -7911,9 +8611,9 @@ mod tests {
             greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
-        let index = render_input_line(&mut lines, &ctx, 80, false, None);
+        let range = render_input_line(&mut lines, &ctx, 80, false, None);
 
-        assert_eq!(index, 1);
+        assert_eq!(range, 1..2);
         let hint: String = lines[0]
             .spans
             .iter()
@@ -7925,6 +8625,91 @@ mod tests {
         assert_eq!(prompt.spans[0].style.fg, Some(Color::Yellow));
         assert_eq!(prompt.spans[0].style.bg, None);
         assert_eq!(prompt.spans[1].content, "ls -la");
+    }
+
+    #[test]
+    fn multiline_inline_input_renders_separate_lines_and_tracks_caret() {
+        let input = "你好世界\nこんにちは\n안녕하세요\n";
+        let ctx = InputContext {
+            input,
+            cursor: "你好世界\nこん".len(),
+            attachments: &[],
+            suggestion: None,
+            greeting: None,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        let range = render_input_line(&mut lines, &ctx, 80, false, None);
+        assert_eq!(range, 0..4);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rendered, ["你好世界", "こんにちは", "안녕하세요", ""]);
+
+        // Caret sits on row 1, col 4 (after two wide chars "こん").
+        let caret = super::input_caret_lines(&ctx);
+        assert_eq!(super::wrapped_caret_cell(&caret, 80), Some((4, 1)));
+
+        // Caret on the trailing empty line after the final `\n` sits at (0, 3).
+        let at_end = InputContext {
+            cursor: input.len(),
+            ..ctx
+        };
+        let end_caret = super::input_caret_lines(&at_end);
+        assert_eq!(super::wrapped_caret_cell(&end_caret, 80), Some((0, 3)));
+
+        // When line 0 wraps at width 6 ("你好世" / "界"), line 1 starts on row 2.
+        assert_eq!(super::wrapped_caret_cell(&caret, 6), Some((4, 2)));
+
+        // Clicking across wrapped and explicit multiline rows resolves exact byte offsets.
+        assert_eq!(
+            super::caret_at_position(input, &[], 80, 0, 20),
+            "你好世界".len()
+        );
+        assert_eq!(
+            super::caret_at_position(input, &[], 80, 1, 4),
+            "你好世界\nこん".len()
+        );
+        assert_eq!(
+            super::caret_at_position(input, &[], 80, 2, 2),
+            "你好世界\nこんにちは\n안".len()
+        );
+        assert_eq!(super::caret_at_position(input, &[], 80, 3, 0), input.len());
+        assert_eq!(
+            super::caret_at_position(input, &[], 6, 2, 4),
+            "你好世界\nこん".len()
+        );
+    }
+
+    #[test]
+    fn pasted_text_chip_shows_char_count_and_caps_above_repaste_limit() {
+        let cjk = "你好こんにちは안녕".repeat(60); // 540 chars (1620 bytes)
+        let huge = "a".repeat(may_config::pasted_text::REPASTE_INLINE_CHAR_LIMIT + 1);
+        let attachments = vec![
+            Attachment::PastedText {
+                content: cjk,
+                saved_path: None,
+            },
+            Attachment::PastedText {
+                content: huge,
+                saved_path: Some(PathBuf::from("/tmp/paste_0001.txt")),
+            },
+        ];
+        let ctx = InputContext {
+            input: "prompt",
+            cursor: 6,
+            attachments: &attachments,
+            suggestion: None,
+            greeting: None,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &ctx, 80, false, None);
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "[pasted: 540 chars] [pasted: >10k chars] prompt");
     }
 
     #[test]
@@ -8059,6 +8844,7 @@ mod tests {
             false,
             chat.assets(),
             80,
+            None,
         )
         .lines;
         let spans = &lines[0].spans;
@@ -8690,6 +9476,7 @@ mod tests {
             false,
             chat.assets(),
             80,
+            None,
         )
         .lines;
         let verify = lines

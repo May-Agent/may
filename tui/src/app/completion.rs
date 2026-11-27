@@ -6,8 +6,9 @@ use super::App;
 impl App {
     /// Update completion state based on current input.
     pub(super) fn update_completion_state(&mut self) {
-        // Check for slash command at start
-        if self.input.starts_with('/') {
+        // Check for slash command at start (single-line only so multiline pastes
+        // starting with `/` paths do not open the slash palette).
+        if self.input.starts_with('/') && !self.input.contains('\n') {
             let query = &self.input[1..]; // Skip the /
             self.completion
                 .set_sandbox_available(self.sandbox_available());

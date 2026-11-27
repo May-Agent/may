@@ -1,6 +1,12 @@
 {%- match intent -%}
 {%- when Intent::Edit { files } -%}
-{%- if files.len() == 1 -%}Edit {{ files[0].path }}{%- else -%}Edit {{ files.len() }} files{%- endif -%}
+{%- if files.len() == 1 -%}
+{%- match files[0].change -%}
+{%- when FileChange::Add { .. } -%}Create {{ files[0].path }}
+{%- when FileChange::Update { .. } -%}Edit {{ files[0].path }}
+{%- when FileChange::Delete -%}Delete {{ files[0].path }}
+{%- endmatch -%}
+{%- else -%}Edit {{ files.len() }} files{%- endif -%}
 {%- when Intent::Read { path, range } -%}
 {%- match range -%}
 {%- when ReadRange::Whole -%}Read {{ path }}

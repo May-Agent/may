@@ -4,6 +4,8 @@
 use async_channel::Receiver;
 use crossterm::event::KeyCode;
 use executor_core::spawn;
+use nucleo::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+use nucleo::{Config as NucleoConfig, Matcher, Utf32Str};
 
 use super::super::state::AppMode;
 use super::{App, SendAction};
@@ -402,17 +404,96 @@ impl App {
     }
 }
 
+/// Relevance group of a filtered model selector. Model ids are what the
+/// picker primarily searches; provider hits stay below them except an exact
+/// provider name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ModelSearchRank {
+    ExactSelector,
+    ExactModel,
+    ExactProvider,
+    ModelSubstring,
+    SelectorSubstring,
+}
+
+struct ModelSearchMatch<'a> {
+    index: usize,
+    selector: &'a String,
+    rank: ModelSearchRank,
+    score: u32,
+}
+
 /// `list` narrowed by `query` — a case-insensitive substring on the
 /// `provider::model` selector, so a query can hit either side — returned as
-/// `(list_index, selector)` pairs. An empty query keeps every entry.
+/// `(list_index, selector)` pairs ordered by relevance. An empty query keeps
+/// every entry in its original order.
 fn filter_model_list<'a>(list: &'a [String], query: &str) -> Vec<(usize, &'a String)> {
     if query.is_empty() {
         return list.iter().enumerate().collect();
     }
     let query = query.to_lowercase();
-    list.iter()
+    let atom = Atom::new(
+        &query,
+        CaseMatching::Ignore,
+        Normalization::Never,
+        AtomKind::Substring,
+        false,
+    );
+    let mut config = NucleoConfig::DEFAULT;
+    config.prefer_prefix = true;
+    let mut matcher = Matcher::new(config);
+    let mut chars = Vec::new();
+
+    let mut ranked: Vec<ModelSearchMatch<'a>> = list
+        .iter()
         .enumerate()
-        .filter(|(_, model)| model.to_lowercase().contains(&query))
+        .filter_map(|(index, selector)| {
+            let selector_lower = selector.to_lowercase();
+            if !selector_lower.contains(&query) {
+                return None;
+            }
+            let (provider, model_id) = selector_lower
+                .split_once("::")
+                .map_or(("", selector_lower.as_str()), |(provider, model_id)| {
+                    (provider, model_id)
+                });
+            let rank = if selector_lower == query {
+                ModelSearchRank::ExactSelector
+            } else if model_id == query {
+                ModelSearchRank::ExactModel
+            } else if !provider.is_empty() && provider == query {
+                ModelSearchRank::ExactProvider
+            } else if model_id.contains(&query) {
+                ModelSearchRank::ModelSubstring
+            } else {
+                ModelSearchRank::SelectorSubstring
+            };
+            let haystack = if rank == ModelSearchRank::ModelSubstring {
+                model_id
+            } else {
+                &selector_lower
+            };
+            let score = {
+                let haystack = Utf32Str::new(haystack, &mut chars);
+                u32::from(atom.score(haystack, &mut matcher).unwrap_or(0))
+            };
+            Some(ModelSearchMatch {
+                index,
+                selector,
+                rank,
+                score,
+            })
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.index.cmp(&b.index))
+    });
+    ranked
+        .into_iter()
+        .map(|entry| (entry.index, entry.selector))
         .collect()
 }
 
@@ -460,6 +541,28 @@ mod tests {
         let by_model = filter_model_list(&list, "opus");
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].0, 2);
+    }
+
+    #[test]
+    fn filter_ranks_an_exact_model_before_composite_ids_containing_it() {
+        let list = vec![
+            "devin::fusion-claude-fable-5-2-high-sidekick-swe-2-1-medium".to_string(),
+            "devin::fusion-claude-fable-5-2-low-sidekick-swe-2-1-medium".to_string(),
+            "devin::swe-2-1".to_string(),
+            "devin::swe-2-1-lightning".to_string(),
+        ];
+        let filtered = filter_model_list(&list, "swe-2-1");
+        assert_eq!(filtered[0].1, "devin::swe-2-1");
+    }
+
+    #[test]
+    fn filter_prefers_an_earlier_model_match_to_a_later_composite_match() {
+        let list = vec![
+            "devin::fusion-claude-fable-5-2-high-sidekick-swe-2-1-medium".to_string(),
+            "devin::swe-2-1".to_string(),
+        ];
+        let filtered = filter_model_list(&list, "2-1");
+        assert_eq!(filtered[0].1, "devin::swe-2-1");
     }
 
     #[test]
