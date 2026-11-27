@@ -1,0 +1,1 @@
+Refused before running: `{{ command }}` cannot modify files in place. {% if hashline %}Use `edit` (with `N#HH` anchors from `search`) to modify existing files.{% else %}Use `apply_patch` to modify existing files.{% endif %}

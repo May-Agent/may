@@ -36,12 +36,12 @@ fn program_basename(program: &str) -> &str {
 }
 
 fn excluded_pipeline(stages: &[StageSyntax]) -> bool {
-    // Patch pipelines (`cat <<'EOF' | apply_patch`) edit files rather than filter output.
+    // Patch pipelines (`cat <<'EOF' | apply_patch`, `cat <<'EOF' | edit`) edit files rather than filter output.
     if stages.iter().any(|stage| {
         stage
             .program
             .as_deref()
-            .is_some_and(|name| program_basename(name) == "apply_patch")
+            .is_some_and(|name| matches!(program_basename(name), "apply_patch" | "edit"))
     }) {
         return true;
     }
@@ -320,6 +320,16 @@ mod tests {
             syntax(1, "apply_patch", Some("apply_patch"), &[], &[]),
         ];
         assert!(plan("cat <<'EOF' | apply_patch", &patch_stages).is_none());
+
+        let edit_stages = [
+            StageSyntax {
+                stdin_literal: Some("[src/main.rs]\nPUT 1#PM:\n+fn main() {}\n".into()),
+                has_heredoc: true,
+                ..syntax(0, "cat <<'EOF'", Some("cat"), &[], &[])
+            },
+            syntax(1, "edit", Some("edit"), &[], &[]),
+        ];
+        assert!(plan("cat <<'EOF' | edit", &edit_stages).is_none());
 
         let file_read = [
             syntax(0, "cat Cargo.toml", Some("cat"), &["Cargo.toml"], &[]),

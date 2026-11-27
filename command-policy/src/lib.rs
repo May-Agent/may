@@ -4,7 +4,8 @@
 //! Every script of a shell built with a [`PolicySet`] is put to them before it
 //! runs: one that kills processes by name or pattern, or is not valid shell
 //! and so cannot be checked for that; a foreground `sleep`; a script that
-//! only repeats a read of files unchanged since; and an `apply_patch` hunk that
+//! only repeats a read of files unchanged since; `sed -i` / `sed --in-place`
+//! in-place edits; and an `apply_patch` hunk that
 //! only changes whitespace where it carries no meaning. In the managed bash,
 //! scripts that invoke host `grep`, `awk` or `find` still run and record a
 //! [`HostCommandUsage`] notice so the agent receives a one-shot system alert
@@ -281,8 +282,10 @@ pub struct CheckoutReadTracker {
     pub session_id: String,
 }
 
+mod hashline_bypass;
 mod write_lease;
 
+pub use hashline_bypass::{EditBypassNotices, EditBypassUsage, HashlineEditBypassPolicy};
 pub use write_lease::{WorkspaceWriteLease, WorkspaceWriteLeaseGuard, WorkspaceWriteLeasePolicy};
 
 /// A host command (`grep`, `awk`, or `find`) observed in a managed-bash script,
@@ -360,6 +363,9 @@ pub struct PolicySet {
     pub checkout_reads: Option<CheckoutReadTracker>,
     /// Optional exclusive workspace write lease held while an async Fusion `sidekick` runs.
     pub write_lease: Option<WorkspaceWriteLease>,
+    /// Optional hashline `edit`-bypass notice store; `Some` only when
+    /// `[experimental] hashline` is enabled so there is zero overhead otherwise.
+    pub edit_bypass_notices: Option<EditBypassNotices>,
 }
 
 /// Per-agent epochs invalidating [`UnchangedFileReads`] across a compaction,
@@ -421,8 +427,19 @@ impl PolicySet {
         } else {
             builder
         };
+        let hashline = self.edit_bypass_notices.is_some();
+        let builder = if let Some(notices) = self.edit_bypass_notices {
+            builder
+                .policy(SedInPlace::new(true))
+                .policy(HashlineEditBypassPolicy::new(notices))
+        } else {
+            builder
+        };
         if self.managed_bash {
-            builder.policy(ManagedShellCommands::new(self.host_command_notices))
+            builder.policy(ManagedShellCommands::with_hashline(
+                self.host_command_notices,
+                hashline,
+            ))
         } else {
             builder
         }
@@ -822,6 +839,60 @@ impl ScriptPolicy for UnchangedFileReads {
 }
 
 #[derive(Template)]
+#[template(path = "refused_sed_in_place.txt", escape = "none")]
+struct SedInPlaceRefused<'a> {
+    command: &'a str,
+    hashline: bool,
+}
+
+/// Refuses `sed -i` / `sed --in-place` before `aither-sed` runs, directing the
+/// model to `edit` when hashline mode is enabled and to `apply_patch`
+/// otherwise.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SedInPlace {
+    hashline: bool,
+}
+
+impl SedInPlace {
+    /// Creates a policy naming `edit` when `hashline` is `true` and
+    /// `apply_patch` when `false`.
+    #[must_use]
+    pub const fn new(hashline: bool) -> Self {
+        Self { hashline }
+    }
+}
+
+impl ScriptPolicy for SedInPlace {
+    type State = ();
+
+    fn check(
+        &self,
+        script: &ScriptCheck<'_>,
+        (): &(),
+    ) -> impl Future<Output = ScriptDecision> + Send {
+        let decision = if script.origin == ScriptOrigin::Run {
+            ScriptDecision::Pass
+        } else {
+            parsed(script)
+                .and_then(|shell| {
+                    shell.commands().iter().find_map(|command| {
+                        (command.program() == "sed")
+                            .then(|| hashline_bypass::sed_in_place_flag(command.arguments()))
+                            .flatten()
+                    })
+                })
+                .map_or(ScriptDecision::Pass, |command| {
+                    refuse(&SedInPlaceRefused {
+                        command,
+                        hashline: self.hashline,
+                    })
+                })
+        };
+        std::future::ready(decision)
+    }
+}
+
+#[derive(Template)]
 #[template(path = "refused_python_setup.txt")]
 struct PythonSetupRefused<'a> {
     command: &'a str,
@@ -1217,6 +1288,23 @@ const HOST_COMMANDS: [HostCommandUsage; 3] = [
     },
 ];
 
+/// Host programs in hashline mode, where `grep` should steer toward `search rg`
+/// so results carry `N#HH` anchors for `edit`.
+const HASHLINE_HOST_COMMANDS: [HostCommandUsage; 3] = [
+    HostCommandUsage {
+        name: "grep",
+        replacement: "`search rg`",
+    },
+    HostCommandUsage {
+        name: "awk",
+        replacement: "`python3` or `jq`",
+    },
+    HostCommandUsage {
+        name: "find",
+        replacement: "`fd`",
+    },
+];
+
 /// Observes a script whose own shell runs `grep`, `awk` or `find`, allowing the
 /// script to run while queueing a one-shot reminder notice for the agent.
 ///
@@ -1227,13 +1315,20 @@ const HOST_COMMANDS: [HostCommandUsage; 3] = [
 #[derive(Debug, Clone, Default)]
 pub struct ManagedShellCommands {
     notices: HostCommandNotices,
+    hashline: bool,
 }
 
 impl ManagedShellCommands {
     /// Policy instance that records observed host-command usages into `notices`.
     #[must_use]
     pub const fn new(notices: HostCommandNotices) -> Self {
-        Self { notices }
+        Self::with_hashline(notices, false)
+    }
+
+    /// Policy instance parameterized by whether hashline mode is active.
+    #[must_use]
+    pub const fn with_hashline(notices: HostCommandNotices, hashline: bool) -> Self {
+        Self { notices, hashline }
     }
 }
 
@@ -1254,7 +1349,12 @@ fn run_by_own_shell(script: &ShellScript, command: &ShellCommand) -> bool {
 }
 
 /// Records every `grep`, `awk`, or `find` command `script`'s own shell invokes.
-fn record_host_commands(script: &ShellScript, notices: &HostCommandNotices) {
+fn record_host_commands(script: &ShellScript, notices: &HostCommandNotices, hashline: bool) {
+    let table = if hashline {
+        &HASHLINE_HOST_COMMANDS
+    } else {
+        &HOST_COMMANDS
+    };
     for command in script.commands() {
         let Some(name) = command.argv().first().map(String::as_str) else {
             continue;
@@ -1262,7 +1362,7 @@ fn record_host_commands(script: &ShellScript, notices: &HostCommandNotices) {
         if !run_by_own_shell(script, command) {
             continue;
         }
-        if let Some(usage) = HOST_COMMANDS.iter().find(|entry| entry.name == name) {
+        if let Some(usage) = table.iter().find(|entry| entry.name == name) {
             notices.record(*usage);
         }
     }
@@ -1277,7 +1377,7 @@ impl ScriptPolicy for ManagedShellCommands {
         (): &(),
     ) -> impl Future<Output = ScriptDecision> + Send {
         if let Some(shell) = parsed(script) {
-            record_host_commands(shell, &self.notices);
+            record_host_commands(shell, &self.notices, self.hashline);
         }
         std::future::ready(ScriptDecision::Pass)
     }

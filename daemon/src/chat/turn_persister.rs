@@ -7,7 +7,7 @@
 use jiff::Timestamp;
 
 use crate::db::{ChatDb, RunFence};
-use crate::session::history::{ChatMessage, MessageRole, MessageTranslation};
+use crate::session::history::{ChatMessage, MessageRole, MessageTranslation, TurnEndRecord};
 
 /// A buffered message to be persisted at the end of the turn.
 struct PendingMessage {
@@ -83,6 +83,27 @@ impl TurnPersister {
             thinking: None,
             at,
         });
+    }
+
+    /// Buffer the turn's end record, the turn's last row. Every terminal
+    /// path of the turn runner writes exactly one, atomically with the
+    /// turn's other rows.
+    pub fn push_turn_end(&mut self, record: &TurnEndRecord, at: Timestamp) {
+        let content = serde_json::to_string(record).expect("a turn end record serializes");
+        self.pending.push(PendingMessage {
+            role: MessageRole::TurnEnd,
+            content,
+            tool_call_id: None,
+            translation: None,
+            thinking: None,
+            at,
+        });
+    }
+
+    /// Drop every buffered message without flushing: a failed attempt's
+    /// partial output is discarded, never stored.
+    pub fn drop_pending(&mut self) {
+        self.pending.clear();
     }
 
     fn build_chat_messages(&self) -> Vec<ChatMessage> {

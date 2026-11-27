@@ -1020,6 +1020,7 @@ mod tests {
                 outcome: CommandOutcome::Exited { code: 0 },
                 retained_pid: None,
                 interruptions: Vec::new(),
+                notice: None,
             })),
         )
         .await

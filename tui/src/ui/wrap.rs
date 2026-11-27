@@ -128,7 +128,7 @@ pub fn wrap_line(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
     wrap_single_line(line, width)
 }
 
-fn has_newline(line: &Line<'_>) -> bool {
+pub(super) fn has_newline(line: &Line<'_>) -> bool {
     line.spans
         .iter()
         .any(|span| span.content.contains(['\n', '\r']))
@@ -186,7 +186,16 @@ fn wrap_single_line(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
         row
     };
     if line.width() <= width {
-        return vec![row_line(graphemes(line).collect())];
+        let mut spans = Vec::with_capacity(line.spans.len());
+        for span in &line.spans {
+            if span.content.is_empty() {
+                continue;
+            }
+            spans.push(Span::styled(span.content.to_string(), span.style));
+        }
+        let mut row = Line::from(spans).style(line.style);
+        row.alignment = line.alignment;
+        return vec![row];
     }
 
     let graphemes: Vec<StyledGrapheme<'_>> = graphemes(line).collect();
@@ -356,6 +365,40 @@ mod tests {
         assert!(rows.iter().all(|row| row.style == line.style));
         assert_eq!(texts(&wrap_line(&Line::from(""), 10)), [""]);
         assert_eq!(wrap_line(&Line::from("x"), 0).len(), 0);
+    }
+
+    #[test]
+    fn fast_path_preserves_exact_spans_styles_and_alignment() {
+        use ratatui::layout::Alignment;
+        use ratatui::style::Color;
+
+        let s1 = Style::default().fg(Color::Cyan);
+        let s2 = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let s3 = Style::default().fg(Color::Green);
+        let line = Line::from(vec![
+            Span::styled("hello ", s1),
+            Span::styled("中文日本語한국어", s2),
+            Span::raw(""),
+            Span::styled(" end", s3),
+        ])
+        .style(Style::default().bg(Color::Black))
+        .alignment(Alignment::Right);
+
+        let rows = wrap_line(&line, 40);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.style, line.style);
+        assert_eq!(row.alignment, Some(Alignment::Right));
+        assert_eq!(
+            row.spans,
+            vec![
+                Span::styled("hello ", s1),
+                Span::styled("中文日本語한국어", s2),
+                Span::styled(" end", s3),
+            ]
+        );
     }
 
     #[test]

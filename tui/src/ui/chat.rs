@@ -87,6 +87,8 @@ pub struct StageTarget {
     pub retained: bool,
     /// Whether the 15-minute retention window has elapsed.
     pub expired: bool,
+    /// Whether this stage is the actively running stage of a running pipeline.
+    pub active: bool,
 }
 
 /// Hover/click hit on a pipeline stage at a screen cell.
@@ -129,6 +131,12 @@ pub struct ScreenStageRun {
     pub step: usize,
     /// Whether clicking switches to this stage.
     pub clickable: bool,
+    /// Whether this stage is actively running right now.
+    pub active: bool,
+    /// Leading grapheme index of this wrapped run within the whole stage.
+    pub grapheme_offset: usize,
+    /// Total grapheme count across all wrapped runs of this stage.
+    pub total_graphemes: usize,
 }
 
 /// Request parameters to read one pipeline stage from the daemon.
@@ -208,6 +216,51 @@ pub fn paint_hovered_stage(
             } else {
                 cell.modifier.insert(Modifier::DIM);
             }
+        }
+    }
+}
+
+/// Paint the sweeping highlight onto active running pipeline stages directly
+/// in `buf` so animating them never rebuilds cached layout entries.
+pub(super) fn paint_active_pipeline_sweep(
+    buf: &mut ratatui::buffer::Buffer,
+    runs: &[ScreenStageRun],
+    spinner_frame: usize,
+) {
+    use unicode_width::UnicodeWidthStr as _;
+    let area = buf.area;
+    for run in runs {
+        if !run.active || run.total_graphemes == 0 {
+            continue;
+        }
+        if run.y >= area.bottom() || run.x + run.width > area.right() {
+            continue;
+        }
+        let (win_start, win_end) = super::sweep::sweep_window(run.total_graphemes, spinner_frame);
+        if win_start >= win_end {
+            continue;
+        }
+        let mut cell_text = String::new();
+        let mut at = run.x;
+        while at < run.x + run.width {
+            let symbol = buf[(at, run.y)].symbol();
+            cell_text.push_str(symbol);
+            at += u16::try_from(symbol.width().max(1)).unwrap_or(1);
+        }
+        if cell_text != run.text {
+            continue;
+        }
+        let mut x = run.x;
+        let mut g = run.grapheme_offset;
+        while x < run.x + run.width {
+            let step = u16::try_from(buf[(x, run.y)].symbol().width().max(1)).unwrap_or(1);
+            if (win_start..win_end).contains(&g) {
+                let cell = &mut buf[(x, run.y)];
+                cell.fg = Color::White;
+                cell.modifier.insert(Modifier::BOLD);
+            }
+            g += 1;
+            x += step;
         }
     }
 }
@@ -2495,7 +2548,7 @@ pub fn build_plain_wrapped_lines_unified(
     // left out, the rows are the ones the screen shows.
     let inner = width - 2 * band::padding(width);
     let mut layout = ChatLayout::default();
-    layout.sync(chat, inner, images_supported, false, None, 0, None);
+    layout.sync(chat, inner, images_supported, false, None, None);
     let mut out: Vec<String> = (0..layout.element_rows())
         .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
         .collect();
@@ -3112,35 +3165,21 @@ pub(super) struct ElementState {
     pub open: bool,
     /// Todo blocks render nothing (the sidebar shows the task tree).
     pub hide_todos: bool,
-    /// Spinner frame for a running call's status icon; `0` for everything
-    /// else so only running calls re-lay-out as the frame advances.
-    pub spinner_frame: usize,
 }
 
 impl ElementState {
     /// State of `elem`.
-    pub(super) fn of(
-        elem: &ChatElement,
-        selected_tool: Option<&str>,
-        hide_todos: bool,
-        spinner_frame: usize,
-    ) -> Self {
+    pub(super) fn of(elem: &ChatElement, selected_tool: Option<&str>, hide_todos: bool) -> Self {
         match elem {
             ChatElement::ToolCall { id, display } => Self {
                 selected: selected_tool == Some(id.as_str()),
                 open: display.expandable() && display.body_open(),
                 hide_todos,
-                spinner_frame: if matches!(display.status(), ToolStatus::Running) {
-                    spinner_frame
-                } else {
-                    0
-                },
             },
             _ => Self {
                 selected: false,
                 open: false,
                 hide_todos,
-                spinner_frame: 0,
             },
         }
     }
@@ -3156,6 +3195,9 @@ pub(super) struct ElementLines {
     /// (sub-)element these lines contain — a click on those rows toggles
     /// that element, not the one owning the lines around it.
     pub regions: Vec<(String, usize, usize)>,
+    /// Line indices whose column 2 carries a running tool call's animated
+    /// spinner glyph, patched directly into the terminal buffer each frame.
+    pub spinner_lines: Vec<usize>,
     /// Scratch-tagged command lines carrying pipeline stage `underline_color` markers.
     pub stage_lines: Vec<(usize, Line<'static>)>,
     /// Stage metadata indexed by the markers in `stage_lines`.
@@ -3556,12 +3598,16 @@ pub(super) fn element_lines(
                 images_supported,
                 &mut images,
                 state.open,
-                state.spinner_frame,
                 &assets.highlighting,
                 tilde_root,
                 Some(&mut stage_marks),
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
+            let spinner_lines = if matches!(display.status(), ToolStatus::Running) {
+                vec![start]
+            } else {
+                Vec::new()
+            };
             let has_pipeline = matches!(
                 display,
                 ToolDisplay::Terminal {
@@ -3588,6 +3634,7 @@ pub(super) fn element_lines(
                 lines,
                 images,
                 regions,
+                spinner_lines,
                 stage_lines,
                 stage_targets: stage_marks.targets,
             };
@@ -3779,6 +3826,7 @@ pub(super) fn element_lines(
             expanded,
             ..
         } => {
+            let mut spinner_lines: Vec<usize> = Vec::new();
             let mut stage_lines: Vec<(usize, Line<'static>)> = Vec::new();
             let mut stage_targets: Vec<StageTarget> = Vec::new();
             let arrow = if *expanded { " ▾" } else { " ▸" };
@@ -3790,8 +3838,7 @@ pub(super) fn element_lines(
                 for inner in elements {
                     // Members carry their own expansion state — the group's
                     // `state` describes the group row itself.
-                    let inner_state =
-                        ElementState::of(inner, None, state.hide_todos, state.spinner_frame);
+                    let inner_state = ElementState::of(inner, None, state.hide_todos);
                     let sub = element_lines(
                         inner,
                         inner_state,
@@ -3803,6 +3850,7 @@ pub(super) fn element_lines(
                     let offset = lines.len();
                     let target_base = u32::try_from(stage_targets.len()).unwrap_or(0);
                     lines.extend(sub.lines);
+                    spinner_lines.extend(sub.spinner_lines.into_iter().map(|rel| offset + rel));
                     regions.extend(
                         sub.regions
                             .into_iter()
@@ -3836,6 +3884,7 @@ pub(super) fn element_lines(
                 lines,
                 images,
                 regions,
+                spinner_lines,
                 stage_lines,
                 stage_targets,
             };
@@ -3845,6 +3894,7 @@ pub(super) fn element_lines(
         lines,
         images,
         regions,
+        spinner_lines: Vec::new(),
         stage_lines: Vec::new(),
         stage_targets: Vec::new(),
     }
@@ -3913,7 +3963,6 @@ fn render_impl(
         images_supported,
         hide_todos,
         selected_tool,
-        spinner_frame,
         sandbox_dir,
     );
     stats.elements = layout.rebuilt();
@@ -3939,11 +3988,15 @@ fn render_impl(
 
     let wrap_start = std::time::Instant::now();
     let mut tail_starts = Vec::with_capacity(tail.len());
-    let mut tail_rows = 0usize;
+    let mut tail_line_rows = Vec::with_capacity(tail.len());
+    let mut tail_wrapped = Vec::with_capacity(tail.len());
     for line in &tail {
-        tail_starts.push(tail_rows);
-        tail_rows += chat_layout::line_rows(line, inner.width);
+        tail_starts.push(tail_wrapped.len());
+        let wrapped = super::wrap::wrap_line(line, inner.width);
+        tail_line_rows.push(wrapped.len());
+        tail_wrapped.extend(wrapped);
     }
+    let tail_rows = tail_wrapped.len();
     let element_rows = layout.element_rows();
     let content_height = element_rows + tail_rows;
     stats.wrap_count = wrap_start.elapsed();
@@ -3965,22 +4018,6 @@ fn render_impl(
         scroll.min(content_height - view_height)
     };
     layout.set_top_padding(top_padding);
-
-    // Lines intersecting the window [top, top + view_height).
-    let (mut lines, mut skip) = layout.visible_lines(top, view_height);
-    if top + view_height > element_rows {
-        if top >= element_rows {
-            // The window starts inside the tail.
-            let row = top - element_rows;
-            let first = tail_starts
-                .partition_point(|&start| start <= row)
-                .saturating_sub(1);
-            skip = row - tail_starts.get(first).copied().unwrap_or(0);
-            lines.extend(tail.iter().skip(first).cloned().map(line_into_static));
-        } else {
-            lines.extend(tail.iter().cloned().map(line_into_static));
-        }
-    }
 
     if let Some(out) = image_positions_out {
         out.clear();
@@ -4016,12 +4053,34 @@ fn render_impl(
             .saturating_sub(u16::try_from(top_padding).unwrap_or(0)),
         ..inner
     };
-    // Rows come pre-wrapped so none reaches past the column (see `wrap`).
-    let wrapped = super::wrap::wrap_lines(&lines, inner.width);
-    Paragraph::new(wrapped.clone())
-        .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
-        .render(body, frame.buffer_mut());
-    super::wrap::paint_line_backgrounds(&wrapped, skip, body, frame.buffer_mut());
+    // Visible rows come pre-wrapped from the cached layout and `tail_wrapped`
+    // so nothing re-wraps unchanged elements on every frame. Fill trailing
+    // line backgrounds before handing `visible_rows` to `Paragraph` (which
+    // starts with `Style::default()` and only styles cells holding graphemes),
+    // avoiding a per-frame clone of the visible row slice.
+    {
+        let mut visible_rows = layout.visible_wrapped_lines(top, view_height);
+        if top + view_height > element_rows {
+            let tail_skip = top.saturating_sub(element_rows);
+            let tail_take = (top + view_height - element_rows).saturating_sub(tail_skip);
+            visible_rows.extend(
+                tail_wrapped
+                    .iter()
+                    .skip(tail_skip)
+                    .take(tail_take)
+                    .map(chat_layout::borrow_line),
+            );
+        }
+        super::wrap::paint_line_backgrounds(&visible_rows, 0, body, frame.buffer_mut());
+        Paragraph::new(visible_rows).render(body, frame.buffer_mut());
+    }
+    // Patch running tool spinners and active pipeline sweep directly into the
+    // rendered buffer so 20 Hz ticks never rebuild cached entries.
+    layout.patch_running_spinners(frame.buffer_mut(), top, view_height, inner, spinner_frame);
+    let active_stages = layout.active_stage_runs(top, view_height, inner);
+    if !active_stages.is_empty() {
+        paint_active_pipeline_sweep(frame.buffer_mut(), &active_stages, spinner_frame);
+    }
 
     // The band background: every cell of the band's rows and of user
     // message rows — padding columns and trailing space included.
@@ -4047,17 +4106,16 @@ fn render_impl(
         }
     }
 
-    // Plain mirror of the tail, for selection.
-    layout.set_tail_plain(chat_layout::plain_rows(&tail, inner.width, tail_rows));
+    // Tail plain rows materialize lazily on first selection/click lookup.
+    layout.set_tail_wrapped(tail_wrapped);
     layout.set_greeting_row(
         greeting_line_idx.map(|index| element_rows + tail_starts.get(index).copied().unwrap_or(0)),
     );
     layout.set_input_span(input_line_range.as_ref().map(|range| {
         let start = element_rows + tail_starts.get(range.start).copied().unwrap_or(0);
-        let rows: usize = tail[range.clone()]
-            .iter()
-            .map(|line| chat_layout::line_rows(line, inner.width))
-            .sum();
+        let rows: usize = tail_line_rows
+            .get(range.clone())
+            .map_or(0, |counts| counts.iter().sum());
         (start, rows)
     }));
 
@@ -4466,29 +4524,42 @@ fn wrapped_caret_cell(lines: &[Line<'static>], width: u16) -> Option<(u16, usize
     Some((cx, rows_above + usize::from(cy)))
 }
 
+/// Column of the last non-blank grapheme in one pre-wrapped `row` within
+/// `width` columns, matching ratatui's `Buffer` cell placement (wide graphemes
+/// report their leading cell).
+fn row_last_non_blank_x(row: &Line<'_>, width: u16) -> Option<u16> {
+    let max_w = usize::from(width);
+    let mut x = 0usize;
+    let mut last = None;
+    for span in &row.spans {
+        for g in span.content.graphemes(true) {
+            let gw = UnicodeWidthStr::width(g);
+            if gw == 0 {
+                continue;
+            }
+            if x + gw > max_w {
+                return last;
+            }
+            if g != " " {
+                last = Some(u16::try_from(x).unwrap_or(u16::MAX));
+            }
+            x += gw;
+        }
+    }
+    last
+}
+
 /// Cell of `line`'s last grapheme once wrapped to `width`: the caret cell
-/// of the input caret line. Rendering the same pre-wrapped rows into a
-/// scratch buffer keeps this exactly in step with the chat's wrapping
-/// (wide graphemes included).
+/// of the input caret line. Computed directly from the pre-wrapped rows
+/// without allocating a scratch [`Buffer`].
 fn wrapped_tail_cell(line: &Line<'static>, width: u16) -> Option<(u16, u16)> {
     if width == 0 {
         return None;
     }
     let wrapped = super::wrap::wrap_line(line, width);
-    let rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
-    if rows == 0 {
-        return None;
-    }
-    let buf_area = Rect::new(0, 0, width, rows);
-    let mut buf = Buffer::empty(buf_area);
-    Paragraph::new(wrapped).render(buf_area, &mut buf);
-    // Trailing cells of wide graphemes are reset to blank, so the last
-    // non-blank cell is the caret marker itself.
-    for y in (buf_area.top()..buf_area.bottom()).rev() {
-        for x in (buf_area.left()..buf_area.right()).rev() {
-            if buf[(x, y)].symbol() != " " {
-                return Some((x, y));
-            }
+    for (y, row) in wrapped.iter().enumerate().rev() {
+        if let Some(x) = row_last_non_blank_x(row, width) {
+            return Some((x, u16::try_from(y).unwrap_or(u16::MAX)));
         }
     }
     None
@@ -4604,6 +4675,12 @@ fn render_queue_lines(lines: &mut Vec<Line<'_>>, ctx: &QueueContext<'_>, width: 
 
 /// Spinner glyphs cycled by `spinner_frame` while a run is in flight.
 const SPINNER_FRAMES: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
+
+/// Spinner glyph for animation `frame`.
+#[must_use]
+pub(super) const fn spinner_glyph(frame: usize) -> char {
+    SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+}
 
 /// Format a turn's output-token count for the activity line
 /// (`340 tokens`, `1.3k tokens`).
@@ -4952,7 +5029,6 @@ fn tool_header_line<'a>(
     display: &'a ToolDisplay,
     selection_style: Style,
     open: bool,
-    spinner_frame: usize,
     highlighting: &super::highlight::Highlighting,
 ) -> Line<'a> {
     let marker = if !display.expandable() {
@@ -4970,7 +5046,9 @@ fn tool_header_line<'a>(
             ..
         }
     );
-    let (icon, icon_style) = status_icon(display.status(), spinner_frame, unsafe_exec);
+    // Frame 0 serves as the placeholder cell for running calls; live frames
+    // patch that single cell directly in the terminal buffer.
+    let (icon, icon_style) = status_icon(display.status(), 0, unsafe_exec);
     let mut spans = vec![
         Span::styled(marker, dim),
         Span::styled(format!("{icon} "), icon_style),
@@ -5142,7 +5220,6 @@ fn render_tool_inline<'a>(
         images_supported,
         image_positions,
         open,
-        0,
         &super::highlight::Highlighting::default(),
         None,
         None,
@@ -5158,7 +5235,6 @@ fn render_tool_inline_at<'a>(
     images_supported: bool,
     image_positions: &mut Vec<(String, usize, String)>,
     open: bool,
-    spinner_frame: usize,
     highlighting: &super::highlight::Highlighting,
     tilde_root: Option<&std::path::Path>,
     stage_marks: Option<&mut StageMarks<'_>>,
@@ -5174,7 +5250,6 @@ fn render_tool_inline_at<'a>(
         display,
         selection_style,
         open,
-        spinner_frame,
         highlighting,
     ));
     // A call that ran one of May's commands shows what the command did, open
@@ -5233,7 +5308,6 @@ fn render_tool_inline_at<'a>(
                         settled_output: &info.output,
                         status,
                         selection_style,
-                        spinner_frame,
                         highlighting,
                     },
                     stage_marks,
@@ -5373,16 +5447,13 @@ struct PipelineRenderCtx<'a> {
     settled_output: &'a str,
     status: &'a ToolStatus,
     selection_style: Style,
-    spinner_frame: usize,
     highlighting: &'a super::highlight::Highlighting,
 }
 
 struct StageSpanMeta {
     start: usize,
     end: usize,
-    total_graphemes: usize,
     target_idx: usize,
-    active: bool,
     selected: bool,
 }
 
@@ -5479,13 +5550,61 @@ fn split_line_spans_by_stages<'a>(
     chunks
 }
 
+/// Trailing slice of `text` covering at most `max_lines` newline-delimited
+/// lines so ANSI parsing during a live pipeline run never re-parses the whole
+/// accumulated buffer from byte 0.
+fn ansi_tail_slice(text: &str, max_lines: usize) -> &str {
+    if max_lines == 0 || text.is_empty() {
+        return "";
+    }
+    let bytes = text.as_bytes();
+    let mut i = if bytes.last() == Some(&b'\n') {
+        bytes.len() - 1
+    } else {
+        bytes.len()
+    };
+    let mut remaining = max_lines;
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'\n' {
+            remaining -= 1;
+            if remaining == 0 {
+                return text.get(i + 1..).unwrap_or_default();
+            }
+        }
+    }
+    text
+}
+
+/// Leading slice of `text` covering at most `max_lines` newline-delimited
+/// lines, paired with the total logical line count across `text`.
+fn ansi_head_slice(text: &str, max_lines: usize) -> (&str, usize) {
+    if text.is_empty() {
+        return ("", 0);
+    }
+    let bytes = text.as_bytes();
+    let mut total = 0usize;
+    let mut cut = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            total += 1;
+            if total == max_lines && cut.is_none() {
+                cut = Some(i + 1);
+            }
+        }
+    }
+    if bytes.last() != Some(&b'\n') {
+        total += 1;
+    }
+    let head = cut.map_or(text, |at| text.get(..at).unwrap_or(text));
+    (head, total)
+}
+
 fn render_pipeline_inline(
     lines: &mut Vec<Line<'_>>,
     ctx: &PipelineRenderCtx<'_>,
     mut stage_marks: Option<&mut StageMarks<'_>>,
 ) {
-    use unicode_segmentation::UnicodeSegmentation as _;
-
     let dim = Style::default().fg(Color::DarkGray);
     let is_running = ctx.pipe.is_running();
     let effective = ctx.pipe.effective_step();
@@ -5520,15 +5639,10 @@ fn render_pipeline_inline(
         let active = is_running && ctx.pipe.snapshot.active_step == Some(stage.step);
         let selected = ctx.pipe.selected_step == Some(stage.step);
         let target_idx = stage_metas.len();
-        let total_graphemes = cmd_text
-            .get(start..end)
-            .map_or(0, |s| s.graphemes(true).count());
         stage_metas.push(StageSpanMeta {
             start,
             end,
-            total_graphemes,
             target_idx,
-            active,
             selected,
         });
         if let Some(marks) = stage_marks.as_deref_mut() {
@@ -5539,6 +5653,7 @@ fn render_pipeline_inline(
                 clickable,
                 retained: stage.retained,
                 expired: ctx.pipe.expired && !is_final,
+                active,
             });
         }
     }
@@ -5547,10 +5662,6 @@ fn render_pipeline_inline(
         .highlighting
         .spans(interpreter_syntax(ctx.interpreter), cmd_text);
     let line_ranges = line_byte_ranges(cmd_text);
-    let sweep_hi = Style::default()
-        .fg(Color::White)
-        .bold()
-        .patch(ctx.selection_style);
     let selected_stage_bg = Style::default()
         .bg(Color::Rgb(38, 56, 72))
         .add_modifier(Modifier::UNDERLINED);
@@ -5581,12 +5692,7 @@ fn render_pipeline_inline(
         let mut has_stage_on_line = false;
 
         let chunks = split_line_spans_by_stages(raw_spans, line_start, &stage_metas);
-        let mut chunk_abs_start = line_start;
         for (chunk_spans, stage_opt) in chunks {
-            let chunk_bytes: usize = chunk_spans.iter().map(|s| s.content.len()).sum();
-            let this_abs_start = chunk_abs_start;
-            chunk_abs_start += chunk_bytes;
-
             let Some(stage) = stage_opt else {
                 for span in chunk_spans {
                     let styled = Span::styled(span.content, span.style.patch(ctx.selection_style));
@@ -5604,23 +5710,10 @@ fn render_pipeline_inline(
                 tagged_spans.push(Span::styled(span.content.clone(), tag_style));
             }
 
-            if stage.active {
-                let base_chunk: Vec<Span<'static>> = chunk_spans
-                    .into_iter()
-                    .map(|s| Span::styled(s.content, s.style.patch(ctx.selection_style)))
-                    .collect();
-                let grapheme_offset = cmd_text
-                    .get(stage.start..this_abs_start)
-                    .map_or(0, |prefix| prefix.graphemes(true).count());
-                let (swept, _) = super::sweep::sweep_styled_slice(
-                    &base_chunk,
-                    grapheme_offset,
-                    stage.total_graphemes,
-                    ctx.spinner_frame,
-                    sweep_hi,
-                );
-                visible_spans.extend(swept);
-            } else if stage.selected {
+            // Active stage sweep paints directly onto the frame buffer via
+            // `paint_active_pipeline_sweep` so cached entries never rebuild on
+            // spinner ticks.
+            if stage.selected {
                 for span in chunk_spans {
                     visible_spans.push(Span::styled(
                         span.content,
@@ -5698,25 +5791,30 @@ fn render_pipeline_inline(
     };
 
     if !shown.is_empty() {
+        let (slice, hidden_more) = if is_running {
+            (ansi_tail_slice(shown, DIFF_PREVIEW_LINES), 0)
+        } else {
+            let (head, total) = ansi_head_slice(shown, DIFF_PREVIEW_LINES);
+            (head, total.saturating_sub(DIFF_PREVIEW_LINES))
+        };
         let parsed = super::ansi::parse_ansi_lines(
-            shown,
+            slice,
             "│ ",
             dim,
             Style::default().fg(Color::Gray),
             ctx.selection_style,
         );
-        let total = parsed.len();
         let skip = if is_running {
-            total.saturating_sub(DIFF_PREVIEW_LINES)
+            parsed.len().saturating_sub(DIFF_PREVIEW_LINES)
         } else {
             0
         };
         for line in parsed.into_iter().skip(skip).take(DIFF_PREVIEW_LINES) {
             lines.push(line);
         }
-        if !is_running && total > DIFF_PREVIEW_LINES {
+        if !is_running && hidden_more > 0 {
             lines.push(Line::from(Span::styled(
-                format!("│ … {} more lines", total - DIFF_PREVIEW_LINES),
+                format!("│ … {hidden_more} more lines"),
                 dim.italic().patch(ctx.selection_style),
             )));
         }
@@ -7764,7 +7862,7 @@ mod tests {
             lines.extend(
                 super::element_lines(
                     elem,
-                    super::ElementState::of(elem, None, false, 0),
+                    super::ElementState::of(elem, None, false),
                     true,
                     chat.assets(),
                     inner,
@@ -7800,7 +7898,7 @@ mod tests {
         chat.push_user("thanks", Vec::new(), 1);
 
         let mut layout = super::ChatLayout::default();
-        layout.sync(&chat, 60, true, false, None, 0, None);
+        layout.sync(&chat, 60, true, false, None, None);
         let images = layout.images_in(0, 1000);
         assert_eq!(images.len(), 1);
         let block_end = images[0].row + IMAGE_HEIGHT;
@@ -8768,7 +8866,7 @@ mod tests {
         let elem = &chat.elements[0];
         let lines = super::element_lines(
             elem,
-            super::ElementState::of(elem, None, false, 0),
+            super::ElementState::of(elem, None, false),
             false,
             chat.assets(),
             80,
@@ -9473,7 +9571,7 @@ mod tests {
         let elem = &chat.elements[0];
         let lines = super::element_lines(
             elem,
-            super::ElementState::of(elem, None, false, 0),
+            super::ElementState::of(elem, None, false),
             false,
             chat.assets(),
             80,
@@ -10320,11 +10418,86 @@ mod tests {
         assert!(screen_expired.contains("settled tail"), "{screen_expired}");
 
         let mut layout = crate::ui::chat_layout::ChatLayout::default();
-        layout.sync(&chat, 80, false, false, None, 0, None);
+        layout.sync(&chat, 80, false, false, None, None);
         let hit = (0..layout.element_rows())
             .find_map(|row| (0..80u16).find_map(|col| layout.stage_at(row, col)))
             .expect("stage 0 hit in layout");
         assert!(hit.target.expired);
         assert!(hit.status_hint().contains("expired"), "{hit:?}");
+    }
+
+    #[test]
+    fn wrapped_tail_cell_matches_scratch_buffer_across_cjk_and_wrapping() {
+        use ratatui::prelude::*;
+        use ratatui::widgets::Paragraph;
+
+        fn reference_wrapped_tail_cell(line: &Line<'static>, width: u16) -> Option<(u16, u16)> {
+            if width == 0 {
+                return None;
+            }
+            let wrapped = super::super::wrap::wrap_line(line, width);
+            let rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
+            if rows == 0 {
+                return None;
+            }
+            let buf_area = Rect::new(0, 0, width, rows);
+            let mut buf = Buffer::empty(buf_area);
+            Paragraph::new(wrapped).render(buf_area, &mut buf);
+            for y in (buf_area.top()..buf_area.bottom()).rev() {
+                for x in (buf_area.left()..buf_area.right()).rev() {
+                    if buf[(x, y)].symbol() != " " {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let samples = [
+            Line::from("│"),
+            Line::from("draft│"),
+            Line::from("a │"),
+            Line::from("中文日本語한국어│"),
+            Line::from("中文日本語한국어"),
+            Line::from(vec![
+                Span::raw("! "),
+                Span::raw("混合 text 日本語 테스트 "),
+                Span::raw("│"),
+            ]),
+            Line::from(format!("{}│", "x".repeat(50))),
+            Line::from(format!("{} │", "a".repeat(9))),
+            Line::from("a👍🏽b 漢字テスト한글│"),
+            Line::from("   "),
+        ];
+        for line in &samples {
+            for width in [0u16, 1, 2, 3, 5, 10, 16, 36, 80] {
+                assert_eq!(
+                    super::wrapped_tail_cell(line, width),
+                    reference_wrapped_tail_cell(line, width),
+                    "width={width} line={line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ansi_tail_and_head_slices_extract_exact_window() {
+        use std::fmt::Write as _;
+
+        let mut buf = String::new();
+        for i in 0..25 {
+            let _ = writeln!(buf, "\x1b[32mline-{i} 中文 日本語 한국어\x1b[0m");
+        }
+        let tail = super::ansi_tail_slice(&buf, super::DIFF_PREVIEW_LINES);
+        assert_eq!(tail.lines().count(), super::DIFF_PREVIEW_LINES);
+        assert!(tail.starts_with("\x1b[32mline-17 "), "{tail:?}");
+        assert!(tail.contains("line-24"), "{tail:?}");
+
+        let (head, total) = super::ansi_head_slice(&buf, super::DIFF_PREVIEW_LINES);
+        assert_eq!(total, 25);
+        assert_eq!(head.lines().count(), super::DIFF_PREVIEW_LINES);
+        assert!(head.starts_with("\x1b[32mline-0 "), "{head:?}");
+        assert!(head.contains("line-7"), "{head:?}");
+        assert!(!head.contains("line-8"), "{head:?}");
     }
 }

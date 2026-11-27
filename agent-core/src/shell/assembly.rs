@@ -14,7 +14,7 @@ use aither_sandbox::{
 use heel::HeelBinary;
 
 use super::{
-    FileReadsAreVerbatim, HostSession, MayPipelinePlanner, MayShellWording,
+    FileReadsAreVerbatim, HashlineReadRewriter, HostSession, MayPipelinePlanner, MayShellWording,
     SessionEnvironmentError, ShellBudgets, approval::ServerApproval, shell_tool_settings,
 };
 use crate::agent::command_env::CommandEnv;
@@ -147,11 +147,14 @@ where
             .limits(self.budgets.limits())
             .output(self.budgets.output())
             .wording(MayShellWording)
-            .treat_output(FileReadsAreVerbatim::with_outputs_dir(outputs_dir))
+            .treat_output(FileReadsAreVerbatim::with_outputs_dir(outputs_dir.clone()))
             .plan_pipelines(MayPipelinePlanner)
             .tools(shell_tool_settings(&self.budgets))
             .policy(ServerApproval::new(sessions.clone()))
             .ipc(CommandBridge::new(commands, self.slot.clone()));
+        if self.policies.edit_bypass_notices.is_some() {
+            builder = builder.rewrite_script(HashlineReadRewriter::with_outputs_dir(outputs_dir));
+        }
         if let Some(jobs) = self.jobs {
             builder = builder.jobs(jobs);
         }

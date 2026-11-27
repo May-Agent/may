@@ -16,6 +16,7 @@ use aither_sandbox::{
 use askama::Template;
 use may_protocol::command_reading::{CommandReading, Intent};
 
+use crate::hashline_bypass::{js_looks_mutating, python_looks_mutating};
 use crate::{parsed, refuse};
 
 #[derive(Template)]
@@ -450,67 +451,9 @@ impl ScriptPolicy for WorkspaceWriteLeasePolicy {
     }
 }
 
-fn is_python_program(name: &str) -> bool {
+pub fn is_python_program(name: &str) -> bool {
     name.strip_prefix("python")
         .is_some_and(|suffix| suffix.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
-}
-
-fn python_looks_mutating(source: &str) -> bool {
-    const PATTERNS: &[&str] = &[
-        ".write_text(",
-        ".write_bytes(",
-        "open(",
-        "shutil.",
-        "os.remove(",
-        "os.unlink(",
-        "os.rename(",
-        "os.replace(",
-        "os.mkdir(",
-        "os.makedirs(",
-        "os.rmdir(",
-        "Path.unlink(",
-        ".unlink(",
-        ".rename(",
-        ".replace(",
-        ".mkdir(",
-        "subprocess.",
-        "os.system(",
-    ];
-    if !PATTERNS.iter().any(|pat| source.contains(pat)) {
-        return false;
-    }
-    // `open(path, "r")` / `open(path)` alone is read-only unless a write mode is passed.
-    if source.contains("open(")
-        && !PATTERNS
-            .iter()
-            .filter(|&&pat| pat != "open(")
-            .any(|pat| source.contains(pat))
-    {
-        return source.contains("\"w")
-            || source.contains("'w")
-            || source.contains("\"a")
-            || source.contains("'a")
-            || source.contains("\"x")
-            || source.contains("'x")
-            || source.contains('+')
-            || source.contains(".write(");
-    }
-    true
-}
-
-fn js_looks_mutating(source: &str) -> bool {
-    const PATTERNS: &[&str] = &[
-        "writeFile",
-        "appendFile",
-        "unlink",
-        "rmSync",
-        "rmdir",
-        "mkdir",
-        "rename",
-        "copyFile",
-        "Bun.write",
-    ];
-    PATTERNS.iter().any(|pat| source.contains(pat))
 }
 
 fn first_positional(args: &[String]) -> Option<&str> {
@@ -519,7 +462,7 @@ fn first_positional(args: &[String]) -> Option<&str> {
         .find(|arg| !arg.starts_with('-'))
 }
 
-fn positional_args(args: &[String]) -> Vec<&str> {
+pub fn positional_args(args: &[String]) -> Vec<&str> {
     let mut out = Vec::new();
     let mut after_double_dash = false;
     for arg in args {
@@ -534,12 +477,12 @@ fn positional_args(args: &[String]) -> Vec<&str> {
     out
 }
 
-fn inline_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+pub fn inline_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let pos = args.iter().position(|arg| arg == flag)?;
     args.get(pos + 1).map(String::as_str)
 }
 
-fn resolve_path(cwd: &Path, target: &str) -> PathBuf {
+pub fn resolve_path(cwd: &Path, target: &str) -> PathBuf {
     let path = Path::new(target);
     if path.is_absolute() {
         normalize_path(path)
@@ -549,7 +492,7 @@ fn resolve_path(cwd: &Path, target: &str) -> PathBuf {
 }
 
 /// Lexically normalizes `.` and `..` components without touching the filesystem.
-fn normalize_path(path: &Path) -> PathBuf {
+pub fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

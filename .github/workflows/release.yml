@@ -136,6 +136,12 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: Setup stow
+        if: ${{ !matrix.container && !(runner.os == 'Windows' && runner.arch == 'ARM64') }}
+        uses: water-rs/stow@main
+        with:
+          shared-key: release-dist
+          local-crates-io-max-bytes: '1610612736'
       - name: "Install bun"
         uses: "./.github/actions/install-bun"
       - name: "Install nasm"

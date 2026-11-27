@@ -170,6 +170,9 @@ pub struct SubagentSettings<LLM> {
     pub registry: crate::ipc::RegistrySlot,
     /// Live shell timeout cap applied to subagent `tui open` calls.
     pub timeout_cap: aither_sandbox::LiveDuration,
+    /// Shared hashline `edit`-bypass notice store attached to writable
+    /// subagents when `[experimental] hashline` is enabled.
+    pub edit_bypass_notices: Option<crate::command_policy::EditBypassNotices>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -742,6 +745,11 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             ),
             None => child_hooks,
         };
+        let agent_path = aither_agent::AgentPath::of(&identity);
+        let writable = !matches!(
+            &source,
+            Source::Definition(definition) if definition.access == SubagentAccess::ReadOnly
+        );
         let mut builder = AgentBuilder::new(slot.llm.clone())
             .hooks(child_hooks)
             .identity(identity);
@@ -774,6 +782,14 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         builder = settings
             .toolkit
             .register(builder, &shell, Some(valve.clone()));
+        if writable && let Some(notices) = &settings.edit_bypass_notices {
+            builder = builder.context_source(
+                crate::agent::edit_bypass_alerts::EditBypassAlerts::for_agent(
+                    notices.clone(),
+                    agent_path,
+                ),
+            );
+        }
         if let Some(spec) = &settings.document {
             // Its own inbox: the main agent's holds the starts and ends of
             // the main agent's runs, which are not this one's to answer.

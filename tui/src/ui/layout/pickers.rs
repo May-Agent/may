@@ -710,7 +710,7 @@ pub(super) fn render_resume_picker(
 }
 
 fn display_cwd(cwd: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::home_dir() {
         let home = home.to_string_lossy();
         if let Some(rest) = cwd.strip_prefix(home.as_ref()) {
             return format!("~{rest}");

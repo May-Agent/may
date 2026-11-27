@@ -8,22 +8,26 @@ with `.github/affected-rules.toml`; it supplies `merge_base`, `workspace`,
 the `scope` job forwards:
 
 - `rust` — `true` when any workspace package is in scope. `fmt`, `clippy`
-  and `test` carry the same value: prose-only, web-ui-only and
-  outside-workspace diffs compile nothing.
+  and `test` are `true` when `rust`, `sed`, or `hashline` has work:
+  prose-only, web-ui-only and metadata-only diffs compile nothing.
+- `sed` — `true` when a non-prose, non-metadata file under `sed/` changed
+  (or the gate fell back to the whole workspace).
+- `hashline` — `true` when a non-prose, non-metadata file under `hashline/`
+  changed (or the gate fell back to the whole workspace).
 - `packages` — space-separated affected package names, the literal
   `workspace`, or empty.
 - `package-args` — `packages` as cargo flags: `-p <name>` per package,
   `--workspace` for `workspace`, empty for empty.
 - `linux-package-args` — `package-args` minus the members the Linux legs
   never compile (`LINUX_EXCLUDED`; none today).
-- `cargo-flags` / `linux-cargo-flags` — the full target selection for
-  backwards compatibility (`-p` flags plus `--all-targets` when the e2e gates
-  run, `--lib --bins` when they do not).
-- `unit-test` — `true` when any crate outside the root e2e archive needs unit
-  tests.
-- `unit-cargo-flags` / `linux-unit-cargo-flags` — the target selection for
-  the parallel unit-test jobs: when `e2e` is on, drops `root_pkg` (which
-  `build-e2e` builds and archives with `--all-targets`) and keeps
+- `cargo-flags` / `linux-cargo-flags` — the full test target selection
+  (`-p` flags plus `--all-targets` when the e2e gates run, `--lib --bins`
+  when they do not).
+- `unit-test` — `true` when any crate outside the root package needs unit
+  tests (or any crate when `e2e` is off).
+- `unit-cargo-flags` / `linux-unit-cargo-flags` — non-empty when `test-*-unit`
+  has work on that platform: when `e2e` is on, drops `root_pkg` (whose tests
+  are built and sharded by `build-e2e-*` / `test-*-e2e`) and keeps
   `--all-targets` on the remaining affected crates; when `e2e` is off, keeps
   every affected crate with `--lib --bins`.
 - `ui-clippy` — `true` when the `--features ui` clippy leg has work: a
@@ -100,7 +104,8 @@ WEB_UI_EXTRA = frozenset(
 )
 
 # `may-hashline` and `may-sed` are separate workspaces; nothing in the main
-# package graph reaches them (`sed/` runs its own manifest-scoped steps).
+# package graph reaches them (`hashline/` and `sed/` each run their own
+# manifest-scoped steps).
 HASHLINE_PREFIX = "hashline/"
 SED_PREFIX = "sed/"
 
@@ -218,7 +223,14 @@ def reverse_closure(roots, dependents):
     return seen
 
 
-def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true", root_pkg=ROOT_PACKAGE):
+def workspace_outputs(
+    ui_args,
+    linux_excluded=LINUX_EXCLUDED,
+    *,
+    sed="true",
+    hashline="true",
+    root_pkg=ROOT_PACKAGE,
+):
     """Every gate on: the diff can reach anywhere in the main workspace."""
     # `--exclude` composes with `--workspace` where `-p` cannot.
     excludes = " ".join(f"--exclude {name}" for name in sorted(linux_excluded))
@@ -230,6 +242,7 @@ def workspace_outputs(ui_args, linux_excluded=LINUX_EXCLUDED, *, sed="true", roo
     return {
         "rust": "true",
         "sed": sed,
+        "hashline": hashline,
         "fmt": "true",
         "clippy": "true",
         "ui-clippy": "true",
@@ -254,6 +267,7 @@ def empty_outputs(ui_args):
     return {
         "rust": "false",
         "sed": "false",
+        "hashline": "false",
         "fmt": "false",
         "clippy": "false",
         "ui-clippy": "false",
@@ -288,12 +302,19 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
         and path.rsplit("/", 1)[-1] not in METADATA_FILES
         for path in paths
     )
+    hashline_changed = any(
+        path.startswith(HASHLINE_PREFIX)
+        and not is_prose(path)
+        and path.rsplit("/", 1)[-1] not in METADATA_FILES
+        for path in paths
+    )
 
     if report["workspace"]:
         return workspace_outputs(
             ui_args,
             linux_excluded,
             sed="true" if sed_changed else "false",
+            hashline="true" if hashline_changed else "false",
             root_pkg=root_pkg,
         )
 
@@ -338,12 +359,11 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
     cargo_flags = f"{package_args(test_names)} {target_kinds}".strip()
     linux_cargo_flags = f"{package_args(test_names - linux_excluded)} {target_kinds}".strip()
 
-    # The parallel unit-test job runs every affected crate outside the e2e
-    # archive: when `e2e` runs, `build-e2e` builds and archives `root_pkg`
-    # (`--all-targets`), so `unit_names` drops `root_pkg` and keeps
-    # `--all-targets` for the remaining crates (preserving e.g. `may-patch`'s
-    # integration tests). When `e2e` is off, `unit_names` keeps every affected
-    # crate with `--lib --bins`.
+    # `test-*-unit` builds and runs `unit-cargo-flags` /
+    # `linux-unit-cargo-flags` inline whenever non-empty, in parallel with
+    # `build-e2e-*` (which archives `-p may-agent --all-targets` for the E2E
+    # shards and Container Acceptance). When `e2e` is off, `unit_names` keeps
+    # every affected crate with `--lib --bins`.
     unit_names = (set(affected) - {root_pkg}) if e2e else set(affected)
     linux_unit_names = unit_names - linux_excluded
     unit_cargo_flags = f"{package_args(unit_names)} {target_kinds}".strip() if unit_names else ""
@@ -351,10 +371,11 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
         f"{package_args(linux_unit_names)} {target_kinds}".strip() if linux_unit_names else ""
     )
 
-    has_rust_work = bool(affected) or sed_changed
+    has_rust_work = bool(affected) or sed_changed or hashline_changed
     return {
         "rust": "true" if affected else "false",
         "sed": "true" if sed_changed else "false",
+        "hashline": "true" if hashline_changed else "false",
         "fmt": "true" if has_rust_work else "false",
         "clippy": "true" if has_rust_work else "false",
         "ui-clippy": "true" if ui_clippy else "false",

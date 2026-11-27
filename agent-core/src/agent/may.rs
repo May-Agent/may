@@ -38,7 +38,7 @@ use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
-use crate::command_policy::{FileReadEpochs, HostCommandNotices, PolicySet};
+use crate::command_policy::{EditBypassNotices, FileReadEpochs, HostCommandNotices, PolicySet};
 use crate::config::MayConfig;
 use crate::db::{ChatDb, RunFence};
 use crate::harness::compact_tool::CompactSignal;
@@ -1015,6 +1015,9 @@ impl MayAgent {
             config.limits.shell()
         };
         let host_command_notices = HostCommandNotices::default();
+        let edit_bypass_notices = config.hashline.then(|| {
+            EditBypassNotices::with_sandbox_dir(&config.sandbox_dir).with_grants(grants.clone())
+        });
         let assembly = ShellAssembly {
             tools: tools.clone(),
             container: match &config.environment {
@@ -1071,6 +1074,7 @@ impl MayAgent {
                     session_id: config.session_id.as_str().to_string(),
                 }),
                 write_lease,
+                edit_bypass_notices: edit_bypass_notices.clone(),
             },
             slot: ShellSlot::new(),
             ssh_servers,
@@ -1146,10 +1150,12 @@ impl MayAgent {
                     &config.timezone,
                     config.location.as_ref(),
                 );
+                let prepared_tools = build_prepared_tools(&catalog, config.hashline)?;
                 let subagent_instructions = build_subagent_instructions(
                     &config.environment,
                     config.ssh_servers.clone(),
                     config.hashline,
+                    Some(prepared_tools.clone()),
                     config.secrets.names(),
                     config.network_policy.as_ref(),
                     &config.request_parameters,
@@ -1160,10 +1166,7 @@ impl MayAgent {
                         .with_instruction(tag::IDENTITY, build_identity(config.non_interactive))
                         .with_instruction(tag::ENVIRONMENT, environment_block)
                         .with_instruction(tag::TERMINAL, terminal)
-                        .with_instruction(
-                            tag::PREPARED_TOOLS,
-                            build_prepared_tools(&catalog, config.hashline)?,
-                        )
+                        .with_instruction(tag::PREPARED_TOOLS, prepared_tools)
                         .with_instruction(tag::PERMISSIONS, permissions_block)
                         .with_instruction(tag::HARNESS, harness)
                         .with_instruction(tag::EVIDENCE, evidence)
@@ -1460,6 +1463,7 @@ impl MayAgent {
                             instructions: subagent_instructions,
                             vision_ocr: crate::vision_ocr::VisionOcr::new(),
                             permissions: permissions.clone(),
+                            edit_bypass_notices: edit_bypass_notices.clone(),
                         },
                         issue_store: issue_store.clone(),
                         task_events: task_events.clone(),
@@ -1734,6 +1738,10 @@ impl MayAgent {
                     providers,
                 )
             });
+        if let Some(notices) = edit_bypass_notices {
+            builder =
+                builder.context_source(super::edit_bypass_alerts::EditBypassAlerts::new(notices));
+        }
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }

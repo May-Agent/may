@@ -367,6 +367,17 @@ async fn the_scripts_own_shell_allows_host_grep_awk_or_find_and_records_notices(
         );
         assert_eq!(recorded[0].name, name);
     }
+    // In hashline mode, `grep` steers toward `search rg` so results carry `N#HH` anchors.
+    let notices = HostCommandNotices::default();
+    let policy = ManagedShellCommands::with_hashline(notices.clone(), true);
+    assert_eq!(
+        decide(&policy, &(), "grep x file", ScriptOrigin::Foreground).await,
+        ScriptDecision::Pass
+    );
+    let recorded = notices.take_all();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].name, "grep");
+    assert_eq!(recorded[0].replacement, "`search rg`");
     for script in [
         "rg x file",
         "/usr/bin/grep x file",
@@ -816,6 +827,584 @@ async fn bumping_read_epoch_allows_post_compaction_recall_without_clearing_other
     epochs.bump(&child_path);
     assert_eq!(
         policy.check(&child_repeat, &child_state).await,
+        ScriptDecision::Pass
+    );
+}
+
+#[tokio::test]
+async fn hashline_edit_bypass_flags_bypasses_and_allows_legitimate_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(root.join("existing.py"), "x = 1\n").expect("write existing.py");
+    std::fs::write(root.join("a.py"), "a = 1\n").expect("write a.py");
+    std::fs::write(root.join("existing.rs"), "fn main() {}\n").expect("write existing.rs");
+    std::fs::write(root.join("existing.json"), "{}\n").expect("write existing.json");
+    std::fs::write(root.join("tasks.md"), "- task\n").expect("write tasks.md");
+    std::fs::create_dir_all(root.join("tmp")).expect("mkdir tmp");
+    std::fs::write(root.join("tmp/scratch.txt"), "old\n").expect("write tmp/scratch.txt");
+    std::fs::write(root.join("tmp/x"), "replacement\n").expect("write tmp/x");
+    std::fs::create_dir_all(root.join("repo/src")).expect("mkdir repo/src");
+    std::fs::write(root.join("repo/src/lib.rs"), "pub fn a() {}\n").expect("write repo/src/lib.rs");
+
+    let start = ScriptDir::Host(root.to_path_buf());
+    let run_shell = |script: &str| {
+        let notices = EditBypassNotices::with_sandbox_dir(root);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let parsed = ShellScript::parse(script);
+        let start = start.clone();
+        let script = script.to_string();
+        async move {
+            let check = check_with(
+                aither_sandbox::LaunchLease::fresh().id(),
+                &script,
+                Some(parsed.as_ref()),
+                ScriptOrigin::Foreground,
+                &start,
+            );
+            let decision = policy.check(&check, &()).await;
+            assert_eq!(
+                decision,
+                ScriptDecision::Pass,
+                "`{script}` must pass while recording alerts"
+            );
+            notices.take_all()
+        }
+    };
+
+    // Flagged bypasses.
+    for (script, expected_mechanism) in [
+        ("sed -i 's/1/2/' existing.py", "sed -i"),
+        ("sed -i '' 's/1/2/' existing.py", "sed -i"),
+        ("sed --in-place 's/1/2/' existing.py", "sed --in-place"),
+        ("perl -i -pe 's/1/2/' existing.py", "perl -i"),
+        ("perl -pi -e 's/1/2/' existing.py", "perl -i"),
+        ("perl -pie 's/1/2/' existing.py", "perl -i"),
+        ("ruby -i -pe 'gsub(/1/, \"2\")' existing.py", "ruby -i"),
+        (
+            "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH",
+            "apply_patch",
+        ),
+        ("ed existing.py", "ed"),
+        ("ex -sc 'wq' existing.py", "ex"),
+        ("patch -p1 < tmp/x", "patch"),
+        ("jq . existing.json | sponge existing.json", "sponge"),
+        (
+            "python3 -c 'open(\"existing.py\", \"w\").write(\"x\")'",
+            "python3 -c",
+        ),
+        (
+            "python3 -c 'from pathlib import Path; Path(\"existing.py\").write_text(\"x\")'",
+            "python3 -c",
+        ),
+        (
+            "cd repo && python3 - <<'EOF'\nfrom pathlib import Path\np = Path(\"src/lib.rs\")\np.write_text(\"pub fn b() {}\")\nEOF",
+            "python3",
+        ),
+        (
+            "python3 <<'EOF'\nwith open('existing.py', 'w') as f:\n    f.write('y')\nEOF",
+            "python3",
+        ),
+        (
+            "node -e 'require(\"fs\").writeFileSync(\"existing.py\", \"x\")'",
+            "node -e",
+        ),
+        ("bun -e 'await Bun.write(\"existing.py\", \"x\")'", "bun -e"),
+        ("ruby -e 'File.write(\"existing.py\", \"x\")'", "ruby -e"),
+        ("cat <<EOF > existing.py\nhi\nEOF", "shell redirection"),
+        ("echo hi >> existing.py", "shell redirection"),
+        ("echo hi >| existing.py", "shell redirection"),
+        (
+            "cd repo && cat <<'EOF' > src/lib.rs\npub fn c() {}\nEOF",
+            "shell redirection",
+        ),
+        ("echo hi | tee existing.py", "tee"),
+        ("echo hi | tee -a existing.py", "tee"),
+        ("cp tmp/x existing.py", "cp"),
+        ("mv tmp/x existing.py", "mv"),
+    ] {
+        let recorded = run_shell(script).await;
+        assert!(
+            recorded
+                .iter()
+                .any(|usage| usage.mechanism == expected_mechanism),
+            "expected `{expected_mechanism}` alert for `{script}`, got: {recorded:?}"
+        );
+    }
+
+    // Direct Interpreter::Python mutating an existing file is flagged, while read-only passes.
+    {
+        let notices = EditBypassNotices::with_sandbox_dir(root);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let mut py_write = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            "from pathlib import Path\nPath('existing.py').write_text('x')\n",
+            None,
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        py_write.interpreter = Interpreter::Python;
+        assert_eq!(policy.check(&py_write, &()).await, ScriptDecision::Pass);
+        let recorded = notices.take_all();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].mechanism, "python");
+        assert_eq!(recorded[0].target.as_deref(), Some("existing.py"));
+
+        let mut py_read = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            "print(open('existing.py').read())\n",
+            None,
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        py_read.interpreter = Interpreter::Python;
+        assert_eq!(policy.check(&py_read, &()).await, ScriptDecision::Pass);
+        assert_eq!(
+            notices.take_all(),
+            [] as [hashline_bypass::EditBypassUsage; 0]
+        );
+    }
+
+    // Allowed commands (must NOT trigger any alert).
+    for script in [
+        "edit <<'PATCH'\n[existing.py]\nPUT >1#PM:\n+x > existing.py\nPATCH",
+        "search rg x existing.py",
+        "search rg -n x existing.py",
+        "search sg 'fn $NAME()' --lang rust repo/src",
+        "search sed -n '1,120p' existing.py",
+        "cat <<EOF > brand_new.py\nhello\nEOF",
+        "echo hi > /dev/null",
+        "echo hi > tmp/scratch.txt",
+        "echo hi > outputs/log.txt",
+        "echo hi > files/notes.md",
+        "echo hi > artifacts/report.md",
+        "echo hi > data/sample.json",
+        "echo hi > tasks.md",
+        "echo hi > $MAY_TASKS",
+        "echo hi > $TMPDIR/out.txt",
+        "echo hi | tee brand_new.py",
+        "echo hi | tee tmp/scratch.txt",
+        "cp existing.py brand_new.py",
+        "cp existing.py tmp/scratch.txt",
+        "cp -n tmp/x existing.py",
+        "python3 -c 'print(open(\"existing.py\").read())'",
+        "python3 -c 'print(open(\"a.py\").read())'",
+        "python3 -c 'print(open(\"existing.py\").read().replace(\"1\", \"2\") + \"\\n\")'",
+        "python3 -c 'open(\"brand_new.py\", \"w\").write(\"x\")'",
+        "python3 -c 'open(\"tmp/scratch.txt\", \"w\").write(\"x\")'",
+        "cd repo && python3 - <<'EOF'\nfrom pathlib import Path\nPath(\"tmp/scratch.txt\").write_text(\"ok\")\nEOF",
+        "sed -n '1,10p' existing.py",
+        "sed -e '-i' existing.py",
+        "rustfmt existing.rs",
+        "prettier --write existing.json",
+        "ruff format existing.py",
+        "black existing.py",
+        "git status",
+        "cargo test 2>&1",
+        "pytest",
+    ] {
+        let recorded = run_shell(script).await;
+        assert!(
+            recorded.is_empty(),
+            "`{script}` must not trigger an edit-bypass alert, got: {recorded:?}"
+        );
+    }
+
+    // Internal `ScriptOrigin::Run` scripts never record model alerts.
+    {
+        let notices = EditBypassNotices::with_sandbox_dir(root);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let parsed = ShellScript::parse("sed -i 's/1/2/' existing.py");
+        let check = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            "sed -i 's/1/2/' existing.py",
+            Some(parsed.as_ref()),
+            ScriptOrigin::Run,
+            &start,
+        );
+        assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+        assert_eq!(
+            notices.take_all(),
+            [] as [hashline_bypass::EditBypassUsage; 0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn hashline_edit_bypass_isolates_notices_by_agent_path() {
+    use aither_core::llm::tool::{AgentIdentity, SubagentIdentity};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("existing.py"), "x = 1\n").expect("write");
+    let start = ScriptDir::Host(dir.path().to_path_buf());
+    let notices = EditBypassNotices::with_sandbox_dir(dir.path());
+    let policy = HashlineEditBypassPolicy::new(notices.clone());
+
+    let main_call = CallIdentity::new(ToolCallId::new("c1"), AgentIdentity::Main);
+    let sub_call = CallIdentity::new(
+        ToolCallId::new("c2"),
+        AgentIdentity::Subagent(SubagentIdentity::new("general", Some(main_call.clone()))),
+    );
+    let sub_path = AgentPath::of(sub_call.agent());
+
+    let script = "sed -i 's/1/2/' existing.py";
+    let parsed = ShellScript::parse(script);
+    let mut sub_check = check_with(
+        aither_sandbox::LaunchLease::fresh().id(),
+        script,
+        Some(parsed.as_ref()),
+        ScriptOrigin::Foreground,
+        &start,
+    );
+    sub_check.call = Some(&sub_call);
+    assert_eq!(policy.check(&sub_check, &()).await, ScriptDecision::Pass);
+
+    assert!(notices.take_all().is_empty(), "main queue stays empty");
+    let sub_recorded = notices.take_all_for(&sub_path);
+    assert_eq!(sub_recorded.len(), 1);
+    assert_eq!(sub_recorded[0].mechanism, "sed -i");
+    assert_eq!(
+        notices.take_all_for(&sub_path),
+        [] as [hashline_bypass::EditBypassUsage; 0]
+    );
+}
+
+#[tokio::test]
+async fn hashline_edit_bypass_still_flags_sandboxes_and_granted_repos_under_system_tmp() {
+    let tmp_root = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
+    let sandbox = tmp_root.path().join("sandbox");
+    let granted_repo = tmp_root.path().join("repo");
+    let unrelated = tmp_root.path().join("unrelated.log");
+    std::fs::create_dir_all(sandbox.join("tmp")).expect("mkdir sandbox/tmp");
+    std::fs::create_dir_all(granted_repo.join("src")).expect("mkdir repo/src");
+    std::fs::write(sandbox.join("existing.py"), "x = 1\n").expect("write sandbox/existing.py");
+    std::fs::write(sandbox.join("tmp/scratch.txt"), "old\n").expect("write sandbox scratch");
+    std::fs::write(granted_repo.join("src/app.py"), "y = 1\n").expect("write repo/src/app.py");
+    std::fs::write(&unrelated, "old\n").expect("write unrelated /tmp file");
+
+    let grants = aither_sandbox::Grants::new();
+    grants.add_writable(&granted_repo);
+    let notices = EditBypassNotices::with_sandbox_dir(&sandbox).with_grants(grants);
+    let policy = HashlineEditBypassPolicy::new(notices.clone());
+    let start = ScriptDir::Host(sandbox.clone());
+
+    let run = |script: String| {
+        let policy = policy.clone();
+        let notices = notices.clone();
+        let start = start.clone();
+        async move {
+            let parsed = ShellScript::parse(&script);
+            let check = check_with(
+                aither_sandbox::LaunchLease::fresh().id(),
+                &script,
+                Some(parsed.as_ref()),
+                ScriptOrigin::Foreground,
+                &start,
+            );
+            assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+            notices.take_all()
+        }
+    };
+
+    // Relative and absolute writes to non-scratch files inside a `/tmp` sandbox must alert.
+    for script in [
+        "cat <<'EOF' > existing.py\nx = 2\nEOF".to_string(),
+        format!(
+            "cat <<'EOF' > {}\nx = 3\nEOF",
+            sandbox.join("existing.py").display()
+        ),
+        format!(
+            "cd {} && python3 - <<'EOF'\nfrom pathlib import Path\nPath('src/app.py').write_text('y = 2\\n')\nEOF",
+            granted_repo.display()
+        ),
+    ] {
+        let recorded = run(script.clone()).await;
+        assert!(
+            !recorded.is_empty(),
+            "expected bypass alert for `{script}` under /tmp, got none"
+        );
+    }
+
+    // Explicit sandbox scratch and unrelated `/tmp` files remain allowed.
+    for script in [
+        "echo ok > tmp/scratch.txt".to_string(),
+        format!("echo ok > {}", sandbox.join("tmp/scratch.txt").display()),
+        format!("echo ok > {}", unrelated.display()),
+    ] {
+        let recorded = run(script.clone()).await;
+        assert!(
+            recorded.is_empty(),
+            "expected no alert for scratch path `{script}`, got: {recorded:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hashline_edit_bypass_catches_cd_python_heredoc_and_edge_cases() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sandbox = dir.path().join("sandbox");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&sandbox).expect("mkdir sandbox");
+    std::fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(repo.join("src/_pytest")).expect("mkdir src/_pytest");
+    std::fs::write(
+        repo.join("src/_pytest/logging.py"),
+        "def emit():\n    return 'a'\n",
+    )
+    .expect("write logging.py");
+
+    let exact_script = format!(
+        "cd {} && python3 - <<'EOF'\nimport re\np='src/_pytest/logging.py'\ns=open(p).read()\ns=s.replace('a','b')\nopen(p,'w').write(s)\nEOF",
+        repo.display()
+    );
+
+    // 1. Standard host sandbox -> cd /path/to/repo && python3 - <<'EOF'
+    {
+        let notices = EditBypassNotices::with_sandbox_dir(&sandbox);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let start = ScriptDir::Host(sandbox.clone());
+        let parsed = ShellScript::parse(&exact_script);
+        let check = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            &exact_script,
+            Some(parsed.as_ref()),
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+        let recorded = notices.take_all();
+        assert_eq!(
+            recorded,
+            vec![EditBypassUsage::new(
+                "python3",
+                Some("src/_pytest/logging.py")
+            )]
+        );
+    }
+
+    // 2. Repo under /tmp with only a readable grant or unsandboxed `.git` checkout
+    {
+        let tmp_root = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
+        let tmp_repo = tmp_root.path().join("pytest-repo");
+        std::fs::create_dir_all(tmp_repo.join(".git")).expect("mkdir .git");
+        std::fs::create_dir_all(tmp_repo.join("src/_pytest")).expect("mkdir src/_pytest");
+        std::fs::write(tmp_repo.join("src/_pytest/logging.py"), "x = 'a'\n").expect("write");
+
+        let tmp_script = format!(
+            "cd {} && python3 - <<'EOF'\nimport re\np='src/_pytest/logging.py'\ns=open(p).read()\ns=s.replace('a','b')\nopen(p,'w').write(s)\nEOF",
+            tmp_repo.display()
+        );
+        let notices = EditBypassNotices::with_sandbox_dir(&sandbox);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let start = ScriptDir::Host(sandbox.clone());
+        let parsed = ShellScript::parse(&tmp_script);
+        let check = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            &tmp_script,
+            Some(parsed.as_ref()),
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+        assert_eq!(
+            notices.take_all(),
+            vec![EditBypassUsage::new(
+                "python3",
+                Some("src/_pytest/logging.py")
+            )]
+        );
+    }
+
+    // 3. Container session: both `/workspace/...` mounted repo and `/testbed` unmounted repo
+    {
+        let container_repo = sandbox.join("repos/pytest");
+        std::fs::create_dir_all(container_repo.join("src/_pytest")).expect("mkdir");
+        std::fs::write(container_repo.join("src/_pytest/logging.py"), "x = 'a'\n").expect("write");
+
+        let container_start = ScriptDir::Container {
+            inside: aither_sandbox::ContainerPath::new("/workspace").expect("valid container path"),
+            host: sandbox.clone(),
+        };
+        for script in [
+            "cd /workspace/repos/pytest && python3 - <<'EOF'\nimport re\np='src/_pytest/logging.py'\ns=open(p).read()\ns=s.replace('a','b')\nopen(p,'w').write(s)\nEOF",
+            "cd /testbed && python3 - <<'EOF'\nimport re\np='src/_pytest/logging.py'\ns=open(p).read()\ns=s.replace('a','b')\nopen(p,'w').write(s)\nEOF",
+        ] {
+            let notices = EditBypassNotices::with_sandbox_dir(&sandbox);
+            let policy = HashlineEditBypassPolicy::new(notices.clone());
+            let parsed = ShellScript::parse(script);
+            let check = check_with(
+                aither_sandbox::LaunchLease::fresh().id(),
+                script,
+                Some(parsed.as_ref()),
+                ScriptOrigin::Foreground,
+                &container_start,
+            );
+            assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+            assert_eq!(
+                notices.take_all(),
+                vec![EditBypassUsage::new(
+                    "python3",
+                    Some("src/_pytest/logging.py")
+                )],
+                "container script must alert: {script}"
+            );
+        }
+
+        // Container `/tmp` scratch must stay silent.
+        let notices = EditBypassNotices::with_sandbox_dir(&sandbox);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let scratch_script =
+            "cd /tmp && python3 - <<'EOF'\nopen('scratch.txt','w').write('ok')\nEOF";
+        let parsed = ShellScript::parse(scratch_script);
+        let check = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            scratch_script,
+            Some(parsed.as_ref()),
+            ScriptOrigin::Foreground,
+            &container_start,
+        );
+        assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+        assert_eq!(
+            notices.take_all(),
+            [] as [hashline_bypass::EditBypassUsage; 0]
+        );
+    }
+
+    // 4. Semicolon-separated bindings, `io.open`, `-W ignore`, and read-only `str.replace`.
+    {
+        let start = ScriptDir::Host(repo.clone());
+        for (script, expected_mech) in [
+            (
+                "python3 -c \"p='src/_pytest/logging.py'; s=open(p).read(); open(p,'w').write(s)\"",
+                "python3 -c",
+            ),
+            (
+                "python3 -c \"import io; io.open('src/_pytest/logging.py','w').write('x')\"",
+                "python3 -c",
+            ),
+            (
+                "python3 -W ignore - <<'EOF'\np='src/_pytest/logging.py'\nopen(p,'w').write('x')\nEOF",
+                "python3",
+            ),
+        ] {
+            let notices = EditBypassNotices::with_sandbox_dir(&sandbox);
+            let policy = HashlineEditBypassPolicy::new(notices.clone());
+            let parsed = ShellScript::parse(script);
+            let check = check_with(
+                aither_sandbox::LaunchLease::fresh().id(),
+                script,
+                Some(parsed.as_ref()),
+                ScriptOrigin::Foreground,
+                &start,
+            );
+            assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+            assert_eq!(
+                notices.take_all(),
+                vec![EditBypassUsage::new(
+                    expected_mech,
+                    Some("src/_pytest/logging.py")
+                )],
+                "script: {script}"
+            );
+        }
+
+        // Read-only `str.replace` on a string literal variable must NOT alert.
+        let notices = EditBypassNotices::with_sandbox_dir(&sandbox);
+        let policy = HashlineEditBypassPolicy::new(notices.clone());
+        let read_only = "python3 - <<'EOF'\ntext = 'src/_pytest/logging.py'\nprint(text.replace('a', 'b'))\nEOF";
+        let parsed = ShellScript::parse(read_only);
+        let check = check_with(
+            aither_sandbox::LaunchLease::fresh().id(),
+            read_only,
+            Some(parsed.as_ref()),
+            ScriptOrigin::Foreground,
+            &start,
+        );
+        assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+        assert_eq!(
+            notices.take_all(),
+            [] as [hashline_bypass::EditBypassUsage; 0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn sed_in_place_refuses_with_mode_appropriate_editor_and_avoids_false_positives() {
+    for script in [
+        "sed -i 's/a/b/' file.py",
+        "sed -i '' 's/a/b/' file.py",
+        "sed -i.bak 's/a/b/' file.py",
+        "sed -Ei 's/a/b/' file.py",
+        "sed --in-place 's/a/b/' file.py",
+        "sed --in-place=.bak 's/a/b/' file.py",
+        "sed 's/a/b/' -i file.py",
+        "cd repo && sed -i 's/a/b/' src/app.py",
+    ] {
+        let hashline_decision = decide(
+            &SedInPlace::new(true),
+            &(),
+            script,
+            ScriptOrigin::Foreground,
+        )
+        .await;
+        let hashline_text = refusal(&hashline_decision)
+            .unwrap_or_else(|| panic!("hashline SedInPlace must refuse `{script}`"));
+        assert!(
+            hashline_text.contains("`edit`") && !hashline_text.contains("`apply_patch`"),
+            "hashline refusal should name `edit` for `{script}`: {hashline_text}"
+        );
+
+        let standard_decision = decide(
+            &SedInPlace::new(false),
+            &(),
+            script,
+            ScriptOrigin::Foreground,
+        )
+        .await;
+        let standard_text = refusal(&standard_decision)
+            .unwrap_or_else(|| panic!("standard SedInPlace must refuse `{script}`"));
+        assert!(
+            standard_text.contains("`apply_patch`") && !standard_text.contains("`edit`"),
+            "standard refusal should name `apply_patch` for `{script}`: {standard_text}"
+        );
+    }
+
+    for allowed in [
+        "search sed -n '1,50p' file.py",
+        "search sed -i 's/a/b/' file.py",
+        "sed -n '1,50p' file.py",
+        "sed -E 's/(a)b/\\1/' file.py",
+        "sed -e '-i' file.py",
+        "sed --expression=-i file.py",
+        "sed -e-i file.py",
+        "sed -n '/-i/p' file.py",
+        "sed -- -i file.py",
+        "echo \"sed -i 's/a/b/' file.py\"",
+        "rg -i 'sed -i' file.py",
+    ] {
+        for hashline in [false, true] {
+            assert_eq!(
+                decide(
+                    &SedInPlace::new(hashline),
+                    &(),
+                    allowed,
+                    ScriptOrigin::Foreground
+                )
+                .await,
+                ScriptDecision::Pass,
+                "SedInPlace(hashline={hashline}) must not false-positive on `{allowed}`"
+            );
+        }
+    }
+
+    // Internal `ScriptOrigin::Run` scripts pass.
+    assert_eq!(
+        decide(
+            &SedInPlace::new(true),
+            &(),
+            "sed -i 's/a/b/' file.py",
+            ScriptOrigin::Run
+        )
+        .await,
         ScriptDecision::Pass
     );
 }

@@ -1,12 +1,17 @@
-name: Run E2E test shard
-description: Download the prebuilt `may-agent` nextest archive and run one shard without compiling Rust.
+name: Run archived tests
+description: Download the prebuilt nextest archive and run a filtered (optionally sharded) subset without compiling Rust.
 inputs:
+  filter:
+    description: Nextest filterset expression passed to `-E`.
+    required: true
   shard:
-    description: 1-based shard index.
-    required: true
+    description: 1-based shard index (omit for unsharded runs).
+    required: false
+    default: ''
   total-shards:
-    description: Total number of parallel shards.
-    required: true
+    description: Total number of parallel shards (required when `shard` is set).
+    required: false
+    default: ''
 runs:
   using: composite
   steps:
@@ -37,22 +42,29 @@ runs:
         sudo sysctl -w kern.maxfiles=200000 kern.maxfilesperproc=65536 >/dev/null 2>&1 || true
         sudo launchctl limit maxfiles 65536 200000 >/dev/null 2>&1 || true
     - uses: ./.github/actions/restore-test-downloads
-    - name: Download the E2E nextest archive
+    - name: Download the nextest archive
       uses: actions/download-artifact@v4
       with:
-        name: e2e-archive-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
-        path: ${{ runner.temp }}/e2e-archive
+        name: tests-archive-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        path: ${{ runner.temp }}/tests-archive
     - uses: taiki-e/install-action@nextest
-    - name: cargo nextest (shard ${{ inputs.shard }}/${{ inputs.total-shards }})
+    - name: cargo nextest
       shell: bash
+      env:
+        NEXTEST_FILTER: ${{ inputs.filter }}
+        NEXTEST_SHARD: ${{ inputs.shard }}
+        NEXTEST_TOTAL_SHARDS: ${{ inputs.total-shards }}
       run: |
         ulimit -n 65536 2>/dev/null || true
-        extra=()
+        args=(
+          --archive-file "${{ runner.temp }}/tests-archive/tests-archive.tar.zst"
+          --workspace-remap .
+          -E "${NEXTEST_FILTER}"
+        )
         if [ "${{ runner.os }}" = "macOS" ]; then
-          extra+=(--test-threads 6)
+          args+=(--test-threads 6)
         fi
-        cargo nextest run \
-          "${extra[@]}" \
-          --archive-file "${{ runner.temp }}/e2e-archive/e2e-archive.tar.zst" \
-          --workspace-remap . \
-          --partition "count:${{ inputs.shard }}/${{ inputs.total-shards }}"
+        if [ -n "${NEXTEST_SHARD}" ]; then
+          args+=(--partition "count:${NEXTEST_SHARD}/${NEXTEST_TOTAL_SHARDS}")
+        fi
+        cargo nextest run "${args[@]}"

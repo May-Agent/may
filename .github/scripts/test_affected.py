@@ -146,12 +146,14 @@ class HelperTests(unittest.TestCase):
             ".github/ISSUE_TEMPLATE/bug.md",
             "patch/README.md",  # a crate's own prose
             "sed/LICENSE",
+            "hashline/README.md",
             "tasks/notes.md",
         ]:
             self.assertTrue(affected.is_prose(prose), prose)
         for not_prose in [
             "src/config.rs",
             "patch/src/lib.rs",
+            "hashline/src/lib.rs",
             "templates/prompt/layout.txt",  # embedded: askama/included
             "skills/may/SKILL.md",  # embedded: include_dir!
             "subagents/audit.toml",
@@ -212,12 +214,14 @@ class ComputeTests(unittest.TestCase):
     def test_workspace_scope_runs_everything(self):
         out = compute(report(workspace=True, affected=MEMBERS, owners={"x": None}))
         self.assertEqual(out["rust"], "true")
-        # A main-workspace gate change does not touch the standalone sed/ workspace.
+        # A main-workspace gate change does not touch the standalone sed/ or hashline/ workspaces.
         self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["hashline"], "false")
         self.assertEqual(out["packages"], "workspace")
         self.assertEqual(out["package-args"], "--workspace")
         self.assertEqual(out["linux-package-args"], "--workspace")
         self.assertEqual(out["cargo-flags"], "--workspace --all-targets")
+        self.assertEqual(out["linux-cargo-flags"], "--workspace --all-targets")
         self.assertEqual(out["unit-test"], "true")
         self.assertEqual(
             out["unit-cargo-flags"], "--workspace --exclude may-agent --all-targets"
@@ -250,8 +254,12 @@ class ComputeTests(unittest.TestCase):
     def test_empty_diff_runs_nothing(self):
         out = compute(report(owners={}))
         self.assertEqual(out["rust"], "false")
+        self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["hashline"], "false")
         self.assertEqual(out["packages"], "")
-        for key in ["fmt", "clippy", "ui-clippy", "test", "e2e", "acceptance", "web_ui"]:
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
+        for key in ["fmt", "clippy", "ui-clippy", "test", "unit-test", "e2e", "acceptance", "web_ui"]:
             self.assertEqual(out[key], "false", key)
 
     def test_prose_only_runs_nothing(self):
@@ -281,6 +289,7 @@ class ComputeTests(unittest.TestCase):
         out = compute(report(owners={"sed/src/main.rs": None}))
         self.assertEqual(out["rust"], "false")
         self.assertEqual(out["sed"], "true")
+        self.assertEqual(out["hashline"], "false")
         self.assertEqual(out["fmt"], "true")
         self.assertEqual(out["clippy"], "true")
         self.assertEqual(out["test"], "true")
@@ -288,8 +297,83 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["package-args"], "")
         self.assertEqual(out["e2e"], "false")
         self.assertEqual(out["acceptance"], "false")
+        self.assertEqual(out["unit-test"], "false")
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
         self.assertEqual(out["ui-clippy"], "false")
         self.assertEqual(out["web_ui"], "false")
+
+    def test_standalone_hashline_workspace_runs_hashline_only(self):
+        # `hashline/` is a standalone workspace: editing it runs `hashline`'s
+        # own fmt, clippy, and test steps without building or testing `may-agent`.
+        out = compute(
+            report(owners={"hashline/src/lib.rs": None, "hashline/Cargo.toml": None})
+        )
+        self.assertEqual(out["rust"], "false")
+        self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["hashline"], "true")
+        self.assertEqual(out["fmt"], "true")
+        self.assertEqual(out["clippy"], "true")
+        self.assertEqual(out["test"], "true")
+        self.assertEqual(out["packages"], "")
+        self.assertEqual(out["package-args"], "")
+        self.assertEqual(out["linux-package-args"], "")
+        self.assertEqual(out["e2e"], "false")
+        self.assertEqual(out["acceptance"], "false")
+        self.assertEqual(out["unit-test"], "false")
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
+        self.assertEqual(out["ui-clippy"], "false")
+        self.assertEqual(out["web_ui"], "false")
+
+    def test_standalone_hashline_prose_and_metadata_run_nothing(self):
+        out = compute(
+            report(owners={"hashline/README.md": None, "hashline/.gitignore": None})
+        )
+        self.assertEqual(out["rust"], "false")
+        self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["hashline"], "false")
+        self.assertEqual(out["fmt"], "false")
+        self.assertEqual(out["clippy"], "false")
+        self.assertEqual(out["test"], "false")
+        self.assertEqual(out["e2e"], "false")
+        self.assertEqual(out["web_ui"], "false")
+
+    def test_workspace_scope_with_hashline_change_enables_hashline(self):
+        out = compute(
+            report(
+                workspace=True,
+                affected=MEMBERS,
+                owners={"x": None, "hashline/Cargo.toml": None},
+            )
+        )
+        self.assertEqual(out["rust"], "true")
+        self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["hashline"], "true")
+
+    def test_standalone_hashline_and_sed_together_skip_main_workspace(self):
+        out = compute(
+            report(owners={"hashline/src/bin/search.rs": None, "sed/src/main.rs": None})
+        )
+        self.assertEqual(out["rust"], "false")
+        self.assertEqual(out["sed"], "true")
+        self.assertEqual(out["hashline"], "true")
+        self.assertEqual(out["fmt"], "true")
+        self.assertEqual(out["e2e"], "false")
+        self.assertEqual(out["unit-test"], "false")
+
+    def test_hashline_plus_main_workspace_crate_runs_both(self):
+        out = compute(
+            report(
+                affected=["may-tasks"],
+                owners={"tasks/src/main.rs": "may-tasks", "hashline/src/apply.rs": None},
+            )
+        )
+        self.assertEqual(out["rust"], "true")
+        self.assertEqual(out["hashline"], "true")
+        self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["e2e"], "true")
+        self.assertEqual(out["packages"], "may-tasks")
 
     def test_leaf_tool_crate_keeps_e2e(self):
         # may-tasks ships inside the workspace and container image: its sources
@@ -297,11 +381,16 @@ class ComputeTests(unittest.TestCase):
         # root package joins the build set for the `may` and e2e binaries.
         out = compute(report(affected=["may-tasks"], owners={"tasks/src/main.rs": "may-tasks"}))
         self.assertEqual(out["sed"], "false")
+        self.assertEqual(out["hashline"], "false")
         self.assertEqual(out["packages"], "may-tasks")
         self.assertEqual(out["package-args"], "-p may-tasks")
         self.assertEqual(out["e2e"], "true")
         self.assertEqual(out["acceptance"], "true")
         self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tasks --all-targets")
+        self.assertEqual(out["linux-cargo-flags"], "-p may-agent -p may-tasks --all-targets")
+        self.assertEqual(out["unit-test"], "true")
+        self.assertEqual(out["unit-cargo-flags"], "-p may-tasks --all-targets")
+        self.assertEqual(out["linux-unit-cargo-flags"], "-p may-tasks --all-targets")
         self.assertEqual(out["ui-clippy"], "false")
         self.assertEqual(out["web_ui"], "false")
 
@@ -389,6 +478,9 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["ui-clippy"], "true")
         self.assertEqual(out["ui-args"], "-p may-agent")
         self.assertEqual(out["e2e"], "false")
+        self.assertEqual(out["unit-test"], "false")
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
 
     def test_web_ui_plus_rust_source(self):
         out = compute(
@@ -470,12 +562,6 @@ class ComputeTests(unittest.TestCase):
         out = compute(report(affected=["may-agent"], owners={"Cargo.lock": None}))
         self.assertEqual(out["e2e"], "true")
 
-    def test_outside_workspace_crate_runs_nothing(self):
-        out = compute(report(owners={"hashline/src/lib.rs": None, "hashline/Cargo.toml": None}))
-        self.assertEqual(out["rust"], "false")
-        self.assertEqual(out["e2e"], "false")
-        self.assertEqual(out["web_ui"], "false")
-
     def test_bridge_file_feeds_the_frontend_job(self):
         out = compute(
             report(
@@ -499,6 +585,8 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["linux-package-args"], "-p may-agent")
         self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tui --all-targets")
         self.assertEqual(out["linux-cargo-flags"], "-p may-agent --all-targets")
+        self.assertEqual(out["unit-cargo-flags"], "-p may-tui --all-targets")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
 
     def test_malformed_report_raises(self):
         with self.assertRaises(KeyError):
@@ -539,12 +627,16 @@ class MainTests(unittest.TestCase):
         outputs, _, _ = self.run_main(["--base", "", "--report-file", "/nonexistent"])
         self.assertEqual(outputs["packages"], "workspace")
         self.assertEqual(outputs["e2e"], "true")
+        self.assertEqual(outputs["sed"], "true")
+        self.assertEqual(outputs["hashline"], "true")
 
     def test_missing_report_widens_to_workspace(self):
         outputs, _, stderr = self.run_main(
             ["--base", "abc123", "--report-file", "/nonexistent/report.json"]
         )
         self.assertEqual(outputs["packages"], "workspace")
+        self.assertEqual(outputs["sed"], "true")
+        self.assertEqual(outputs["hashline"], "true")
         self.assertIn("fell back", stderr)
 
     def test_malformed_report_widens_to_workspace(self):
@@ -566,7 +658,20 @@ class MainTests(unittest.TestCase):
             outputs, _, _ = self.run_main(["--base", "abc123", "--report-file", path])
         self.assertEqual(outputs["packages"], "may-tasks")
         self.assertEqual(outputs["sed"], "false")
+        self.assertEqual(outputs["hashline"], "false")
         self.assertEqual(outputs["cargo-flags"], "-p may-agent -p may-tasks --all-targets")
+
+    def test_standalone_hashline_report(self):
+        r = report(owners={"hashline/src/bin/edit.rs": None})
+        path = self.report_file(json.dumps(r))
+        with mock.patch.object(affected, "workspace_facts", return_value=(ROOT, UI, {})):
+            outputs, _, _ = self.run_main(["--base", "abc123", "--report-file", path])
+        self.assertEqual(outputs["rust"], "false")
+        self.assertEqual(outputs["sed"], "false")
+        self.assertEqual(outputs["hashline"], "true")
+        self.assertEqual(outputs["fmt"], "true")
+        self.assertEqual(outputs["e2e"], "false")
+        self.assertEqual(outputs["packages"], "")
 
     def test_report_from_environment(self):
         r = report(affected=["may-patch"], owners={"patch/README.md": "may-patch"})

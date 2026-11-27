@@ -20,7 +20,7 @@ test-fixtures = []
 may-container-image = { path = "../container-image" }
 # The sandbox the distribution's `heel` binary is verified against.
 heel = { version = "0.10.1", default-features = false }
-aither-sandbox = { version = "0.31.0", default-features = false, features = ["code-folding", "connectivity", "jobserver"] }
+aither-sandbox = { version = "0.31.0", default-features = false }
 async-channel = { version = "2", default-features = false, features = ["std"] }
 async-fs = { version = "2.1", default-features = false }
 async-io = { version = "2.6", default-features = false }

@@ -30,12 +30,19 @@ impl BlockResolver for AstResolver {
         if matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx") {
             return markdown_section(text, line);
         }
-        let lang = SupportLang::from_str(ext)
-            .ok()
-            .or_else(|| lang_by_extension(ext))?;
+        let lang = support_lang_for_path(path)?;
         let root = AstGrep::str(text, lang);
         code_block(&root, line - 1)
     }
+}
+
+/// Resolves a file path's extension to its tree-sitter grammar language, if supported.
+fn support_lang_for_path(path: &Path) -> Option<SupportLang> {
+    let ext = path.extension()?.to_str()?;
+    let lower = ext.to_ascii_lowercase();
+    SupportLang::from_str(&lower)
+        .ok()
+        .or_else(|| lang_by_extension(&lower))
 }
 
 /// Maps a file extension to its language when it is not an accepted alias.

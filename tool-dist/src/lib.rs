@@ -9,7 +9,12 @@ mod distribution;
 mod environment;
 mod python;
 mod runtime;
+pub mod stage;
 mod transport;
+
+/// The shim installed as `python3`, `python` and `uv` in both host sessions
+/// and the published workspace image.
+pub const PYTHON_SHIM: &str = include_str!("../templates/python_shim");
 
 pub use distribution::{
     HostProgramArtifact, PinnedArtifact, ToolArtifact, ToolArtifactFormat, ToolArtifactLocation,

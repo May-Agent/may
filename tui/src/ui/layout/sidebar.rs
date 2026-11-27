@@ -103,8 +103,8 @@ fn truncate_tail(text: &str, width: usize) -> String {
 
 /// `path` with the user's home directory shown as `~`.
 fn home_label(path: &std::path::Path) -> String {
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rest) = path.strip_prefix(&home)
+    if let Some(home) = crate::home_dir()
+        && let Ok(rest) = path.strip_prefix(home)
     {
         return if rest.as_os_str().is_empty() {
             "~".to_string()

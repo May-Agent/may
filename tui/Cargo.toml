@@ -82,6 +82,7 @@ url = { version = "2.5.9", default-features = false, features = ["std"] }
 zenwave = { version = "0.12", git = "https://github.com/zen-rs/zenwave", branch = "main", default-features = false, features = ["hyper-backend", "rustls-ring", "ws", "http2", "http3"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGEventSource", "CGEventTypes"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSURL"] }

@@ -348,3 +348,136 @@ async fn messaging_commands_carry_their_usage_only_in_a_session_with_agent_messa
         );
     }
 }
+
+#[tokio::test]
+async fn hashline_mode_injects_syntax_and_alerts_on_edit_bypass_only_when_enabled() {
+    use aither_core::llm::Tool as _;
+
+    let run_terminal = |session: &Session, script: &str| {
+        let tool = session.agent.shell().tool();
+        let args = aither_sandbox::ShellArgs {
+            description: "test edit bypass".to_string(),
+            script: script.to_string(),
+            interpreter: aither_sandbox::Interpreter::default(),
+            sandbox: aither_sandbox::SandboxMode::Sandboxed,
+            location: None,
+            resolution: aither_sandbox::MediaResolution::default(),
+            max_lines: None,
+            raw: false,
+            timeout: 30,
+            background: false,
+        };
+        async move {
+            let _ = tool
+                .call(args, aither_core::llm::tool::ToolContext::default())
+                .await;
+        }
+    };
+
+    // 1. When `hashline == false`, hashline syntax is absent and bypass policy is inactive.
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let mut standard_config = saved_config(&stub, None);
+    standard_config.experimental.hashline = false;
+    let mut standard = Box::pin(Session::start_with_runtime(&standard_config)).await;
+    let standard_prefix = system_prefix(&mut standard).await;
+    assert!(
+        !standard_prefix.contains("PUT N#HH.=M#KK:"),
+        "{standard_prefix}"
+    );
+    std::fs::write(standard.agent.sandbox_dir().join("existing.py"), "x = 1\n")
+        .expect("write existing.py");
+    run_terminal(&standard, "cat <<'EOF' > existing.py\nx = 2\nEOF\n").await;
+    let standard_messages = standard
+        .agent
+        .preview_request_messages("continue", [])
+        .await
+        .expect("preview renders");
+    assert!(
+        !standard_messages.iter().any(|msg| {
+            msg.role() == aither_core::llm::Role::System
+                && msg
+                    .content()
+                    .contains("attempted to modify an existing file")
+        }),
+        "bypass alert must not fire when hashline is disabled: {standard_messages:?}"
+    );
+
+    // 2. When `hashline == true`, complete syntax is injected and bypassing `edit`
+    //    queues a one-shot system alert for the next request.
+    let mut hashline_config = saved_config(&stub, None);
+    hashline_config.experimental.hashline = true;
+    let mut hashline = Box::pin(Session::start_with_runtime(&hashline_config)).await;
+    let hashline_prefix = system_prefix(&mut hashline).await;
+    for expected in [
+        "search sed",
+        "search rg",
+        "search cat",
+        "search head",
+        "search tail",
+        "search nl",
+        "search sg",
+        "raw: true",
+        "[PATH]",
+        "N#HH|content",
+        "edit <<'PATCH'",
+        "PUT N#HH:",
+        "PUT N#HH.=M#KK:",
+        "PUT N#HH*:",
+        "PUT <1:",
+        "PUT >$:",
+        "CUT N#HH.=M#KK",
+        "MV DEST",
+        "REM",
+        "edit --help",
+    ] {
+        assert!(
+            hashline_prefix.contains(expected),
+            "hashline session prompt missing `{expected}`:\n{hashline_prefix}"
+        );
+    }
+
+    std::fs::write(hashline.agent.sandbox_dir().join("existing.py"), "x = 1\n")
+        .expect("write existing.py");
+
+    // Creating a brand-new file with redirection does NOT trigger an alert.
+    run_terminal(&hashline, "cat <<'EOF' > brand_new.py\ny = 1\nEOF\n").await;
+    let after_new = hashline
+        .agent
+        .preview_request_messages("continue", [])
+        .await
+        .expect("preview renders");
+    assert!(
+        !after_new.iter().any(|msg| {
+            msg.role() == aither_core::llm::Role::System
+                && msg
+                    .content()
+                    .contains("attempted to modify an existing file")
+        }),
+        "creating a new file must not trigger an edit-bypass alert: {after_new:?}"
+    );
+
+    // Overwriting an existing file with redirection DOES trigger the alert.
+    run_terminal(&hashline, "cat <<'EOF' > existing.py\nx = 2\nEOF\n").await;
+    let after_overwrite = hashline
+        .agent
+        .preview_request_messages("continue", [])
+        .await
+        .expect("preview renders");
+    let alert_msg = after_overwrite
+        .iter()
+        .find(|msg| {
+            msg.role() == aither_core::llm::Role::System
+                && msg
+                    .content()
+                    .contains("attempted to modify an existing file")
+        })
+        .expect("overwriting existing.py must queue a hashline edit-bypass alert");
+    assert!(
+        alert_msg.content().contains("`shell redirection`")
+            && alert_msg.content().contains("`existing.py`")
+            && alert_msg.content().contains("`edit`")
+            && alert_msg.content().contains("N#HH"),
+        "{}",
+        alert_msg.content()
+    );
+}

@@ -22,6 +22,28 @@
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl"
       ]
+    },
+    {
+      "tool": "search",
+      "package": "may-hashline",
+      "manifest": "hashline/Cargo.toml",
+      "bin": "search",
+      "targets": [
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
+      ]
+    },
+    {
+      "tool": "edit",
+      "package": "may-hashline",
+      "manifest": "hashline/Cargo.toml",
+      "bin": "edit",
+      "targets": [
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl"
+      ]
     }
   ]
 }

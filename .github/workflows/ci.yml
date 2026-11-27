@@ -32,6 +32,7 @@ jobs:
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       sed: ${{ steps.scope.outputs.sed }}
+      hashline: ${{ steps.scope.outputs.hashline }}
       fmt: ${{ steps.scope.outputs.fmt }}
       clippy: ${{ steps.scope.outputs.clippy }}
       ui-clippy: ${{ steps.scope.outputs.ui-clippy }}
@@ -131,13 +132,17 @@ jobs:
           if [ "${{ needs.scope.outputs.sed }}" = "true" ] || [ "${{ needs.scope.result }}" != "success" ]; then
             cargo fmt --manifest-path sed/Cargo.toml -- --check
           fi
+          if [ "${{ needs.scope.outputs.hashline }}" = "true" ] || [ "${{ needs.scope.result }}" != "success" ]; then
+            cargo fmt --manifest-path hashline/Cargo.toml -- --check
+          fi
 
-  # Clippy legs run as independent parallel jobs so default-features lints do
-  # not wait for `bun install` + `--features ui` or `sed/`.
+  # Default and `--features ui` clippy share one runner so the second pass
+  # reuses `target/` and compiled build scripts from the first. `sed/` and
+  # `hashline/` stay separate as their own standalone workspaces.
   clippy:
-    name: clippy (default)
+    name: clippy
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' || needs.scope.outputs.ui-clippy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -164,63 +169,29 @@ jobs:
         with:
           components: clippy
       - uses: water-rs/stow@main
+        with:
+          shared-key: ci-clippy
+          local-crates-io-max-bytes: '1610612736'
       - name: Install nasm
         uses: ./.github/actions/install-nasm
       - name: cargo clippy (default features)
+        if: needs.scope.result != 'success' || needs.scope.outputs.rust == 'true'
         run: cargo clippy --locked --profile ci-check --all-targets ${{ needs.scope.outputs.linux-package-args || '--workspace' }} --timings -- -D warnings
-      - name: Upload cargo timings
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-timings-clippy
-          path: target/cargo-timings/
-      - name: Report stow cache stats
-        if: always()
-        run: stow stats || true
-
-  clippy-ui:
-    name: clippy (ui)
-    needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.ui-clippy == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Stop a superseded merge group
-        if: github.event_name == 'merge_group'
-        run: |
-          if ! git ls-remote --exit-code "https://github.com/${{ github.repository }}" "${{ github.ref }}" > /dev/null; then
-            echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
-            exit 1
-          fi
-      - name: Free runner disk
-        run: |
-          sudo bash -c 'for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
-            mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
-          done
-          rm -rf /tmp/gc-* &'
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: water-rs/stow@main
-      - uses: ./.github/actions/install-bun
+      - name: Install bun
+        if: needs.scope.result != 'success' || needs.scope.outputs.ui-clippy == 'true'
+        uses: ./.github/actions/install-bun
       - name: bun install
+        if: needs.scope.result != 'success' || needs.scope.outputs.ui-clippy == 'true'
         working-directory: web-ui
         run: bun install --frozen-lockfile
-      - name: Install nasm
-        uses: ./.github/actions/install-nasm
       - name: cargo clippy (ui)
+        if: needs.scope.result != 'success' || needs.scope.outputs.ui-clippy == 'true'
         run: cargo clippy --locked --profile ci-check --all-targets --features ui ${{ needs.scope.outputs.ui-args || '--workspace' }} --timings -- -D warnings
       - name: Upload cargo timings
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cargo-timings-clippy-ui
+          name: cargo-timings-clippy
           path: target/cargo-timings/
       - name: Report stow cache stats
         if: always()
@@ -243,6 +214,9 @@ jobs:
         with:
           components: clippy
       - uses: water-rs/stow@main
+        with:
+          shared-key: ci-sed
+          workspaces: sed
       - name: cargo clippy (sed)
         run: cargo clippy --locked --manifest-path sed/Cargo.toml --profile ci-check --all-targets -- -D warnings
       - name: Report stow cache stats
@@ -265,6 +239,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: water-rs/stow@main
+        with:
+          shared-key: ci-sed
+          workspaces: sed
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (sed)
         run: cargo nextest run --locked --manifest-path sed/Cargo.toml --all-targets
@@ -288,6 +265,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: water-rs/stow@main
+        with:
+          shared-key: ci-sed
+          workspaces: sed
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (sed)
         run: cargo nextest run --locked --manifest-path sed/Cargo.toml --all-targets
@@ -295,53 +275,168 @@ jobs:
         if: always()
         run: stow stats || true
 
-  # Workspace unit/crate tests run in parallel with `build-e2e-ubuntu`: when
-  # `e2e` is on, `may-agent` (its bin unit tests plus `tests/*.rs`) is built
-  # and archived in `build-e2e-ubuntu` and executed across 4 parallel shards.
-  test-ubuntu-unit:
-    name: test-unit (ubuntu-latest)
+  clippy-hashline:
+    name: clippy (hashline)
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.linux-unit-cargo-flags != '') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.hashline == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Dependencies keep Cargo's default debuginfo (`2`) so they match
-      # stow's public prebuilt cache; ./.github/actions/test disables debuginfo
-      # only on workspace packages via ${CARGO_HOME}/config.toml.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: water-rs/stow@main
+        with:
+          shared-key: ci-hashline
+          workspaces: hashline
+      - name: cargo clippy (hashline)
+        run: cargo clippy --locked --manifest-path hashline/Cargo.toml --profile ci-check --all-targets -- -D warnings
+      - name: Report stow cache stats
+        if: always()
+        run: stow stats || true
+
+  test-hashline-ubuntu:
+    name: test-hashline (ubuntu-latest)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.hashline == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/test
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: water-rs/stow@main
         with:
-          cargo-flags: ${{ needs.scope.outputs.linux-unit-cargo-flags || '--workspace --exclude may-agent --all-targets' }}
+          shared-key: ci-hashline
+          workspaces: hashline
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (hashline)
+        run: cargo nextest run --locked --manifest-path hashline/Cargo.toml --all-targets
+      - name: cargo build (hashline)
+        run: cargo build --locked --manifest-path hashline/Cargo.toml --bins
+      - name: Pack the debug hashline binaries
+        env:
+          GZIP: '-1'
+        run: tar -czf "${{ runner.temp }}/hashline-debug.tar.gz" -C hashline/target/debug search edit
+      - name: Upload the debug hashline binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashline-debug-linux-x64
+          path: ${{ runner.temp }}/hashline-debug.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+      - name: Report stow cache stats
+        if: always()
+        run: stow stats || true
 
+  test-hashline-macos:
+    name: test-hashline (macos-latest)
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.hashline == 'true') }}
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: water-rs/stow@main
+        with:
+          shared-key: ci-hashline
+          workspaces: hashline
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (hashline)
+        run: cargo nextest run --locked --manifest-path hashline/Cargo.toml --all-targets
+      - name: cargo build (hashline)
+        run: cargo build --locked --manifest-path hashline/Cargo.toml --bins
+      - name: Pack the debug hashline binaries
+        env:
+          GZIP: '-1'
+        run: tar -czf "${{ runner.temp }}/hashline-debug.tar.gz" -C hashline/target/debug search edit
+      - name: Upload the debug hashline binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashline-debug-macos-arm64
+          path: ${{ runner.temp }}/hashline-debug.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+      - name: Report stow cache stats
+        if: always()
+        run: stow stats || true
+
+  # Split unit tests and E2E archive builds per OS so both run in parallel and
+  # never compile `may-daemon` lib + `may-daemon` test in the same job (which
+  # added 5+ minutes of duplicate compilation and exceeded 7 GiB RAM on 3-vCPU
+  # macOS runners):
+  # - `test-*-unit` builds and runs affected non-`may-agent` crates inline (no
+  #   `may-daemon` lib, no archive upload/download).
+  # - `build-e2e-*` builds and archives `-p may-agent --all-targets` alone (no
+  #   `may-daemon` / `may-agent-core` unit-test targets), packs `may-debug-*`,
+  #   and fans out E2E shards + Container Acceptance.
   build-e2e-ubuntu:
     name: build-e2e (ubuntu-latest)
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: write
     outputs:
-      run-e2e: ${{ steps.build.outputs.run-e2e }}
+      run-tests: ${{ steps.build.outputs.run-tests }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Dependencies keep Cargo's default profile settings so they match stow's
+      # public prebuilt cache; ./.github/actions/build-tests sets debug=0,
+      # codegen-units=16, and (on Linux) strip="debuginfo" only on workspace
+      # packages via ${CARGO_HOME}/config.toml.
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - id: build
+        uses: ./.github/actions/build-tests
+        with:
+          e2e: 'true'
+          cargo-flags: '-p may-agent --all-targets'
+
+  test-ubuntu-unit:
+    name: test-unit (ubuntu-latest)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.linux-unit-cargo-flags != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - id: build
-        uses: ./.github/actions/e2e-build
+      - uses: ./.github/actions/build-tests
+        with:
+          e2e: 'false'
+          cargo-flags: ${{ needs.scope.outputs.linux-unit-cargo-flags || '--workspace --exclude may-agent --all-targets' }}
 
   test-ubuntu-e2e:
     name: test-e2e (ubuntu-latest, ${{ matrix.shard }}/4)
     needs: [scope, build-e2e-ubuntu]
-    if: ${{ !cancelled() && needs.build-e2e-ubuntu.result == 'success' && needs.build-e2e-ubuntu.outputs.run-e2e == 'true' }}
+    if: ${{ !cancelled() && needs.build-e2e-ubuntu.result == 'success' && needs.build-e2e-ubuntu.outputs.run-tests == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -352,71 +447,79 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/e2e-run
+      - uses: ./.github/actions/run-tests
         with:
+          filter: 'package(may-agent)'
           shard: ${{ matrix.shard }}
           total-shards: 4
 
-  # Pull requests skip macOS jobs; the merge queue runs them on the tree that
-  # lands on main, using parallel unit + build-e2e -> 4 E2E shards.
-  test-macos-unit:
-    name: test-unit (macos-latest)
-    needs: scope
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.unit-cargo-flags != '') }}
-    runs-on: macos-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      CARGO_INCREMENTAL: '0'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/test
-        with:
-          cargo-flags: ${{ needs.scope.outputs.unit-cargo-flags || '--workspace --exclude may-agent --all-targets' }}
-
+  # Pull requests skip macOS jobs; the merge queue runs `test-macos-unit` and
+  # `build-e2e-macos` -> 2 E2E shards in parallel (peak concurrent macOS
+  # runners stays at 3, avoiding runner-pool queuing delays while keeping every
+  # macOS build under 7 GiB RAM).
   build-e2e-macos:
     name: build-e2e (macos-latest)
     needs: scope
     if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') }}
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: write
     outputs:
-      run-e2e: ${{ steps.build.outputs.run-e2e }}
+      run-tests: ${{ steps.build.outputs.run-tests }}
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
       - id: build
-        uses: ./.github/actions/e2e-build
+        uses: ./.github/actions/build-tests
+        with:
+          e2e: 'true'
+          cargo-flags: '-p may-agent --all-targets'
+
+  test-macos-unit:
+    name: test-unit (macos-latest)
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.unit-cargo-flags != '') }}
+    runs-on: macos-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-tests
+        with:
+          e2e: 'false'
+          cargo-flags: ${{ needs.scope.outputs.unit-cargo-flags || '--workspace --exclude may-agent --all-targets' }}
 
   test-macos-e2e:
-    name: test-e2e (macos-latest, ${{ matrix.shard }}/4)
+    name: test-e2e (macos-latest, ${{ matrix.shard }}/2)
     needs: [scope, build-e2e-macos]
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-e2e-macos.result == 'success' && needs.build-e2e-macos.outputs.run-e2e == 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-e2e-macos.result == 'success' && needs.build-e2e-macos.outputs.run-tests == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/e2e-run
+      - uses: ./.github/actions/run-tests
         with:
+          filter: 'package(may-agent)'
           shard: ${{ matrix.shard }}
-          total-shards: 4
+          total-shards: 2
 
-  # Starts as soon as `container-image` and `build-e2e-ubuntu` finish, running
-  # in parallel with `test-ubuntu-unit` and all 4 `test-ubuntu-e2e` shards.
+  # Starts as soon as `container-image` and `build-e2e-ubuntu` finish,
+  # running in parallel with all 4 `test-ubuntu-e2e` shards.
   container-acceptance:
     name: Container Acceptance
     needs: [scope, container-image, build-e2e-ubuntu]
@@ -437,16 +540,16 @@ jobs:
       - uses: actions/checkout@v4
       - id: downloads
         uses: ./.github/actions/restore-test-downloads
-      - name: Download the E2E nextest archive
+      - name: Download the nextest archive
         uses: actions/download-artifact@v4
         with:
-          name: e2e-archive-linux-x64
-          path: ${{ runner.temp }}/e2e-archive
+          name: tests-archive-linux-x64
+          path: ${{ runner.temp }}/tests-archive
       - uses: taiki-e/install-action@nextest
       - name: Run the container tests
         run: |
           cargo nextest run \
-            --archive-file "${{ runner.temp }}/e2e-archive/e2e-archive.tar.zst" \
+            --archive-file "${{ runner.temp }}/tests-archive/tests-archive.tar.zst" \
             --workspace-remap . \
             --run-ignored ignored-only \
             --no-capture \
@@ -489,15 +592,17 @@ jobs:
     needs:
       - fmt
       - clippy
-      - clippy-ui
       - clippy-sed
       - test-sed-ubuntu
       - test-sed-macos
-      - test-ubuntu-unit
+      - clippy-hashline
+      - test-hashline-ubuntu
+      - test-hashline-macos
       - build-e2e-ubuntu
+      - test-ubuntu-unit
       - test-ubuntu-e2e
-      - test-macos-unit
       - build-e2e-macos
+      - test-macos-unit
       - test-macos-e2e
       - container-image
       - container-acceptance

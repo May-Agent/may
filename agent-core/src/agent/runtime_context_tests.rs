@@ -791,10 +791,18 @@ fn sessions_differing_only_in_session_values_share_the_prompt_up_to_the_session_
 /// user-facing directives the main agent's sections hold.
 #[test]
 fn subagent_instructions_report_to_the_parent_and_never_the_user() {
+    let target = crate::tools::ToolTarget::native().expect("native target");
+    let catalog = crate::tools::embedded_distribution()
+        .expect("embedded distribution")
+        .image_tools(&target)
+        .expect("image tools")
+        .catalog();
+    let prepared_tools = super::build_prepared_tools(&catalog, false).expect("prepared tools");
     let blocks = super::build_subagent_instructions(
         &AgentEnvironment::Local,
         Vec::new(),
         false,
+        Some(prepared_tools),
         vec!["API_KEY"],
         None,
         &Parameters::default(),
@@ -828,6 +836,113 @@ fn subagent_instructions_report_to_the_parent_and_never_the_user() {
         text.contains("the agent that launched you approves")
             && text.contains("Stored secrets: API_KEY"),
         "{text}"
+    );
+    // Non-hashline subagent instructions must not inject hashline patch ops.
+    assert!(!text.contains("PUT N#HH.=M#KK:"), "{text}");
+    assert!(!text.contains("CUT N#HH.=M#KK"), "{text}");
+}
+
+#[test]
+fn hashline_prepared_tools_inject_complete_syntax_for_main_and_subagents() {
+    let target = crate::tools::ToolTarget::native().expect("native target");
+    let tools = crate::tools::embedded_distribution()
+        .expect("embedded distribution")
+        .image_tools(&target)
+        .expect("image tools");
+
+    let target_json = serde_json::json!({ "os": target.os(), "arch": target.arch() });
+    let artifacts: Vec<_> = target
+        .tools_for_mode(true)
+        .into_iter()
+        .map(|tool| {
+            serde_json::json!({
+                "tool": tool,
+                "version": "1.0.0",
+                "target": target_json,
+                "url": format!("https://example.invalid/{}", tool.command()),
+                "sha256": "00".repeat(32),
+                "size": 1,
+                "encoding": { "format": "executable" },
+            })
+        })
+        .collect();
+    let python: Vec<_> = target
+        .provides_python()
+        .then(|| {
+            serde_json::json!({
+                "version": "3.13.1",
+                "target": target_json,
+                "interpreter_sha256": "00".repeat(32),
+            })
+        })
+        .into_iter()
+        .collect();
+    let manifest = serde_json::json!({ "artifacts": artifacts, "python": python });
+    let hashline_catalog = crate::tools::ToolDistribution::from_json(
+        &serde_json::to_vec(&manifest).expect("manifest json"),
+    )
+    .expect("hashline fixture distribution")
+    .image_tools_for_mode(&target, true)
+    .expect("hashline image tools")
+    .catalog();
+    let hashline_tools =
+        super::build_prepared_tools(&hashline_catalog, true).expect("hashline prepared tools");
+    let subagent_blocks = super::build_subagent_instructions(
+        &AgentEnvironment::Local,
+        Vec::new(),
+        true,
+        Some(hashline_tools.clone()),
+        Vec::new(),
+        None,
+        &Parameters::default(),
+    );
+    let subagent_text = subagent_blocks.join("\n");
+
+    for expected in [
+        "search sed",
+        "search rg",
+        "search cat",
+        "search head",
+        "search tail",
+        "search nl",
+        "search sg",
+        "--lang <lang>",
+        "raw: true",
+        "edit <<'PATCH'",
+        "[PATH]",
+        "N#HH|content",
+        "PUT N#HH:",
+        "PUT N#HH.=M#KK:",
+        "PUT N#HH*:",
+        "PUT <N#HH:",
+        "PUT >N#HH:",
+        "PUT <1:",
+        "PUT >$:",
+        "CUT N#HH.=M#KK",
+        "CUT N#HH*",
+        "REM",
+        "MV DEST",
+        "edit --help",
+    ] {
+        assert!(
+            hashline_tools.contains(expected),
+            "main hashline prepared_tools missing `{expected}`:\n{hashline_tools}"
+        );
+        assert!(
+            subagent_text.contains(expected),
+            "subagent hashline instructions missing `{expected}`:\n{subagent_text}"
+        );
+    }
+
+    let standard_tools =
+        super::build_prepared_tools(&tools.catalog(), false).expect("standard prepared tools");
+    assert!(
+        !standard_tools.contains("PUT N#HH.=M#KK:"),
+        "non-hashline prepared_tools must omit hashline syntax:\n{standard_tools}"
+    );
+    assert!(
+        !standard_tools.contains("search sg"),
+        "non-hashline prepared_tools must omit hashline search sg:\n{standard_tools}"
     );
 }
 

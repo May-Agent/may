@@ -3326,6 +3326,67 @@ printf '%s\n' 'uv @VERSION@'
         assert!(first.contains("--help"));
         assert!(!first.contains("command -v"));
         assert!(!first.contains("which "));
+        for hashline_only in [
+            "search rg",
+            "search sg",
+            "PUT N#HH.=M#KK:",
+            "CUT N#HH.=M#KK",
+            "MV DEST",
+            "N#HH|content",
+        ] {
+            assert!(
+                !first.contains(hashline_only),
+                "non-hashline catalog must not contain `{hashline_only}`:\n{first}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashline_prompt_catalog_injects_compact_search_and_edit_syntax() {
+        let target = ToolTarget::native().unwrap();
+        let tools = target.tools_for_mode(true);
+        let python = target.provides_python().then(fixture_python);
+        let catalog = ToolBundle::for_mode(target, script_binaries(&tools), python, true)
+            .unwrap()
+            .catalog();
+        let rendered = catalog.render(true).unwrap();
+        assert_eq!(rendered, catalog.render(true).unwrap());
+
+        for expected in [
+            "search sed",
+            "search rg",
+            "search cat",
+            "search head",
+            "search tail",
+            "search nl",
+            "search sg",
+            "--lang <lang>",
+            "raw: true",
+            "[PATH]",
+            "N#HH|content",
+            "edit <<'PATCH'",
+            "PUT N#HH:",
+            "PUT N#HH.=M#KK:",
+            "PUT N#HH*:",
+            "PUT <N#HH:",
+            "PUT >N#HH:",
+            "PUT <1:",
+            "PUT >$:",
+            "CUT N#HH.=M#KK",
+            "CUT N#HH*",
+            "REM",
+            "MV DEST",
+            "edit --help",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "hashline catalog missing `{expected}`:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("*** Begin Patch"),
+            "hashline catalog must not show apply_patch syntax:\n{rendered}"
+        );
     }
 
     struct RuntimeProbe;

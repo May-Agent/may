@@ -61,6 +61,16 @@ fn targeted_reads_saved_outputs_and_searches_are_verbatim() {
         "find src -name '*.rs'",
         "sed -n '1,20p' a.md && head -n 10 b.md",
         "rg foo src/ && rg bar tests/",
+        "search rg -n needle src/",
+        "search rg -n needle src/ | head -20",
+        "search sg 'fn $NAME($$$)' --lang rust src/",
+        "search sed -n '1,50p' notes.md",
+        "search cat notes.md",
+        "search head -20 notes.md",
+        "search tail -n +10 notes.md",
+        "search nl -ba notes.md",
+        "search cat notes.md | sed -n '1,20p'",
+        "search rg foo src/ && search sed -n '1,20p' a.md",
     ] {
         assert_eq!(
             treatment_with(&policy, script, Interpreter::Shell),
@@ -110,6 +120,10 @@ fn any_other_script_is_command_output() {
         "find src -name '*.rs' -delete",
         "find src -name '*.rs' -exec echo {} +",
         "git log | head -n 20",
+        "search rg foo src/ > out.txt",
+        "echo hi | search rg foo",
+        "search rg foo src/ | wc -l",
+        "search cat",
         "if [ ; then",
         "",
     ] {

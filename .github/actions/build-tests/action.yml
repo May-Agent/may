@@ -1,0 +1,197 @@
+name: Build and archive tests
+description: >-
+  Build and archive `may-agent` test targets (and pack the debug `may` binary)
+  for E2E/acceptance fan-out when `e2e` is true, or build and run affected unit
+  tests inline when `e2e` is false.
+inputs:
+  e2e:
+    description: >-
+      'true' when building the `may-agent` nextest archive and `may-debug`
+      artifact for downstream E2E/acceptance jobs, or 'false' to build and run
+      unit tests inline.
+    required: true
+  cargo-flags:
+    description: >-
+      Package and target selection flags passed to `cargo nextest` (`-p
+      may-agent --all-targets` for `build-e2e-*`, or `unit-cargo-flags` /
+      `linux-unit-cargo-flags` for `test-*-unit`).
+    required: true
+outputs:
+  run-tests:
+    description: "'true' when downstream E2E jobs should run from the uploaded archive."
+    value: ${{ steps.decide.outputs.run-tests }}
+runs:
+  using: composite
+  steps:
+    # A rebuilt merge queue deletes its old group branches but leaves their
+    # runs queued; such a run ends here instead of holding a runner.
+    - name: Stop a superseded merge group
+      if: github.event_name == 'merge_group'
+      shell: bash
+      run: |
+        if ! git ls-remote --exit-code "https://github.com/${{ github.repository }}" "${{ github.ref }}" > /dev/null; then
+          echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
+          exit 1
+        fi
+    - name: Enable unprivileged user namespaces
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+    # mv returns at once and the delete runs in the background while the
+    # toolchain installs; rm -rf used to block checkout for up to two minutes.
+    - name: Free runner disk
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo bash -c 'for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+          mv "$dir" "/tmp/gc-$(basename "$dir")" 2>/dev/null || true
+        done
+        rm -rf /tmp/gc-* &'
+    # macOS GitHub runners ship a 256 soft RLIMIT_NOFILE, which exhausts file
+    # descriptors (`os error 24`) when materializing large dependency closures.
+    - name: Raise macOS open-file limits
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        sudo sysctl -w kern.maxfiles=200000 kern.maxfilesperproc=65536 >/dev/null 2>&1 || true
+        sudo launchctl limit maxfiles 65536 200000 >/dev/null 2>&1 || true
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: water-rs/stow@main
+      with:
+        shared-key: ci-build
+        local-crates-io-max-bytes: '1610612736'
+    # Cargo ignores CARGO_PROFILE_*_PACKAGE_* env vars, so configure per-package
+    # debug=0 and codegen-units=16 (plus strip="debuginfo" on Linux) for
+    # workspace crates in $CARGO_HOME/config.toml. Leaving dependencies at
+    # default settings preserves stow's public cache hits; Linux ELF links
+    # dependency DWARF into every binary so stripping drops the test archive by
+    # ~80% (keeping symbol tables intact for backtraces), while macOS Mach-O
+    # keeps DWARF unpacked and avoids unnecessary rust-objcopy work.
+    - name: Configure workspace package build settings
+      shell: bash
+      run: |
+        cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+        mkdir -p "${cargo_home}"
+        strip_line=""
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          strip_line=$'strip = "debuginfo"\n'
+        fi
+        for pkg in may-agent may-agent-core may-client may-command-policy may-config may-container-image may-daemon may-db may-git-forge may-harness may-media may-patch may-protocol may-providers may-repo-search may-tasks may-tool-dist may-tui; do
+          printf '[profile.dev.package.%s]\ndebug = 0\ncodegen-units = 16\n%s[profile.test.package.%s]\ndebug = 0\ncodegen-units = 16\n%s' "$pkg" "$strip_line" "$pkg" "$strip_line" >> "${cargo_home}/config.toml"
+        done
+    # Drop any leftover scratch directory before test runs.
+    - name: Drop restored test scratch
+      shell: bash
+      run: |
+        chmod -R u+w target/tmp 2>/dev/null || true
+        rm -rf target/tmp
+    # The pinned tool artifacts, their prepared runtimes and heel, which the
+    # sandbox unit and E2E tests download from GitHub releases on a miss.
+    - id: downloads
+      uses: ./.github/actions/restore-test-downloads
+    # Downstream archive jobs run only when E2E is in scope and the suite was
+    # not already verified by the merge queue (a `push` to `main` whose test
+    # downloads hit still builds to seed `main`'s stow cache and upload
+    # `may-debug-*`, plus the Linux archive for Container Acceptance).
+    - id: decide
+      shell: bash
+      run: |
+        if [ "${{ inputs.e2e }}" != "true" ]; then
+          echo "run-tests=false" >> "${GITHUB_OUTPUT}"
+        elif [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.downloads.outputs.tools-hit }}" = "true" ]; then
+          echo "run-tests=false" >> "${GITHUB_OUTPUT}"
+        else
+          echo "run-tests=true" >> "${GITHUB_OUTPUT}"
+        fi
+    # rav1e's x86_64 assembly is built with nasm.
+    - name: Install nasm
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      uses: ./.github/actions/install-nasm
+    - uses: taiki-e/install-action@nextest
+    - name: Build and archive test targets
+      if: inputs.e2e == 'true'
+      shell: bash
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        cargo nextest archive --locked ${{ inputs.cargo-flags }} \
+          --archive-file "${{ runner.temp }}/tests-archive.tar.zst" --timings
+    - name: cargo nextest (unit-only)
+      if: inputs.e2e != 'true'
+      shell: bash
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        # Standard 3-vCPU / 7 GiB macOS runners can thrash swap when
+        # `may-agent-core` (~3 GiB RSS), `may-daemon` test (~3.6 GiB RSS), and
+        # `may-tui` test (~1.5 GiB RSS) compile concurrently. Cap concurrency to
+        # 2 on <= 8 GiB macOS VMs while keeping Cargo pipelining enabled so
+        # smaller crates still fly.
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+          if [ "${mem_bytes}" -gt 0 ] && [ "${mem_bytes}" -le 8589934592 ]; then
+            export CARGO_BUILD_JOBS=2
+          fi
+        fi
+        if [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.downloads.outputs.tools-hit }}" = "true" ]; then
+          cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
+        elif [ "${{ runner.os }}" = "macOS" ]; then
+          cargo nextest run --test-threads 6 --locked ${{ inputs.cargo-flags }} --timings
+        else
+          cargo nextest run --locked ${{ inputs.cargo-flags }} --timings
+        fi
+    # Every E2E run keeps the debug `may` binary so a commit can be tested on
+    # another machine without building it there.
+    - name: Pack the debug may
+      if: inputs.e2e == 'true'
+      shell: bash
+      env:
+        GZIP: '-1'
+      run: tar -czf "${{ runner.temp }}/may-debug.tar.gz" -C target/debug may
+    - name: Upload the debug may
+      if: inputs.e2e == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        path: ${{ runner.temp }}/may-debug.tar.gz
+        retention-days: 90
+    # Verify baseline tools (~14-18s) directly from the stripped archive before
+    # uploading and fanning out. Using `--archive-file` avoids invoking Cargo
+    # again (whose target/feature graph differs from `cargo nextest archive` and
+    # triggers multi-minute workspace recompiles) and also validates the archive.
+    - name: Verify baseline tools
+      if: inputs.e2e == 'true' && steps.decide.outputs.run-tests == 'true'
+      shell: bash
+      run: |
+        ulimit -n 65536 2>/dev/null || true
+        cargo nextest run \
+          --archive-file "${{ runner.temp }}/tests-archive.tar.zst" \
+          --workspace-remap . \
+          --run-ignored ignored-only \
+          --no-capture \
+          -E 'test(=the_baseline_tools_pass_their_acceptance_script_in_the_sandbox)'
+    - name: Upload the nextest archive
+      if: inputs.e2e == 'true' && (steps.decide.outputs.run-tests == 'true' || runner.os == 'Linux')
+      uses: actions/upload-artifact@v4
+      with:
+        name: tests-archive-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        path: ${{ runner.temp }}/tests-archive.tar.zst
+        retention-days: 1
+        compression-level: 0
+    - name: Upload cargo timings
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cargo-timings-${{ github.job }}
+        path: target/cargo-timings/
+    - name: Drop test-written shims before saving cache
+      if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+      shell: bash
+      run: rm -rf "${{ steps.downloads.outputs.tools-path }}"/runtimes/*/shims
+    - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.downloads.outputs.tools-path }}
+        key: ${{ steps.downloads.outputs.tools-key }}
+    - name: Report stow cache stats
+      if: always()
+      shell: bash
+      run: stow stats || true

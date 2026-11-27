@@ -2,15 +2,22 @@
 These commands are already on PATH in the initialized execution environment:
 {% for tool in tools %}- {{ tool.listed_name() }}
 {% endfor %}
-{% if hashline %}Search for lines with `search rg` (`search rg 'pattern' src`, `search rg -F`, `-i`, `-C N`, `-g 'glob'`, `-l`), for code structure with `search sg` (`search sg 'fn $NAME($$$ARGS) { $$$ }' --lang rust src`); both print `[path#TAG]` sections of numbered lines.
-Every change to an existing file goes through `edit`, which reads a hashline patch on stdin and verifies the `[path#TAG]` it names before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command; `edit --help` gives the patch language:
+{% if hashline %}### Hashline `search` and `edit`
+- Read files with `search sed`/`search rg`/`search cat`/`search head`/`search tail`/`search nl`/`search sg` (`--lang <lang>`) for `[PATH]` headers and `N#HH|content` anchors; bare `rg`/`sed -n`/`cat`/`head`/`tail`/`nl` are auto-rewritten to `search …` unless `raw: true`.
+- Edit existing files only via `edit <<'PATCH'` (never `sed -i`, scripts, redirects, `tee`, or `cp`/`mv`); create new files via redirection.
+- Sections start `[PATH]`; copy each line's `N#HH` anchor from `search` or prior `edit` (mismatched hashes reject the whole patch with live lines).
+- Ops (`:` headers take `+TEXT` verbatim, no `N#HH|` prefix; `+` = blank line; no `-old` rows):
+  - `PUT N#HH:` / `PUT N#HH.=M#KK:` / `PUT N#HH*:` replace line / range / block
+  - `PUT <N#HH:` / `PUT >N#HH:` / `PUT <1:` / `PUT >$:` insert before N / after N / BOF / EOF
+  - `CUT N#HH.=M#KK` / `CUT N#HH*` delete; `REM` remove file; `MV DEST` move file
 ```sh
 edit <<'PATCH'
-[src/main.rs#1A2B]
-PUT 3.=5:
+[src/main.rs]
+PUT 3#PM.=5#YN:
 +    new_call();
 PATCH
 ```
+- Run `search --help` / `edit --help` for `YANK`/`PASTE` registers and advanced options.
 {% elif self.has("ast-grep") %}Prefer `ast-grep` patterns over text search for code constructs (`ast-grep run --lang rust --pattern 'fn $NAME($$$ARGS) { $$$BODY }' src`).
 {% endif %}{% if self.has("apply_patch") %}Every change to an existing file goes through `apply_patch`; it validates a contextual patch before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command:
 ```sh
