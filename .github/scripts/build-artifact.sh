@@ -24,6 +24,9 @@
 #   ARTIFACT_ABORT     "immediate" (default): panics abort without a
 #                      message; ordinary errors keep full text.
 #                      "panic": keep panic=abort diagnostics at ~3x size.
+#   ARTIFACT_PACKAGES  optional JSON array of Cargo package names to build
+#                      (e.g. `["may-hashline"]`); empty or unset builds
+#                      every listed tool of the target.
 set -euo pipefail
 
 target="${1:?usage: build-artifact.sh <target-triple> [out-dir]}"
@@ -32,13 +35,20 @@ root="$(cd "$scripts/../.." && pwd)"
 out_dir="${2:-$root/target/artifacts}"
 nightly="${ARTIFACT_NIGHTLY:-nightly-2026-10-01}"
 abort="${ARTIFACT_ABORT:-immediate}"
+packages_filter="${ARTIFACT_PACKAGES:-}"
 
 # jq.exe on Windows ends its output lines with CRLF; every value the script
 # reads back drops the CR.
 query() { jq "$@" | tr -d '\r'; }
 
 # The listed tools of this target, one compact JSON object per line.
-tools="$(query -c --arg target "$target" '.tools[] | select(.targets | index($target))' "$scripts/built-tools.json")"
+if [ -n "$packages_filter" ] && [ "$packages_filter" != "[]" ]; then
+    tools="$(query -c --arg target "$target" --argjson packages "$packages_filter" \
+        '.tools[] | select((.targets | index($target)) and (.package as $p | $packages | index($p)))' \
+        "$scripts/built-tools.json")"
+else
+    tools="$(query -c --arg target "$target" '.tools[] | select(.targets | index($target))' "$scripts/built-tools.json")"
+fi
 [ -n "$tools" ] || { echo "no tool in .github/scripts/built-tools.json is built for $target" >&2; exit 2; }
 
 case "$abort" in
@@ -52,6 +62,17 @@ suffix=""
 checksum=(shasum -a 256)
 case "$target" in
     *-apple-darwin) linker_flags=() ;;
+    *-unknown-linux-musl)
+        linker_flags=(-Clinker=rust-lld)
+        # C dependencies (such as tree-sitter grammars in may-hashline) must
+        # compile against musl headers rather than the host glibc headers.
+        # cc-rs looks up `aarch64-linux-musl-gcc` on arm64 rather than
+        # Ubuntu's `musl-gcc`, so point it at `musl-gcc` on native builds.
+        if [ "${target%%-*}" = "$(uname -m)" ] && command -v musl-gcc >/dev/null 2>&1; then
+            cc_var="CC_${target//-/_}"
+            export "${cc_var}=${!cc_var:-musl-gcc}"
+        fi
+        ;;
     *-unknown-linux-*) linker_flags=(-Clinker=rust-lld) ;;
     *-pc-windows-msvc) linker_flags=(); suffix=".exe"; checksum=(sha256sum) ;;
     *) echo "unsupported artifact target: $target" >&2; exit 2 ;;
@@ -60,12 +81,13 @@ export RUSTFLAGS="${flags[*]-} ${linker_flags[*]-}"
 export CARGO_TARGET_DIR="$out_dir/build"
 
 # Group tools by their Cargo workspace manifest (`Cargo.toml` by default;
-# standalone tool workspaces such as `sed/Cargo.toml` carry their own lockfile).
+# standalone tool workspaces such as `sed/Cargo.toml` and `hashline/Cargo.toml`
+# carry their own lockfile).
 while IFS= read -r manifest_rel; do
     packages=()
     while IFS= read -r package; do
         packages+=(-p "$package")
-    done < <(query -r --arg m "$manifest_rel" 'select((.manifest // "Cargo.toml") == $m) | .package' <<<"$tools")
+    done < <(query -r --arg m "$manifest_rel" 'select((.manifest // "Cargo.toml") == $m) | .package' <<<"$tools" | sort -u)
     cargo +"$nightly" build "${packages[@]}" --profile artifact \
         --target "$target" -Zbuild-std=std,panic_abort --timings \
         --manifest-path "$root/$manifest_rel"

@@ -28,5 +28,18 @@ path = "src/bin/edit.rs"
 [dev-dependencies]
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 
-
+# Standalone workspace so main-workspace edits never resolve or compile
+# may-hashline or its tree-sitter grammar dependency tree.
 [workspace]
+
+[profile.ci-check]
+inherits = "dev"
+debug = false
+incremental = false
+
+[profile.artifact]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"

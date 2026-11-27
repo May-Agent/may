@@ -26,7 +26,8 @@ release = false
 # may-patch ships as prebuilt executables attached to its GitHub release
 # (.github/workflows/tool-artifacts.yml), never to crates.io, so release-plz
 # reads its latest version from git tags instead of the registry. (`may-sed`
-# lives in its own `sed/` workspace with `sed/release-plz.toml`.)
+# and `may-hashline` live in their own `sed/` and `hashline/` workspaces with
+# `sed/release-plz.toml` and `hashline/release-plz.toml`.)
 
 [[package]]
 name = "may-patch"

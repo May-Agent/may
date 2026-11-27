@@ -1,11 +1,12 @@
 name: Tool Artifacts
 
-# Builds the prebuilt `apply_patch` (may-patch) and `aither-sed` (may-sed)
-# executables listed in .github/scripts/built-tools.json, and GNU bash
-# (patch/bash), and attaches them to the `patch/v<version>` (apply_patch and
-# bash) and `sed/v<version>` releases. release-plz creates
-# those tags with GITHUB_TOKEN, which starts no workflow, so release-plz.yml
-# calls this workflow with the tags its run released.
+# Builds the prebuilt `apply_patch` (may-patch), `aither-sed` (may-sed), and
+# `search`/`edit` (may-hashline) executables listed in
+# .github/scripts/built-tools.json, and GNU bash (patch/bash), and attaches
+# them to the `patch/v<version>` (apply_patch and bash), `sed/v<version>`, and
+# `hashline/v<version>` releases. release-plz creates those tags with
+# GITHUB_TOKEN, which starts no workflow, so release-plz.yml calls this
+# workflow with the tags its run released.
 
 on:
   workflow_call:
@@ -26,10 +27,67 @@ permissions:
   contents: read
 
 jobs:
+  # Routes release tags (`patch/v*`, `sed/v*`, `hashline/v*`) to only the
+  # packages, target runners, and bash job they need. A manual dispatch (empty
+  # `tags`) builds every tool and runner.
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      bash: ${{ steps.scope.outputs.bash }}
+      packages: ${{ steps.scope.outputs.packages }}
+      matrix: ${{ steps.scope.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: scope
+        env:
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          runners='[
+            {"runner":"ubuntu-24.04","target":"x86_64-unknown-linux-musl","heel_os":"linux","heel_arch":"x86_64","suffix":""},
+            {"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-musl","heel_os":"linux","heel_arch":"aarch64","suffix":""},
+            {"runner":"macos-latest","target":"aarch64-apple-darwin","heel_os":"macos","heel_arch":"aarch64","suffix":""},
+            {"runner":"windows-2025","target":"x86_64-pc-windows-msvc","heel_os":"windows","heel_arch":"x86_64","suffix":".exe"},
+            {"runner":"windows-11-arm","target":"aarch64-pc-windows-msvc","heel_os":"windows","heel_arch":"aarch64","suffix":".exe"}
+          ]'
+          if [ -z "${TAGS}" ] || [ "${TAGS}" = "[]" ]; then
+            bash=true
+            packages='[]'
+            targets="$(jq -c '[.tools[].targets[]] | unique' .github/scripts/built-tools.json)"
+          else
+            bash=false
+            pkgs=()
+            for TAG in $(jq -r '.[]' <<<"${TAGS}"); do
+              crate="${TAG%%/*}"
+              case "${crate}" in
+                patch) bash=true; pkgs+=("may-patch") ;;
+                sed) pkgs+=("may-sed") ;;
+                hashline) pkgs+=("may-hashline") ;;
+                *) echo "::error::${TAG} is not a patch/v, sed/v or hashline/v tag"; exit 1 ;;
+              esac
+            done
+            packages="$(printf '%s\n' "${pkgs[@]}" | jq -R . | jq -c -s 'unique')"
+            targets="$(jq -c --argjson packages "${packages}" \
+              '[.tools[] | select(.package as $p | $packages | index($p)) | .targets[]] | unique' \
+              .github/scripts/built-tools.json)"
+          fi
+          matrix="$(jq -c -n --argjson runners "${runners}" --argjson targets "${targets}" \
+            '{include: [$runners[] | select(.target as $t | $targets | index($t))]}')"
+          {
+            echo "bash=${bash}"
+            echo "packages=${packages}"
+            echo "matrix=${matrix}"
+          } >> "${GITHUB_OUTPUT}"
+
   # GNU bash for the platforms that run terminal scripts through it; Windows
   # has none. Each target builds on a runner of its own architecture.
   bash:
     name: bash / ${{ matrix.target }}
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.bash == 'true' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     defaults:
@@ -78,6 +136,8 @@ jobs:
 
   artifact:
     name: ${{ matrix.target }}
+    needs: scope
+    if: ${{ !cancelled() && needs.scope.outputs.matrix != '{"include":[]}' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     defaults:
@@ -85,30 +145,7 @@ jobs:
         shell: bash
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            heel_os: linux
-            heel_arch: x86_64
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            heel_os: linux
-            heel_arch: aarch64
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            heel_os: macos
-            heel_arch: aarch64
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-            heel_os: windows
-            heel_arch: x86_64
-            suffix: .exe
-          - runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            heel_os: windows
-            heel_arch: aarch64
-            suffix: .exe
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,19 +158,36 @@ jobs:
           toolchain: nightly-2026-10-01
           components: rust-src
           targets: ${{ matrix.target }}
-      # The tools .github/scripts/built-tools.json lists for this target, as a JSON array.
+      # The tools .github/scripts/built-tools.json lists for this target (filtered
+      # by scope when building specific release tags), as a JSON array.
       - name: Select the tools of this target
         id: tools
+        env:
+          ARTIFACT_PACKAGES: ${{ needs.scope.outputs.packages }}
         run: |
-          echo "tools=$(jq -c --arg target "${{ matrix.target }}" '[.tools[] | select(.targets | index($target)) | .tool]' .github/scripts/built-tools.json)" >> "${GITHUB_OUTPUT}"
+          if [ -n "${ARTIFACT_PACKAGES}" ] && [ "${ARTIFACT_PACKAGES}" != "[]" ]; then
+            tools="$(jq -c --arg target "${{ matrix.target }}" --argjson packages "${ARTIFACT_PACKAGES}" \
+              '[.tools[] | select((.targets | index($target)) and (.package as $p | $packages | index($p))) | .tool]' \
+              .github/scripts/built-tools.json)"
+          else
+            tools="$(jq -c --arg target "${{ matrix.target }}" \
+              '[.tools[] | select(.targets | index($target)) | .tool]' \
+              .github/scripts/built-tools.json)"
+          fi
+          echo "tools=${tools}" >> "${GITHUB_OUTPUT}"
+      - name: Install musl-tools
+        if: runner.os == 'Linux' && (contains(fromJSON(steps.tools.outputs.tools), 'search') || contains(fromJSON(steps.tools.outputs.tools), 'edit'))
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build rebuilt-std executables
         timeout-minutes: 20
         env:
           ARTIFACT_ABORT: immediate
           ARTIFACT_NIGHTLY: nightly-2026-10-01
+          ARTIFACT_PACKAGES: ${{ needs.scope.outputs.packages }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
         run: .github/scripts/build-artifact.sh "${{ matrix.target }}" "${{ runner.temp }}/tool-artifacts"
       - name: Verify the exact apply_patch artifact
+        if: contains(fromJSON(steps.tools.outputs.tools), 'apply_patch')
         timeout-minutes: 5
         env:
           APPLY_PATCH_TEST_BIN: ${{ runner.temp }}/tool-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}
@@ -154,9 +208,31 @@ jobs:
           [ "$(printf 'a\n' | "${check}/aither-sed" 's/a/b/')" = b ]
           "${check}/aither-sed" 'w out' </dev/null 2>/dev/null || status=$?
           [ "${status}" = 1 ]
+      - name: Verify the packaged hashline tools
+        if: contains(fromJSON(steps.tools.outputs.tools), 'search') || contains(fromJSON(steps.tools.outputs.tools), 'edit')
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          check="${RUNNER_TEMP}/hashline-check"
+          mkdir -p "${check}"
+          tar -xzf "${RUNNER_TEMP}"/tool-artifacts/search-*-"${{ matrix.target }}".tar.gz -C "${check}"
+          tar -xzf "${RUNNER_TEMP}"/tool-artifacts/edit-*-"${{ matrix.target }}".tar.gz -C "${check}"
+          version="$(cargo metadata --locked --no-deps --format-version 1 --manifest-path hashline/Cargo.toml \
+            | jq -r '.packages[] | select(.name == "may-hashline") | .version')"
+          [ "$("${check}/search" --version)" = "search ${version}" ]
+          [ "$("${check}/edit" --version)" = "edit ${version}" ]
+          work="${check}/work"
+          mkdir -p "${work}"
+          printf 'alpha\nbeta\n' > "${work}/sample.txt"
+          tag="$("${check}/search" rg alpha "${work}/sample.txt" | sed -n '1s/^\[.*#\([0-9A-F]\{4\}\)\]$/\1/p')"
+          [ -n "${tag}" ]
+          printf '[sample.txt#%s]\nPUT 2:\n+BETA\n' "${tag}" | (cd "${work}" && "${check}/edit")
+          [ "$(cat "${work}/sample.txt")" = "$(printf 'alpha\nBETA')" ]
+          cargo +stable test --locked --manifest-path hashline/Cargo.toml
       # The heel executable the tool distribution pins for this runner
       # (tool-dist/src/host-programs.json), as HEEL_BIN.
       - name: Install heel
+        if: contains(fromJSON(steps.tools.outputs.tools), 'apply_patch')
         run: |
           set -euo pipefail
           pin="$(jq -c --arg os "${{ matrix.heel_os }}" --arg arch "${{ matrix.heel_arch }}" \
@@ -171,13 +247,14 @@ jobs:
           "${executable}" --version
           echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"
       - name: Verify Windows native sandbox launch
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && contains(fromJSON(steps.tools.outputs.tools), 'apply_patch')
         timeout-minutes: 2
         shell: pwsh
         run: |
           & "$env:HEEL_BIN" run --network deny --keep-working-dir --working-dir "$env:RUNNER_TEMP" -- cmd.exe /D /S /C "echo native-sandbox-ready"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify sandbox file permissions
+        if: contains(fromJSON(steps.tools.outputs.tools), 'apply_patch')
         timeout-minutes: 5
         run: bash .github/scripts/verify-sandbox.sh "${{ runner.temp }}/tool-artifacts/build/${{ matrix.target }}/artifact/apply_patch${{ matrix.suffix }}"
       - name: Verify archive checksum
@@ -199,11 +276,17 @@ jobs:
             ${{ runner.temp }}/tool-artifacts/*.json
 
   # A `patch/v<version>` tag attaches the apply_patch and bash archives, a
-  # `sed/v<version>` tag the aither-sed archives, to the release of that tag.
+  # `sed/v<version>` tag the aither-sed archives, and a `hashline/v<version>`
+  # tag the search and edit archives, to the release of that tag.
   release:
     name: Attach to the release
-    needs: [artifact, bash]
-    if: inputs.tags != '' && inputs.tags != '[]'
+    needs: [scope, artifact, bash]
+    if: >-
+      !cancelled() &&
+      inputs.tags != '' && inputs.tags != '[]' &&
+      needs.scope.result == 'success' &&
+      needs.artifact.result == 'success' &&
+      (needs.scope.outputs.bash != 'true' || needs.bash.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -221,6 +304,7 @@ jobs:
           path: artifacts
           merge-multiple: true
       - uses: actions/download-artifact@v4
+        if: needs.scope.outputs.bash == 'true'
         with:
           pattern: bash-*
           path: artifacts
@@ -232,34 +316,39 @@ jobs:
             crate="${TAG%%/*}"
             version="${TAG#*/v}"
             case "${crate}" in
-              patch) tool=apply_patch; package=may-patch; manifest=Cargo.toml ;;
-              sed) tool=aither-sed; package=may-sed; manifest=sed/Cargo.toml ;;
-              *) echo "::error::${TAG} is not a patch/v or sed/v tag"; exit 1 ;;
+              patch) tools=(apply_patch); package=may-patch; manifest=Cargo.toml ;;
+              sed) tools=(aither-sed); package=may-sed; manifest=sed/Cargo.toml ;;
+              hashline) tools=(search edit); package=may-hashline; manifest=hashline/Cargo.toml ;;
+              *) echo "::error::${TAG} is not a patch/v, sed/v or hashline/v tag"; exit 1 ;;
             esac
             [ "$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "${manifest}" \
               | jq -r --arg package "${package}" '.packages[] | select(.name == $package) | .version')" = "${version}" ] \
               || { echo "::error::${TAG} does not name the version of ${package}"; exit 1; }
-            # Every listed target has its archive and checksum.
-            for target in $(jq -r --arg tool "${tool}" '.tools[] | select(.tool == $tool) | .targets[]' .github/scripts/built-tools.json); do
-              for file in "${tool}-${version}-${target}.tar.gz" "${tool}-${version}-${target}.tar.gz.sha256"; do
-                [ -f "artifacts/${file}" ] || { echo "::error::missing ${file}"; exit 1; }
+            uploads=()
+            for tool in "${tools[@]}"; do
+              # Every listed target has its archive and checksum.
+              for target in $(jq -r --arg tool "${tool}" '.tools[] | select(.tool == $tool) | .targets[]' .github/scripts/built-tools.json); do
+                for file in "${tool}-${version}-${target}.tar.gz" "${tool}-${version}-${target}.tar.gz.sha256"; do
+                  [ -f "artifacts/${file}" ] || { echo "::error::missing ${file}"; exit 1; }
+                  uploads+=("artifacts/${file}")
+                done
               done
             done
             # release-plz creates the release with the tag; create it only if absent.
             gh release view "${TAG}" >/dev/null 2>&1 \
               || gh release create "${TAG}" --verify-tag --title "${TAG}" --notes ""
-            gh release upload "${TAG}" --clobber \
-              artifacts/"${tool}-${version}"-*.tar.gz artifacts/"${tool}-${version}"-*.tar.gz.sha256
+            gh release upload "${TAG}" --clobber "${uploads[@]}"
             # The bash archives ride the patch release: patch/bash is part of
             # may-patch, and bash's own version is 5.3.<number of pinned patches>.
             if [ "${crate}" = patch ]; then
               bash_version="5.3.$(grep -c ' bash53-' patch/bash/bash-sources.sha256)"
+              bash_uploads=()
               for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin; do
                 for file in "bash-${bash_version}-${target}.tar.gz" "bash-${bash_version}-${target}.tar.gz.sha256"; do
                   [ -f "artifacts/${file}" ] || { echo "::error::missing ${file}"; exit 1; }
+                  bash_uploads+=("artifacts/${file}")
                 done
               done
-              gh release upload "${TAG}" --clobber \
-                artifacts/"bash-${bash_version}"-*.tar.gz artifacts/"bash-${bash_version}"-*.tar.gz.sha256
+              gh release upload "${TAG}" --clobber "${bash_uploads[@]}"
             fi
           done

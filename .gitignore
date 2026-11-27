@@ -1,4 +1,6 @@
 /target
+/hashline/target
+/sed/target
 .DS_Store
 *.png
 *.log
