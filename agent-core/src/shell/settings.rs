@@ -209,6 +209,17 @@ mod tests {
     }
 
     #[test]
+    fn scaled_shell_description_reflects_scaled_foreground_window() {
+        let budgets = ShellBudgets::of(&ShellSettings::default()).with_foreground_wait_scale(5);
+        let settings = shell_tool_settings(&budgets);
+        assert!(
+            settings.shell.description.contains("up to 50 seconds"),
+            "{}",
+            settings.shell.description
+        );
+    }
+
+    #[test]
     fn the_input_description_limits_input_to_background_jobs() {
         let budgets = ShellBudgets::of(&ShellSettings::default());
         let settings = shell_tool_settings(&budgets);

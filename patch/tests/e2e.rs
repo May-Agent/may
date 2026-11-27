@@ -102,7 +102,7 @@ fn full_heredoc_roundtrip_add_update_delete_move() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        "M keep.rs\nR keep.rs -> renamed.rs\nA fresh/created.txt\nD trash.txt\n"
+        "M keep.rs (line 1)\nR keep.rs -> renamed.rs\nA fresh/created.txt (1 line)\nD trash.txt\n"
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("renamed.rs")).expect("read"),
@@ -138,6 +138,11 @@ fn mismatched_context_exits_1_and_reports_the_line() {
     assert!(
         stderr(&output).contains("phantom"),
         "stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("1| real"),
+        "stderr should include nearby actual file context: {}",
         stderr(&output)
     );
 }

@@ -24,16 +24,26 @@ use std::{
 use matcher::apply_tolerant;
 
 pub use error::PatchError;
-pub use matcher::{Located, Whitespace, locate_hunks};
+pub use matcher::{LineRange, Located, Whitespace, locate_hunks};
 pub use parse::{Action, Hunk, HunkLine, parse};
 
 /// One file-level change a successfully applied patch made on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOutcome {
     /// A new file was created at this path.
-    Added(String),
+    Added {
+        /// The created file's path.
+        path: String,
+        /// Number of lines written to the file.
+        lines: usize,
+    },
     /// An existing file's contents changed in place.
-    Modified(String),
+    Modified {
+        /// The modified file's path.
+        path: String,
+        /// Resulting 1-based line ranges touched by the applied hunks.
+        ranges: Vec<LineRange>,
+    },
     /// A file was removed.
     Deleted(String),
     /// A file moved to a new path; its contents may also have changed.
@@ -42,20 +52,42 @@ pub enum FileOutcome {
         from: String,
         /// The destination path.
         to: String,
+        /// Resulting 1-based line ranges touched by the applied hunks.
+        ranges: Vec<LineRange>,
     },
+}
+
+fn format_ranges(ranges: &[LineRange]) -> String {
+    match ranges {
+        [] => String::new(),
+        [only] if only.first == only.last => format!(" (line {})", only.first),
+        [only] => format!(" (lines {only})"),
+        many => {
+            let joined = many
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" (lines {joined})")
+        }
+    }
 }
 
 impl FileOutcome {
     /// The single-letter summary line printed for this change.
     ///
-    /// Modeled on `git status --short` letters: `A`, `M`, `D`, `R`.
+    /// Modeled on `git status --short` letters (`A`, `M`, `D`, `R`) with
+    /// concise line counts or resulting line ranges.
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
-            Self::Added(path) => format!("A {path}"),
-            Self::Modified(path) => format!("M {path}"),
+            Self::Added { path, lines: 1 } => format!("A {path} (1 line)"),
+            Self::Added { path, lines } => format!("A {path} ({lines} lines)"),
+            Self::Modified { path, ranges } => format!("M {path}{}", format_ranges(ranges)),
             Self::Deleted(path) => format!("D {path}"),
-            Self::Renamed { from, to } => format!("R {from} -> {to}"),
+            Self::Renamed { from, to, ranges } => {
+                format!("R {from} -> {to}{}", format_ranges(ranges))
+            }
         }
     }
 }
@@ -121,8 +153,7 @@ pub fn apply_patch_text(patch: &str, base: &Path) -> Result<Vec<FileOutcome>, Pa
 
     // Validate every hunk in memory first; nothing is written unless the whole
     // patch applies cleanly.
-    let patched = apply_actions(&actions, &files)?;
-    let outcomes = file_outcomes(&actions);
+    let (patched, outcomes) = apply_actions(&actions, &files)?;
     commit(base, &patched, modes, &outcomes)?;
     Ok(outcomes)
 }
@@ -184,8 +215,9 @@ fn load_file(
 fn apply_actions(
     actions: &[Action],
     files: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, PatchError> {
+) -> Result<(HashMap<String, String>, Vec<FileOutcome>), PatchError> {
     let mut out = files.clone();
+    let mut outcomes = Vec::with_capacity(actions.len());
     for action in actions {
         match action {
             Action::Add { path, lines } => {
@@ -198,6 +230,10 @@ fn apply_actions(
                     content.push('\n');
                 }
                 out.insert(path.clone(), content);
+                outcomes.push(FileOutcome::Added {
+                    path: path.clone(),
+                    lines: lines.len(),
+                });
             }
             Action::Delete { path, expected } => {
                 let existing = out
@@ -210,6 +246,7 @@ fn apply_actions(
                     return Err(PatchError::DeleteMismatch(path.clone()));
                 }
                 out.remove(path);
+                outcomes.push(FileOutcome::Deleted(path.clone()));
             }
             Action::Update {
                 path,
@@ -221,7 +258,7 @@ fn apply_actions(
                     .ok_or_else(|| PatchError::FileNotFound(path.clone()))?
                     .clone();
                 let lines: Vec<String> = original.lines().map(String::from).collect();
-                let applied = apply_tolerant(path, &lines, hunks)?;
+                let (applied, ranges) = apply_tolerant(path, &lines, hunks)?;
                 let updated = rejoin(&original, &applied);
                 if let Some(new_path) = new_path {
                     if out.contains_key(new_path) {
@@ -229,31 +266,22 @@ fn apply_actions(
                     }
                     out.remove(path);
                     out.insert(new_path.clone(), updated);
+                    outcomes.push(FileOutcome::Renamed {
+                        from: path.clone(),
+                        to: new_path.clone(),
+                        ranges,
+                    });
                 } else {
                     out.insert(path.clone(), updated);
+                    outcomes.push(FileOutcome::Modified {
+                        path: path.clone(),
+                        ranges,
+                    });
                 }
             }
         }
     }
-    Ok(out)
-}
-
-/// Maps each action to the change it reports on success.
-fn file_outcomes(actions: &[Action]) -> Vec<FileOutcome> {
-    actions
-        .iter()
-        .map(|action| match action {
-            Action::Add { path, .. } => FileOutcome::Added(path.clone()),
-            Action::Delete { path, .. } => FileOutcome::Deleted(path.clone()),
-            Action::Update { path, new_path, .. } => new_path.as_ref().map_or_else(
-                || FileOutcome::Modified(path.clone()),
-                |to| FileOutcome::Renamed {
-                    from: path.clone(),
-                    to: to.clone(),
-                },
-            ),
-        })
-        .collect()
+    Ok((out, outcomes))
 }
 
 /// Writes the validated results to disk.
@@ -270,7 +298,7 @@ fn commit(
 ) -> Result<(), PatchError> {
     for outcome in outcomes {
         match outcome {
-            FileOutcome::Added(path) | FileOutcome::Modified(path) => {
+            FileOutcome::Added { path, .. } | FileOutcome::Modified { path, .. } => {
                 let content = patched.get(path).map_or("", String::as_str);
                 write_file(base, path, content)?;
             }
@@ -280,7 +308,7 @@ fn commit(
                     source,
                 })?;
             }
-            FileOutcome::Renamed { from, to } => {
+            FileOutcome::Renamed { from, to, .. } => {
                 let content = patched.get(to).map_or("", String::as_str);
                 write_file(base, to, content)?;
                 if let Some(mode) = modes.remove(from) {
@@ -360,7 +388,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let patch = "*** Begin Patch\n*** Add File: sub/dir/new.txt\n+alpha\n+beta\n*** End Patch";
         let outcomes = apply_patch_text(patch, dir.path()).expect("patch applies");
-        assert_eq!(outcomes, [FileOutcome::Added("sub/dir/new.txt".to_owned())]);
+        assert_eq!(
+            outcomes,
+            [FileOutcome::Added {
+                path: "sub/dir/new.txt".to_owned(),
+                lines: 2,
+            }]
+        );
+        assert_eq!(outcomes[0].summary(), "A sub/dir/new.txt (2 lines)");
         assert_eq!(read(dir.path(), "sub/dir/new.txt"), "alpha\nbeta\n");
     }
 
@@ -375,6 +410,8 @@ mod tests {
             *** End Patch";
         let outcomes = apply_patch_text(patch, dir.path()).expect("patch applies");
         assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].summary(), "M a.txt (lines 3, 5)");
+        assert_eq!(outcomes[1].summary(), "M b.txt (line 1)");
         assert_eq!(read(dir.path(), "a.txt"), "one\ntwo\nTHREE\nfour\nfive\n");
         assert_eq!(read(dir.path(), "b.txt"), "w\ny\n");
     }
@@ -412,8 +449,13 @@ mod tests {
             outcomes,
             [FileOutcome::Renamed {
                 from: "old/place.rs".to_owned(),
-                to: "new/place.rs".to_owned()
+                to: "new/place.rs".to_owned(),
+                ranges: vec![super::LineRange { first: 2, last: 2 }],
             }]
+        );
+        assert_eq!(
+            outcomes[0].summary(),
+            "R old/place.rs -> new/place.rs (line 2)"
         );
         assert!(!dir.path().join("old/place.rs").exists());
         assert_eq!(read(dir.path(), "new/place.rs"), "keep\nchanged\n");

@@ -898,11 +898,13 @@ struct SessionTemplate<'a> {
     readonly_checkout: Option<String>,
     remote_repository: Option<&'a str>,
     issue_repository: Option<&'a str>,
+    indexed_search_command: Option<&'a str>,
 }
 
 /// The session section, where the values only this session has are stated:
 /// its directory, the launch directory, the optional read-only daemon checkout,
-/// the remote forge repository and the issue repository.
+/// the remote forge repository, the issue repository and whether indexed code
+/// search is ready for this session's repository.
 pub fn build_session(
     environment: &AgentEnvironment,
     session_paths: &SessionPaths,
@@ -910,6 +912,7 @@ pub fn build_session(
     readonly_checkout: Option<String>,
     remote_repository: Option<&str>,
     issue_backend: &crate::issue::IssueBackendInfo,
+    indexed_search_command: Option<&str>,
 ) -> String {
     SessionTemplate {
         session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
@@ -917,6 +920,7 @@ pub fn build_session(
         readonly_checkout,
         remote_repository,
         issue_repository: issue_backend.repository.as_deref(),
+        indexed_search_command,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render session: {error}"))
@@ -1022,25 +1026,15 @@ pub fn build_prepared_tools(
 #[derive(Template)]
 #[template(path = "prompt/efficiency.md", escape = "none")]
 struct EfficiencyTemplate {
-    /// The indexed-search command's name: `search`, or `rag` under hashline.
-    search_command: &'static str,
     /// `[experimental] hashline`: `search rg`/`search sg`/`edit` on PATH.
     hashline: bool,
 }
 
 /// The efficiency section: concurrent calls, the cheapest search, `explore`.
-pub fn build_efficiency(commands: &[(String, String)], hashline: bool) -> String {
-    let indexed = if hashline { "rag" } else { "search" };
-    EfficiencyTemplate {
-        search_command: if commands.iter().any(|(name, _)| name == indexed) {
-            indexed
-        } else {
-            ""
-        },
-        hashline,
-    }
-    .render()
-    .unwrap_or_else(|error| panic!("failed to render efficiency: {error}"))
+pub fn build_efficiency(hashline: bool) -> String {
+    EfficiencyTemplate { hashline }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render efficiency: {error}"))
 }
 
 struct CatalogSkill {

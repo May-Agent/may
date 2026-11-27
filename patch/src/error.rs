@@ -24,7 +24,7 @@ pub enum PatchError {
     InvalidFormat(String),
 
     /// A hunk's context and deleted lines match nowhere it may apply.
-    #[error("Patch conflict: in {path}: hunk {hunk}: {reason}")]
+    #[error("{}", ConflictMessage::new(.path, .hunk, .reason, .nearby.as_ref()))]
     Conflict {
         /// The patch-relative path of the file being updated.
         path: String,
@@ -32,6 +32,9 @@ pub enum PatchError {
         hunk: usize,
         /// Which line failed to match and where.
         reason: String,
+        /// Nearby actual lines from the file around the closest candidate or
+        /// anchor, when one can be narrowed down.
+        nearby: Option<Excerpt>,
     },
 
     /// A hunk's context and deleted lines match in more than one place.
@@ -114,6 +117,31 @@ pub struct ExcerptLine {
 impl ExcerptLine {
     const fn marker(&self) -> char {
         if self.matched { '>' } else { ' ' }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "conflict.txt")]
+struct ConflictMessage<'a> {
+    path: &'a str,
+    hunk: usize,
+    reason: &'a str,
+    nearby: Option<&'a Excerpt>,
+}
+
+impl<'a> ConflictMessage<'a> {
+    const fn new(
+        path: &'a str,
+        hunk: &usize,
+        reason: &'a str,
+        nearby: Option<&'a Excerpt>,
+    ) -> Self {
+        Self {
+            path,
+            hunk: *hunk,
+            reason,
+            nearby,
+        }
     }
 }
 

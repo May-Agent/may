@@ -329,6 +329,7 @@ fn the_work_section_names_the_issue_backend() {
         None,
         Some("gitlab.com/group/sub/repo"),
         &github,
+        None,
     );
     assert!(
         session.contains("Issue repository: May-Agent/may."),
@@ -337,6 +338,21 @@ fn the_work_section_names_the_issue_backend() {
     assert!(
         session.contains("Remote repository: gitlab.com/group/sub/repo."),
         "{session}"
+    );
+    assert!(!session.contains("Indexed code search:"), "{session}");
+
+    let indexed_session = super::build_session(
+        &AgentEnvironment::Local,
+        &session_paths(&dir),
+        None,
+        None,
+        None,
+        &github,
+        Some("search"),
+    );
+    assert!(
+        indexed_session.contains("Indexed code search: ready via `search`"),
+        "{indexed_session}"
     );
 }
 
@@ -558,7 +574,7 @@ fn container_clone_outside_the_session_directory_panics() {
 
 #[test]
 fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
-    let prompt = build_efficiency(&[], false);
+    let prompt = build_efficiency(false);
     assert!(
         prompt.contains("Fix with automated tools before hand edits"),
         "{prompt}"
@@ -574,7 +590,7 @@ fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
 
 #[test]
 fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
-    let prompt = build_efficiency(&[], false);
+    let prompt = build_efficiency(false);
     assert!(
         prompt.contains(
             "When answering means reading across many files and only the conclusion matters"
@@ -702,7 +718,7 @@ fn rendered_instructions(
             tag::TERMINAL,
             super::build_terminal(&AgentEnvironment::Local, false),
         )
-        .with_instruction(tag::EFFICIENCY, build_efficiency(&[], false))
+        .with_instruction(tag::EFFICIENCY, build_efficiency(false))
         .with_instruction(tag::WORK, build_work(&issues, true, true, false))
         .with_instruction(
             tag::SESSION,
@@ -713,6 +729,7 @@ fn rendered_instructions(
                 None,
                 None,
                 &issues,
+                None,
             ),
         )
         .with_instruction(tag::REPO_CLONES, clones);
@@ -816,7 +833,7 @@ fn subagent_instructions_report_to_the_parent_and_never_the_user() {
 
 #[test]
 fn efficiency_routes_unautofixed_lint_findings_to_fast_subagent() {
-    let efficiency = build_efficiency(&[], false);
+    let efficiency = build_efficiency(false);
     assert!(
         efficiency.contains("subagent general --tier fast"),
         "{efficiency}"
@@ -995,6 +1012,7 @@ fn cross_repo_guidance_routes_git_repositories_to_repo_clone_path() {
         Some("/tmp/may".to_string()),
         None,
         &issues,
+        None,
     );
     assert!(
         session.contains("repo clone --path <dir>"),

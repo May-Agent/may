@@ -15,12 +15,14 @@ pub use repo_search_client::protocol::Document;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_lock::OnceCell;
+use futures_lite::future;
 use may_tool_dist::{HostProgram, ToolRuntimeError, ToolTarget};
 use repo_search_client::client::{Client, ClientError};
 use repo_search_client::launcher::{self, ConnectError, Launcher as _};
-use repo_search_client::protocol::{BuildId, Hello};
+use repo_search_client::protocol::{BuildId, Final, Hello, Request, WirePhase};
 
 #[cfg(target_os = "macos")]
 type PlatformLauncher = repo_search_client::launcher::LaunchdAgents<
@@ -88,6 +90,10 @@ struct Inner {
     /// lock is taken, so a retirement never waits on the network.
     retired: async_lock::RwLock<bool>,
 }
+
+/// Upper bound on a passive index-readiness probe during session build so a
+/// busy daemon never delays agent startup.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Shared handle on the repo-search daemon.
 ///
@@ -204,6 +210,69 @@ impl RepoSearch {
         // Held until here: the launch above is what installs agents.
         drop(retired);
         Ok(client)
+    }
+
+    /// Returns whether `worktree` already has a ready, non-empty index in a
+    /// running `repo-search` daemon, without downloading the binary, spawning
+    /// a daemon, or triggering indexing.
+    pub async fn worktree_index_ready(&self, worktree: &Path) -> bool {
+        if *self.inner.retired.read().await {
+            return false;
+        }
+        let Some((socket, hello)) = self.cached_endpoint().await else {
+            return false;
+        };
+        let socket_exists = blocking::unblock({
+            let socket = socket.clone();
+            move || socket.exists()
+        })
+        .await;
+        if !socket_exists {
+            return false;
+        }
+        let worktree = worktree.to_path_buf();
+        let probe = async move {
+            let client = Client::connect(&socket, &hello).await.ok()?;
+            let answer = client
+                .request(Request::Status { worktree })
+                .await
+                .ok()?
+                .finish()
+                .await
+                .ok()?;
+            match answer {
+                Final::Status(report) => Some(report.index.is_some_and(|index| {
+                    index.phase != WirePhase::FirstIndex && index.chunks_total > 0
+                })),
+                _ => Some(false),
+            }
+        };
+        let timeout = async {
+            async_io::Timer::after(READY_PROBE_TIMEOUT).await;
+            None
+        };
+        future::or(probe, timeout).await.unwrap_or(false)
+    }
+
+    /// The daemon socket and handshake for an already-cached binary, without
+    /// downloading or installing anything.
+    async fn cached_endpoint(&self) -> Option<(PathBuf, Hello)> {
+        if let Some(prepared) = self.inner.prepared.get() {
+            return Some((prepared.socket.clone(), prepared.hello.clone()));
+        }
+        let distribution = may_tool_dist::embedded_distribution().ok()?;
+        let target = ToolTarget::native().ok()?;
+        let path = distribution
+            .cached_host_program(HostProgram::RepoSearch, &target, &self.inner.cache_root)
+            .await
+            .ok()??;
+        let program = path.path().to_path_buf();
+        blocking::unblock(move || {
+            let hello = Hello::new(BuildId::of_file(&program).ok()?);
+            let launcher = PlatformLauncher::user(program).ok()?;
+            Some((launcher.socket().to_path_buf(), hello))
+        })
+        .await
     }
 
     /// Boots out the launchd agents this process installed for a relocated
