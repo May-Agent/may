@@ -504,6 +504,7 @@ where
                     read_epochs: crate::command_policy::FileReadEpochs::default(),
                     checkout_reads: None,
                     write_lease: None,
+                    edit_bypass_notices: None,
                 },
                 slot: crate::ipc::ShellSlot::new(),
                 ssh_servers: Vec::new(),

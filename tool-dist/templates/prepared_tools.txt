@@ -2,8 +2,25 @@
 These commands are already on PATH in the initialized execution environment:
 {% for tool in tools %}- {{ tool.listed_name() }}
 {% endfor %}
-{% if hashline %}Search for lines with `search rg` (`search rg 'pattern' src`, `search rg -F`, `-i`, `-C N`, `-g 'glob'`, `-l`), for code structure with `search sg` (`search sg 'fn $NAME($$$ARGS) { $$$ }' --lang rust src`); both print `[path#TAG]` sections of numbered lines.
-Every change to an existing file goes through `edit`, which reads a hashline patch on stdin and verifies the `[path#TAG]` it names before writing. Never rewrite an existing file with `sed -i`, a Python script, a shell redirect or any other command; `edit --help` gives the patch language:
+{% if hashline %}### Hashline `search` and `edit`
+- `search rg [opts] <pattern> [path…]` — line search (`-F` literal, `-i` ignore-case, `-S` smart-case, `-C N` context, `-g 'glob'` repeatable / `!` negates, `-m N` limit, `-l` files-with-matches, `--hidden`).
+- `search sg <pattern> --lang <lang> [opts] [path…]` — structural ast-grep search (`-l`/`--lang <lang>` required, `-C N`, `-g 'glob'`, `-m N`, `--hidden`; pattern `-` reads from stdin).
+- Both output `[path#TAG]` sections of `N:content` lines whose tag and line numbers anchor `edit`.
+- Every change to an existing file goes through `edit` on stdin (`edit <<'PATCH'`); create brand-new files with shell redirection. Never modify an existing file with `sed -i`, `perl -i`, `ruby -i`, `apply_patch`, `patch`, `ed`, `ex`, `sponge`, a Python/Node/Bun/Ruby script, a shell redirect, `tee`, or `cp`/`mv`.
+- Each section starts `[PATH#TAG]` (path relative to cwd, no `..` segments). All line numbers name the ORIGINAL lines — hunks in one patch never shift later numbers, and a stale tag refuses the whole patch.
+- Ops (headers ending in `:` take `+` body rows; the rest take none):
+  - `PUT N.=M:` replace lines N–M inclusive
+  - `PUT N:` replace single line N
+  - `PUT N*:` replace syntactic block beginning on line N (anchor the opening line or leading decorator/attribute)
+  - `PUT <N:` insert before line N (`PUT <1:` = file head)
+  - `PUT >N:` insert after line N (`PUT >$:` = file tail)
+  - `PUT >N*:` insert after block beginning on line N
+  - `CUT N.=M` / `CUT N*` delete lines or block and capture
+  - `REM` delete file (stands alone in its section)
+  - `MV DEST` move file to relative `DEST` (edits above land first)
+- Registers: `CUT … @name` captures into `@name`; bodyless `PUT <N @name`, `PUT >N @name`, `PUT >$ @name`, `PUT >N* @name`, `PUT N.=M @name`, or `PUT N* @name` pastes (including across files in one patch). One unlabeled `CUT` + one unlabeled gap `PUT` (`PUT <N`, `PUT >N`, `PUT >$`, `PUT >N*`) moves once within a patch.
+- Body rows: every body row starts with `+` verbatim (`+TEXT`, leading whitespace preserved; `+` alone = blank line; no `-old` or context rows; literal leading `-`/`+` kept as `+-`/`++`).
+- Rules: touch only lines seen with the file's current tag, and re-ground from the echoed `[path#TAG]` after each edit (on a stale tag, re-read with `search` or `cat` before retrying):
 ```sh
 edit <<'PATCH'
 [src/main.rs#1A2B]

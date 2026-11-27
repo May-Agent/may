@@ -472,6 +472,7 @@ async fn build_exec_shell(
             read_epochs: may_agent::command_policy::FileReadEpochs::default(),
             checkout_reads: None,
             write_lease: None,
+            edit_bypass_notices: None,
         },
         slot: ShellSlot::new(),
         ssh_servers: ssh_server.into_iter().collect(),
@@ -556,6 +557,7 @@ where
                 instructions: Vec::new(),
                 vision_ocr: may_agent::vision_ocr::VisionOcr::new(),
                 permissions,
+                edit_bypass_notices: None,
             },
             // exec runs scripts without a model turn, so no provider-hosted
             // web tools exist here and the commands must stay registered.

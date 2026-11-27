@@ -3066,6 +3066,77 @@ printf '%s\n' 'uv @VERSION@'
         assert!(first.contains("--help"));
         assert!(!first.contains("command -v"));
         assert!(!first.contains("which "));
+        for hashline_only in [
+            "search rg",
+            "search sg",
+            "PUT N.=M:",
+            "CUT N.=M",
+            "MV DEST",
+            "[PATH#TAG]",
+        ] {
+            assert!(
+                !first.contains(hashline_only),
+                "non-hashline catalog must not contain `{hashline_only}`:\n{first}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashline_prompt_catalog_injects_complete_search_and_edit_syntax() {
+        let catalog = bundle().without(ManagedTool::ApplyPatch).catalog();
+        let rendered = catalog.render(true).unwrap();
+        assert_eq!(rendered, catalog.render(true).unwrap());
+
+        for expected in [
+            "search rg",
+            "-F",
+            "-i",
+            "-S",
+            "-C N",
+            "-g 'glob'",
+            "-m N",
+            "-l",
+            "--hidden",
+            "search sg",
+            "--lang <lang>",
+            "[path#TAG]",
+            "N:content",
+            "edit <<'PATCH'",
+            "[PATH#TAG]",
+            "PUT N.=M:",
+            "PUT N:",
+            "PUT N*:",
+            "PUT <N:",
+            "PUT <1:",
+            "PUT >N:",
+            "PUT >$:",
+            "PUT >N*:",
+            "CUT N.=M",
+            "CUT N*",
+            "REM",
+            "MV DEST",
+            "CUT … @name",
+            "PUT <N @name",
+            "PUT >N @name",
+            "PUT >$ @name",
+            "PUT N.=M @name",
+            "PUT N* @name",
+            "`+` alone = blank line",
+            "`+-`/`++`",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "hashline catalog missing `{expected}`:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("*** Begin Patch"),
+            "hashline catalog must not show apply_patch syntax:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("edit --help"),
+            "hashline catalog must inject complete syntax directly rather than deferring to `edit --help`:\n{rendered}"
+        );
     }
 
     struct RuntimeProbe;

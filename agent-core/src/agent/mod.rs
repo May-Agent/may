@@ -20,6 +20,7 @@ mod compaction_watch;
 #[cfg(target_os = "macos")]
 pub mod computer_tool;
 
+pub(crate) mod edit_bypass_alerts;
 mod environment;
 pub mod explore_tool;
 mod hooks;
