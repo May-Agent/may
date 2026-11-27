@@ -5498,6 +5498,7 @@ fn build_session_agent<'a>(
                 profile_persona: ctx.profile_persona.clone(),
                 profile_memories: ctx.profile_memories.clone(),
                 memory_off: ctx.memory_off,
+                non_interactive: ctx.non_interactive,
                 plan_state: ctx.plan_state,
                 execution_mode: ctx.execution_mode.clone(),
                 location,

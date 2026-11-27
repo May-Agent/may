@@ -38,7 +38,7 @@ use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
-use crate::command_policy::{FileReadEpochs, PolicySet};
+use crate::command_policy::{FileReadEpochs, HostCommandNotices, PolicySet};
 use crate::config::MayConfig;
 use crate::db::{ChatDb, RunFence};
 use crate::harness::compact_tool::CompactSignal;
@@ -272,6 +272,8 @@ pub struct MayAgentConfig {
     pub profile_memories: Option<crate::memory::ProfileMemories>,
     /// Whether reading and saving memories are disabled for the rest of this session.
     pub memory_off: bool,
+    /// Whether this session runs non-interactively (no user prompts or `unsafe` approval).
+    pub non_interactive: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
     /// Session-scoped execution mode, orthogonal to `plan_state`.
@@ -387,6 +389,8 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_memories: Option<crate::memory::ProfileMemories>,
     /// Whether reading and saving memories are disabled for the rest of this session.
     pub memory_off: bool,
+    /// Whether this session runs non-interactively (no user prompts or `unsafe` approval).
+    pub non_interactive: bool,
     /// Session-scoped planning workflow state.
     pub plan_state: SessionPlanState,
     /// Session-scoped execution mode, orthogonal to `plan_state`.
@@ -554,6 +558,12 @@ pub struct MayAgent {
     edit_tracker: Option<crate::fusion::WorkspaceEditTracker>,
     /// Parent session grants mirrored into a Fusion companion sidekick across turns.
     shared_grants: Option<Grants>,
+    /// Whether this session runs non-interactively (no user prompts or `unsafe` approval).
+    non_interactive: bool,
+    /// Issue backend metadata for live `<work>` instruction updates.
+    issue_backend: crate::issue::IssueBackendInfo,
+    /// Whether this session works in a derived repository clone.
+    works_in_clone: bool,
 }
 
 /// Effective prompt-cache lifetime for a session: Fusion lead and sidekick use
@@ -990,6 +1000,7 @@ impl MayAgent {
             (Some(lease), Some(tracker))
         };
         let budgets = config.limits.shell();
+        let host_command_notices = HostCommandNotices::default();
         let assembly = ShellAssembly {
             tools: tools.clone(),
             container: match &config.environment {
@@ -1036,6 +1047,7 @@ impl MayAgent {
             policies: PolicySet {
                 managed_bash: crate::command_policy::runs_managed_bash(is_container),
                 refused: refused_reads.clone(),
+                host_command_notices: host_command_notices.clone(),
                 read_epochs: read_epochs.clone(),
                 checkout_reads: Some(crate::command_policy::CheckoutReadTracker {
                     checkouts: crate::command_policy::AnyCheckoutRegistry::new(
@@ -1111,6 +1123,7 @@ impl MayAgent {
                 let terminal = build_terminal(&config.environment, config.hashline);
                 let permissions_block = build_permissions(
                     &config.environment,
+                    config.non_interactive,
                     config.secrets.names(),
                     config.network_policy.as_ref(),
                 );
@@ -1130,7 +1143,7 @@ impl MayAgent {
                 let mut runtime_system_context =
                     RuntimeSystemContext::new(memory_file, memory_content)
                         .with_memory_enabled(!config.memory_off)
-                        .with_instruction(tag::IDENTITY, build_identity())
+                        .with_instruction(tag::IDENTITY, build_identity(config.non_interactive))
                         .with_instruction(tag::ENVIRONMENT, environment_block)
                         .with_instruction(tag::TERMINAL, terminal)
                         .with_instruction(
@@ -1528,6 +1541,7 @@ impl MayAgent {
             &skills_dir,
         )
         .await?;
+        let issue_backend = crate::issue::IssueStore::info(&issue_store);
         runtime_system_context = runtime_system_context
             .with_instruction(
                 tag::EFFICIENCY,
@@ -1541,8 +1555,10 @@ impl MayAgent {
             .with_instruction(
                 tag::WORK,
                 build_work(
-                    &crate::issue::IssueStore::info(&issue_store),
+                    &issue_backend,
                     works_in_clone,
+                    !config.memory_off,
+                    config.non_interactive,
                 ),
             )
             .with_instruction(
@@ -1553,7 +1569,7 @@ impl MayAgent {
                     (!is_container).then(|| config.cwd.display().to_string()),
                     readonly_checkout,
                     remote_repo.as_deref(),
-                    &crate::issue::IssueStore::info(&issue_store),
+                    &issue_backend,
                 ),
             );
 
@@ -1670,6 +1686,9 @@ impl MayAgent {
             .subagents(subagent_tracker.runs().clone())
             .context_source(PreCompactionAlert::new(gauge.clone()))
             .context_source(loops.alerts())
+            .context_source(super::host_command_alerts::HostCommandAlerts::new(
+                host_command_notices,
+            ))
             .context_source(conditions)
             .context_source(events)
             .context_source(super::checkout_updates::CheckoutUpdates::new(
@@ -1825,6 +1844,9 @@ impl MayAgent {
             fusion_pair,
             edit_tracker,
             shared_grants: config.shared_grants,
+            non_interactive: config.non_interactive,
+            issue_backend,
+            works_in_clone,
         })
     }
 
@@ -1873,6 +1895,7 @@ impl MayAgent {
             profile_persona,
             profile_memories,
             memory_off,
+            non_interactive,
             plan_state,
             execution_mode,
             location,
@@ -2068,6 +2091,7 @@ impl MayAgent {
             profile_persona,
             profile_memories,
             memory_off,
+            non_interactive,
             plan_state,
             execution_mode,
             network_policy: may_config
@@ -2992,8 +3016,18 @@ impl MayAgent {
             tag::PERMISSIONS,
             Some(build_permissions(
                 &self.environment,
+                self.non_interactive,
                 secret_name_refs,
                 network_policy.as_ref(),
+            )),
+        );
+        self.runtime_system_context.set_instruction_opt(
+            tag::WORK,
+            Some(build_work(
+                &self.issue_backend,
+                self.works_in_clone,
+                !input.memory_off,
+                self.non_interactive,
             )),
         );
         self.runtime_system_context.set_instruction_opt(

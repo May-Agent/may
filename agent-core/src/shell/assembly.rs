@@ -196,7 +196,14 @@ where
                 let path = heel.path().to_path_buf();
                 blocking::unblock(move || HeelBinary::verify(path)).await?
             };
-            let session = HostSession::prepare(&self.working_dir, tools).await?;
+            let snapshot = self.grants.snapshot();
+            let extra_roots: Vec<PathBuf> = snapshot
+                .writable
+                .iter()
+                .chain(snapshot.readable.iter())
+                .cloned()
+                .collect();
+            let session = HostSession::prepare(&self.working_dir, tools, &extra_roots).await?;
             Sandbox::new(Backend::Host { heel }, executor, &self.working_dir)
                 .with_fixed_grants(session.grants)
                 .with_environment(session.environment)
