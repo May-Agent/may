@@ -13,6 +13,7 @@ use tempfile::tempdir;
 
 fn executable() -> std::ffi::OsString {
     std::env::var_os("APPLY_PATCH_TEST_BIN")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_apply_patch"))
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_apply_patch").into())
 }
 
