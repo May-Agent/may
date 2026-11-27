@@ -249,6 +249,26 @@ fn browser_stream_error(error: crate::container::browser::BrowserError) -> skyze
     }
 }
 
+/// Kicks off host-tool pre-warming whenever `[experimental] hashline` changes
+/// live, acquiring the preparation lease before returning so the next agent
+/// startup blocks until the target toolset is downloaded and verified.
+async fn prewarm_host_tools_if_hashline_changed(
+    state: &DaemonState,
+    previous_hashline: bool,
+    updated_hashline: bool,
+) {
+    if updated_hashline != previous_hashline {
+        crate::agent::prewarm_host_tools(
+            &state.tokio_handle,
+            state.may_dir.clone(),
+            state.tool_distribution.clone(),
+            &state.tool_environments,
+            updated_hashline,
+        )
+        .await;
+    }
+}
+
 async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> SkyResult<ApiHealth> {
     let previous_browser_manager = state.browser_manager();
     let previous_config = state.config_snapshot();
@@ -411,6 +431,12 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
 
     state.save_config(&updated).await.map_err(internal_error)?;
     state.replace_config(updated.clone());
+    prewarm_host_tools_if_hashline_changed(
+        &state,
+        previous_config.experimental.hashline,
+        updated.experimental.hashline,
+    )
+    .await;
     state.live_limits.apply(&updated);
     state.job_server.resize(updated.sandbox.job_pool_size());
     if let Some(previous_browser_manager) = previous_browser_manager
@@ -955,6 +981,12 @@ pub async fn reload_config_from_disk(state: &Arc<DaemonState>) {
     }
 
     state.replace_config(loaded.clone());
+    prewarm_host_tools_if_hashline_changed(
+        state,
+        previous_config.experimental.hashline,
+        loaded.experimental.hashline,
+    )
+    .await;
     state.live_limits.apply(&loaded);
     state.job_server.resize(loaded.sandbox.job_pool_size());
     if let Some(previous_browser_manager) = previous_browser_manager
@@ -1486,6 +1518,134 @@ mod tests {
             .expect("remove config.toml");
         super::reload_config_from_disk(&state).await;
         assert_eq!(state.config_snapshot().max_iterations, 0);
+    }
+
+    #[tokio::test]
+    async fn live_hashline_toggle_prewarms_search_and_edit_and_blocks_waiters_until_ready() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let initial = MayConfig::default();
+        initial
+            .save_to(&config_path)
+            .await
+            .expect("initial config.toml");
+
+        let state = std::sync::Arc::new(
+            super::DaemonState::for_test(dir.path(), initial)
+                .await
+                .expect("daemon state"),
+        );
+
+        let mut enabled = MayConfig::default();
+        enabled.experimental.hashline = true;
+        enabled
+            .save_to(&config_path)
+            .await
+            .expect("hashline config.toml");
+
+        super::reload_config_from_disk(&state).await;
+        assert!(state.config_snapshot().experimental.hashline);
+
+        // Because `reload_config_from_disk` acquires the pre-warm lease before
+        // returning, a session acquiring `(Local, true)` immediately after
+        // blocks on the daemon's in-flight pre-warm and receives `Ready` with
+        // `search` and `edit` (and no `apply_patch`).
+        let session = may_protocol::session_summary::SessionId::from_string("s1");
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(30),
+            state
+                .tool_environments
+                .acquire(&session, crate::agent::HomeBackend::Local, true),
+        )
+        .await
+        .expect("acquire should complete once prewarm finishes")
+        .expect("acquire should not be evicted");
+        let crate::agent::Acquired::Ready(tools) = acquired else {
+            panic!("session acquiring after live hashline reload must adopt the daemon prewarm");
+        };
+        let bin_dir = tools.local_tools().expect("local tools").bin_dir();
+        assert!(
+            bin_dir
+                .join(crate::tools::ManagedTool::HashlineSearch.command())
+                .is_file()
+        );
+        assert!(
+            bin_dir
+                .join(crate::tools::ManagedTool::HashlineEdit.command())
+                .is_file()
+        );
+        assert!(
+            !bin_dir
+                .join(crate::tools::ManagedTool::ApplyPatch.command())
+                .exists()
+        );
+        let rendered = tools.catalog().render(true).expect("catalog renders");
+        assert!(rendered.contains("- search\n"), "{rendered}");
+        assert!(rendered.contains("- edit\n"), "{rendered}");
+        assert!(!rendered.contains("- apply_patch\n"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn live_hashline_toggle_fails_fast_when_hashline_artifacts_are_unpinned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let initial = MayConfig::default();
+        initial
+            .save_to(&config_path)
+            .await
+            .expect("initial config.toml");
+
+        let mut state = super::DaemonState::for_test(dir.path(), initial)
+            .await
+            .expect("daemon state");
+        // Strip the experimental hashline artifacts from the test distribution.
+        let mut raw = serde_json::to_value(state.tool_distribution.as_ref()).expect("serialize");
+        raw["artifacts"]
+            .as_array_mut()
+            .expect("artifacts array")
+            .retain(|entry| entry["tool"] != "search" && entry["tool"] != "edit");
+        state.tool_distribution = std::sync::Arc::new(
+            crate::tools::ToolDistribution::from_json(&serde_json::to_vec(&raw).expect("json"))
+                .expect("baseline-only distribution validates"),
+        );
+        let state = std::sync::Arc::new(state);
+
+        let mut enabled = MayConfig::default();
+        enabled.experimental.hashline = true;
+        enabled
+            .save_to(&config_path)
+            .await
+            .expect("hashline config.toml");
+
+        super::reload_config_from_disk(&state).await;
+
+        // Pre-warm fails and releases its lease; a waiting session wakes up
+        // rather than hanging and fails fast with MissingTool when preparing.
+        let session = may_protocol::session_summary::SessionId::from_string("s1");
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(10),
+            state
+                .tool_environments
+                .acquire(&session, crate::agent::HomeBackend::Local, true),
+        )
+        .await
+        .expect("waiter must not hang when prewarm fails")
+        .expect("acquire should not be evicted");
+        let crate::agent::Acquired::Prepare(_lease) = acquired else {
+            panic!("failed prewarm must never cache a registry without search/edit");
+        };
+        let tools_dir = crate::session::MayHomePaths::new(state.may_dir.clone()).tools_dir();
+        let err = crate::tools::ToolEnvironments::prepare_host(
+            &state.tool_distribution,
+            &tools_dir,
+            true,
+        )
+        .await
+        .expect_err("hashline host preparation must fail fast without search/edit pins");
+        assert!(matches!(
+            err,
+            crate::tools::ToolRuntimeError::MissingTool(crate::tools::ManagedTool::HashlineSearch)
+        ));
     }
 
     #[test]

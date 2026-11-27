@@ -17,9 +17,7 @@ use aither_sandbox::{
 };
 
 use super::distribution::ToolDistribution;
-use super::runtime::{
-    HostProgram, ManagedTool, PreparedTools, ToolBundle, ToolCatalog, ToolRuntimeError, ToolTarget,
-};
+use super::runtime::{HostProgram, PreparedTools, ToolCatalog, ToolRuntimeError, ToolTarget};
 use super::transport::{
     ContainerToolTransport, LocalToolTransport, SshToolTransport, ToolTransport,
     ensure_command_line_tools, probe_tool_environment, successful_output,
@@ -64,17 +62,8 @@ pub struct ToolEnvironments {
     home: PreparedHome,
     catalog: ToolCatalog,
     source: Arc<ToolSource>,
-    /// `[experimental] hashline`: `apply_patch` stays out of every backend.
+    /// `[experimental] hashline`: `search`/`edit` replace `apply_patch` in every backend.
     hashline: bool,
-}
-
-/// The bundle a backend gets: `apply_patch` stripped under hashline mode.
-fn strip_for_hashline(bundle: ToolBundle, hashline: bool) -> ToolBundle {
-    if hashline {
-        bundle.without(ManagedTool::ApplyPatch)
-    } else {
-        bundle
-    }
 }
 
 impl ToolEnvironments {
@@ -130,12 +119,7 @@ impl ToolEnvironments {
     ) -> Result<Self, ToolRuntimeError> {
         let transport = ContainerToolTransport::new(exec, container_id);
         let info = probe_tool_environment(&transport).await?;
-        let image_tools = distribution.image_tools(&info.target)?;
-        let image_tools = if hashline {
-            image_tools.without(ManagedTool::ApplyPatch)
-        } else {
-            image_tools
-        };
+        let image_tools = distribution.image_tools_for_mode(&info.target, hashline)?;
         let tools = image_tools.verify(&transport).await?;
         Ok(Self::new(
             PreparedHome::Container {
@@ -233,18 +217,14 @@ impl ToolEnvironments {
         if let PreparedHome::Local { tools, .. } = &self.home {
             return Ok(tools.clone());
         }
-        strip_for_hashline(
-            self.source
-                .distribution
-                .load(
-                    &ToolTarget::native()?,
-                    &self.source.cache_root.join("artifacts"),
-                )
-                .await?,
-            self.hashline,
-        )
-        .prepare_local(&self.source.cache_root.join("runtimes"))
-        .await
+        self.source
+            .distribution
+            .prepare_local_bundle(
+                &ToolTarget::native()?,
+                &self.source.cache_root,
+                self.hashline,
+            )
+            .await
     }
 
     /// The commands verified in the home environment, to describe to the
@@ -263,13 +243,15 @@ impl ToolEnvironments {
         let transport = SshToolTransport::new(server.clone());
         let info = probe_tool_environment(&transport).await?;
         ensure_command_line_tools(&transport, &info.target).await?;
-        let bundle = strip_for_hashline(
-            self.source
-                .distribution
-                .load(&info.target, &self.source.cache_root.join("artifacts"))
-                .await?,
-            self.hashline,
-        );
+        let bundle = self
+            .source
+            .distribution
+            .load_for_mode(
+                &info.target,
+                &self.source.cache_root.join("artifacts"),
+                self.hashline,
+            )
+            .await?;
         let (tools, heel) = futures::try_join!(
             bundle.prepare_remote(&transport, &info.cache_root),
             remote_heel(&transport, &info.target, &self.source),
@@ -491,5 +473,45 @@ mod tests {
             .unwrap();
         child.stdin.take().unwrap().write_all(&bad).unwrap();
         assert!(!child.wait().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn prepare_host_switches_between_baseline_and_hashline_and_fails_fast_when_unpinned() {
+        let fixtures = tempfile::tempdir().unwrap();
+        let cache = crate::runtime::tests::unlocking_tempdir();
+        let distribution = crate::fixture_distribution(fixtures.path()).await;
+
+        let baseline = super::ToolEnvironments::prepare_host(&distribution, cache.path(), false)
+            .await
+            .unwrap();
+        let baseline_bin = baseline.local_tools().unwrap().bin_dir();
+        assert!(baseline_bin.join("apply_patch").is_file());
+        assert!(!baseline_bin.join("search").exists());
+        assert!(!baseline_bin.join("edit").exists());
+
+        let hashline = super::ToolEnvironments::prepare_host(&distribution, cache.path(), true)
+            .await
+            .unwrap();
+        let hashline_bin = hashline.local_tools().unwrap().bin_dir();
+        assert_ne!(hashline_bin, baseline_bin);
+        assert!(hashline_bin.join("search").is_file());
+        assert!(hashline_bin.join("edit").is_file());
+        assert!(!hashline_bin.join("apply_patch").exists());
+
+        // Stripping the hashline artifacts causes hashline prepare_host to fail fast.
+        let mut raw = serde_json::to_value(&distribution).unwrap();
+        raw["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| entry["tool"] != "search" && entry["tool"] != "edit");
+        let baseline_only =
+            crate::ToolDistribution::from_json(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let err = super::ToolEnvironments::prepare_host(&baseline_only, cache.path(), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ToolRuntimeError::MissingTool(crate::ManagedTool::HashlineSearch)
+        ));
     }
 }

@@ -214,6 +214,32 @@ impl PythonRuntime {
         })
     }
 
+    /// Mirrors an already-staged read-only `.python` tree from `peer_bin` into
+    /// `<stage>/bin` using hardlinks for regular files and recreated relative
+    /// symlinks, then links `<stage>/bin/python3` and verifies the result.
+    ///
+    /// Hardlinking keeps container images from duplicating ~80 MiB of `CPython`
+    /// across baseline and hashline tool directories and avoids running `uv` a
+    /// second time. On failure, only the newly created directories are unlocked
+    /// so shared regular-file inodes in `peer_bin` stay read-only.
+    pub(crate) fn stage_from_peer(
+        &self,
+        target: &ToolTarget,
+        stage: &Path,
+        peer_bin: &Path,
+    ) -> Result<(), ToolRuntimeError> {
+        let bin = stage.join("bin");
+        let src_python = peer_bin.join(PYTHON_DIRECTORY);
+        let dst_python = bin.join(PYTHON_DIRECTORY);
+        mirror_readonly_tree(&src_python, &dst_python).inspect_err(|_| {
+            let _ = unlock_dirs(&dst_python);
+        })?;
+        link_python(&self.link_target(target)?, &bin.join(PYTHON_COMMAND))?;
+        self.verify(target, &bin).inspect_err(|_| {
+            let _ = unlock_dirs(&dst_python);
+        })
+    }
+
     /// Checks that `<bin>/python3` is the expected relative link and that the
     /// interpreter it reaches is a read-only executable with the pinned digest.
     pub(crate) fn verify(&self, target: &ToolTarget, bin: &Path) -> Result<(), ToolRuntimeError> {
@@ -341,6 +367,69 @@ fn lock_tree(root: &Path) -> Result<(), ToolRuntimeError> {
 /// Restores the owner's write bit under `root` so the tree can be deleted.
 pub fn unlock_tree(root: &Path) -> Result<(), ToolRuntimeError> {
     change_modes(root, |mode| mode | 0o200)
+}
+
+/// Restores owner write/search bits on directories under `root` only, leaving
+/// regular file inodes untouched so hardlinked peer trees stay read-only.
+#[cfg(unix)]
+pub fn unlock_dirs(root: &Path) -> Result<(), ToolRuntimeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let mode = metadata.permissions().mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o700))?;
+        for entry in std::fs::read_dir(&path)? {
+            pending.push(entry?.path());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn unlock_dirs(_root: &Path) -> Result<(), ToolRuntimeError> {
+    Ok(())
+}
+
+/// Recursively mirrors a read-only tree from `src` to `dst`, hardlinking
+/// regular files (falling back to copying with preserved permissions when
+/// hardlinks are unavailable) and recreating relative symlinks. Directories
+/// receive their read-only permissions after their children are populated.
+fn mirror_readonly_tree(src: &Path, dst: &Path) -> Result<(), ToolRuntimeError> {
+    let src_meta = std::fs::symlink_metadata(src)?;
+    if !src_meta.file_type().is_dir() {
+        return Err(ToolRuntimeError::InvalidPythonTree(src.to_path_buf()));
+    }
+    std::fs::create_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let child_src = entry.path();
+        let child_dst = dst.join(entry.file_name());
+        let meta = std::fs::symlink_metadata(&child_src)?;
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            mirror_readonly_tree(&child_src, &child_dst)?;
+        } else if kind.is_symlink() {
+            let link_target = std::fs::read_link(&child_src)?;
+            link_python(&link_target, &child_dst)?;
+        } else if kind.is_file() {
+            if std::fs::hard_link(&child_src, &child_dst).is_err() {
+                std::fs::copy(&child_src, &child_dst)?;
+                std::fs::set_permissions(&child_dst, meta.permissions())?;
+            }
+        } else {
+            return Err(ToolRuntimeError::InvalidPythonTree(child_src));
+        }
+    }
+    std::fs::set_permissions(dst, src_meta.permissions())?;
+    Ok(())
 }
 
 #[cfg(unix)]

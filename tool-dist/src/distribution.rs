@@ -268,20 +268,28 @@ impl ToolDistribution {
         Ok(manifest)
     }
 
-    /// The artifacts pinned for `target`, exactly one per tool the target
-    /// requires; pins of other tools for it are not selected.
+    /// The artifacts pinned for `target` under `hashline` mode, exactly one
+    /// per tool that mode requires; pins of other tools for it are not selected.
+    ///
+    /// When `hashline` is `false`, selects only baseline tools (including
+    /// `apply_patch`, never `search`/`edit`). When `hashline` is `true`,
+    /// omits `apply_patch` and requires pinned `search` and `edit` artifacts.
     ///
     /// # Errors
-    /// Rejects missing or duplicate required tools for the target.
-    fn select_artifacts(&self, target: &ToolTarget) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
-        let required = target.required_tools();
-        let selected = self
+    /// Rejects missing or duplicate required tools for the target and mode.
+    fn select_artifacts_for_mode(
+        &self,
+        target: &ToolTarget,
+        hashline: bool,
+    ) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
+        let required = target.tools_for_mode(hashline);
+        let mut selected = self
             .artifacts
             .iter()
             .filter(|artifact| &artifact.target == target && required.contains(&artifact.tool))
             .cloned()
             .collect::<Vec<_>>();
-        for &tool in required {
+        for &tool in &required {
             match selected
                 .iter()
                 .filter(|artifact| artifact.tool == tool)
@@ -292,21 +300,54 @@ impl ToolDistribution {
                 _ => return Err(ToolRuntimeError::DuplicateTool(tool)),
             }
         }
+        selected.sort_by_key(|artifact| artifact.tool);
         Ok(selected)
     }
 
-    /// The tools a container image must carry for `target`, pinned without bytes.
+    /// Whether this distribution pins any experimental hashline artifact for `target`.
+    fn has_hashline_artifacts(&self, target: &ToolTarget) -> bool {
+        self.artifacts
+            .iter()
+            .any(|artifact| &artifact.target == target && artifact.tool.is_hashline())
+    }
+
+    /// The baseline artifacts pinned for `target` (`hashline = false`).
+    #[cfg(test)]
+    fn select_artifacts(&self, target: &ToolTarget) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
+        self.select_artifacts_for_mode(target, false)
+    }
+
+    /// The tools a container image must carry for `target` in default
+    /// (non-hashline) mode, pinned without bytes.
+    ///
+    /// # Errors
+    /// Rejects missing or duplicate tools for the target, or a manifest pin
+    /// whose version or digest is malformed.
+    pub fn image_tools(&self, target: &ToolTarget) -> Result<ImageTools, ToolRuntimeError> {
+        self.image_tools_for_mode(target, false)
+    }
+
+    /// The tools a container image must carry for `target` and `hashline` mode,
+    /// pinned without bytes.
+    ///
+    /// When `hashline` is `false`, selects the baseline tools (including
+    /// `apply_patch`, omitting `search` and `edit`). When `hashline` is `true`,
+    /// omits `apply_patch` and requires pinned `search` and `edit` artifacts.
     ///
     /// Never touches the network or the filesystem: each entry carries the
     /// command, the version it must report and the digest of its pinned
     /// archive, which is all the container backend needs to verify the image.
     ///
     /// # Errors
-    /// Rejects missing or duplicate tools for the target, or a manifest pin
-    /// whose version or digest is malformed.
-    pub fn image_tools(&self, target: &ToolTarget) -> Result<ImageTools, ToolRuntimeError> {
+    /// Rejects missing or duplicate tools for the target and mode, or a
+    /// manifest pin whose version or digest is malformed.
+    pub fn image_tools_for_mode(
+        &self,
+        target: &ToolTarget,
+        hashline: bool,
+    ) -> Result<ImageTools, ToolRuntimeError> {
         let tools = self
-            .select_artifacts(target)?
+            .select_artifacts_for_mode(target, hashline)?
             .into_iter()
             .map(|artifact| {
                 let mut archive_sha256 = [0; 32];
@@ -326,12 +367,15 @@ impl ToolDistribution {
     }
 
     /// Stages the executables an image build must place at
-    /// [`ImageTools::container_directory`]: `<out>/<image cache key>/bin`,
-    /// returning that `<out>/<key>` directory.
+    /// [`ImageTools::container_directory`]: `<out>/<baseline cache key>/bin`,
+    /// returning that `<out>/<baseline cache key>` directory.
     ///
-    /// The bundle is downloaded and digest-verified through [`Self::load`]:
-    /// downloads are expected on the image-build machine, never on the host
-    /// that runs the container.
+    /// Whenever the distribution also pins the experimental hashline artifacts
+    /// (`search`, `edit`) for `target`, stages `<out>/<hashline cache key>/bin`
+    /// alongside it (hardlinking shared baseline executables and `.python` so
+    /// the image carries both modes without duplicating shared bytes). If
+    /// neither hashline artifact is pinned for `target`, stages only the
+    /// baseline directory; a partial hashline pin fails fast.
     ///
     /// # Errors
     /// Rejects missing/duplicate tools, failed downloads, oversized artifacts,
@@ -345,8 +389,54 @@ impl ToolDistribution {
         artifact_cache: &Path,
         out: &Path,
     ) -> Result<PathBuf, ToolRuntimeError> {
-        let key = self.image_tools(target)?.cache_key()?;
-        let bundle = self.load(target, artifact_cache).await?;
+        let baseline_key = self.image_tools_for_mode(target, false)?.cache_key()?;
+        let hashline_stage = if self.has_hashline_artifacts(target) {
+            let hashline_key = self.image_tools_for_mode(target, true)?.cache_key()?;
+            let hashline_artifacts = self
+                .select_artifacts_for_mode(target, true)?
+                .into_iter()
+                .filter(|artifact| artifact.tool.is_hashline())
+                .collect::<Vec<_>>();
+            Some((hashline_key, hashline_artifacts))
+        } else {
+            None
+        };
+        let baseline_bundle = self.load_for_mode(target, artifact_cache, false).await?;
+        let hashline_bundle = if let Some((hashline_key, hashline_artifacts)) = hashline_stage {
+            async_fs::create_dir_all(artifact_cache).await?;
+            let token = self.github_token.clone();
+            let mut binaries: Vec<ToolBinary> = baseline_bundle
+                .binaries
+                .iter()
+                .filter(|binary| binary.tool != ManagedTool::ApplyPatch)
+                .cloned()
+                .collect();
+            let extra = stream::iter(hashline_artifacts)
+                .map(|artifact| {
+                    let cache_root = artifact_cache.to_path_buf();
+                    let token = token.clone();
+                    async move {
+                        let (bytes, sha256) =
+                            load_artifact_and_digest(&artifact, &cache_root, token.as_ref())
+                                .await?;
+                        ToolBinary::from_verified_digest(
+                            artifact.tool,
+                            &artifact.version,
+                            sha256,
+                            bytes,
+                        )
+                    }
+                })
+                .buffer_unordered(ManagedTool::HASHLINE.len())
+                .try_collect::<Vec<_>>()
+                .await?;
+            binaries.extend(extra);
+            let bundle =
+                ToolBundle::for_mode(target.clone(), binaries, self.select_python(target)?, true)?;
+            Some((hashline_key, bundle))
+        } else {
+            None
+        };
         // The interpreter of an image for another platform is still installed
         // by a `uv` that runs here.
         let installer = if target.provides_python() && *target != ToolTarget::native()? {
@@ -354,19 +444,35 @@ impl ToolDistribution {
         } else {
             None
         };
+        let hashline_lock = hashline_bundle
+            .as_ref()
+            .map(|(hashline_key, _)| out.join(format!(".{hashline_key}.lock")));
         let out = out.to_path_buf();
-        blocking::unblock(move || {
-            let prepared = bundle.prepare_local_sync(&out, &key, installer.as_deref())?;
-            Ok(prepared
+        let baseline_dir = blocking::unblock(move || {
+            let baseline =
+                baseline_bundle.prepare_local_sync(&out, &baseline_key, installer.as_deref())?;
+            let baseline_dir = baseline
                 .bin_dir()
                 .parent()
                 .expect("prepared binaries have a parent directory")
-                .to_path_buf())
+                .to_path_buf();
+            if let Some((hashline_key, hashline_bundle)) = hashline_bundle {
+                hashline_bundle.prepare_local_from_peer_sync(
+                    &out,
+                    &hashline_key,
+                    baseline.bin_dir(),
+                )?;
+            }
+            Ok::<_, ToolRuntimeError>(baseline_dir)
         })
-        .await
+        .await?;
+        if let Some(lock) = hashline_lock {
+            let _ = async_fs::remove_file(lock).await;
+        }
+        Ok(baseline_dir)
     }
 
-    /// Loads one complete target bundle concurrently, before shell execution.
+    /// Loads one complete baseline target bundle concurrently, before shell execution.
     ///
     /// # Errors
     /// Rejects missing/duplicate tools, failed downloads, oversized artifacts,
@@ -376,7 +482,27 @@ impl ToolDistribution {
         target: &ToolTarget,
         cache_root: &Path,
     ) -> Result<ToolBundle, ToolRuntimeError> {
-        let selected = self.select_artifacts(target)?;
+        self.load_for_mode(target, cache_root, false).await
+    }
+
+    /// Loads one complete target bundle for `hashline` mode concurrently,
+    /// before shell execution.
+    ///
+    /// When `hashline` is `false`, downloads only baseline tools (never
+    /// `search`/`edit`). When `hashline` is `true`, downloads baseline tools
+    /// without `apply_patch`, plus `search` and `edit` (failing fast with
+    /// [`ToolRuntimeError::MissingTool`] if either is unpinned for `target`).
+    ///
+    /// # Errors
+    /// Rejects missing/duplicate tools, failed downloads, oversized artifacts,
+    /// digest mismatch or unsafe/non-regular archive members.
+    pub async fn load_for_mode(
+        &self,
+        target: &ToolTarget,
+        cache_root: &Path,
+        hashline: bool,
+    ) -> Result<ToolBundle, ToolRuntimeError> {
+        let selected = self.select_artifacts_for_mode(target, hashline)?;
         async_fs::create_dir_all(cache_root).await?;
         let token = self.github_token.clone();
         let binaries = stream::iter(selected)
@@ -397,7 +523,12 @@ impl ToolDistribution {
             .buffer_unordered(ManagedTool::ALL.len())
             .try_collect::<Vec<_>>()
             .await?;
-        ToolBundle::new(target.clone(), binaries, self.select_python(target)?)
+        ToolBundle::for_mode(
+            target.clone(),
+            binaries,
+            self.select_python(target)?,
+            hashline,
+        )
     }
 
     /// Prepares the host's local runtime directory under `cache_root/runtimes`,
@@ -413,11 +544,7 @@ impl ToolDistribution {
         cache_root: &Path,
         hashline: bool,
     ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
-        let mut selected = self.select_artifacts(target)?;
-        if hashline {
-            selected.retain(|artifact| artifact.tool != ManagedTool::ApplyPatch);
-        }
-        selected.sort_by_key(|artifact| artifact.tool);
+        let selected = self.select_artifacts_for_mode(target, hashline)?;
         let python = self.select_python(target)?;
         let manifest_key = manifest_runtime_key(target, &selected, python.as_ref())?;
         let runtimes_root = cache_root.join("runtimes");
@@ -436,12 +563,7 @@ impl ToolDistribution {
         }
 
         let artifacts = cache_root.join("artifacts");
-        let bundle = self.load(target, &artifacts).await?;
-        let bundle = if hashline {
-            bundle.without(ManagedTool::ApplyPatch)
-        } else {
-            bundle
-        };
+        let bundle = self.load_for_mode(target, &artifacts, hashline).await?;
         let prepared = bundle.prepare_local(&runtimes_root).await?;
         let specs = bundle.specs();
         let bundle_key = bundle.cache_key()?;
@@ -1274,6 +1396,32 @@ pub mod tests {
         }
     }
 
+    /// A distribution pinning one `script_tool` executable per baseline command
+    /// plus `search` and `edit` for `target`.
+    pub fn script_distribution_with_hashline(
+        target: &ToolTarget,
+        version: &str,
+        dir: &Path,
+        url: impl Fn(&Path) -> ToolArtifactLocation,
+    ) -> ToolDistribution {
+        let mut distribution = script_distribution(target, version, dir, &url);
+        for &tool in target.hashline_tools() {
+            let bytes = script_tool(tool, version);
+            let path = dir.join(tool.command());
+            std::fs::write(&path, &bytes).unwrap();
+            distribution.artifacts.push(ToolArtifact {
+                tool,
+                version: version.into(),
+                target: target.clone(),
+                url: url(&path),
+                sha256: hex::encode(digest(&bytes)),
+                size: bytes.len() as u64,
+                encoding: ToolArtifactFormat::Executable,
+            });
+        }
+        distribution
+    }
+
     /// The interpreter pins of `target`: one where it provides `python3`.
     pub fn python_pins(target: &ToolTarget) -> Vec<PythonPin> {
         target
@@ -1618,6 +1766,200 @@ pub mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn hashline_mode_downloads_search_and_edit_isolates_cache_and_fails_fast_when_unpinned() {
+        let files = tempfile::tempdir().unwrap();
+        let cache = unlocking_tempdir();
+        let target = ToolTarget::native().unwrap();
+
+        // Without hashline artifacts pinned, baseline mode works and hashline mode fails fast.
+        let baseline_only = script_distribution(&target, "1.0.0", files.path(), file_artifact);
+        assert!(matches!(
+            baseline_only
+                .prepare_local_bundle(&target, cache.path(), true)
+                .await,
+            Err(ToolRuntimeError::MissingTool(ManagedTool::HashlineSearch))
+        ));
+        assert!(matches!(
+            baseline_only
+                .load_for_mode(&target, &cache.path().join("a"), true)
+                .await,
+            Err(ToolRuntimeError::MissingTool(ManagedTool::HashlineSearch))
+        ));
+        assert!(matches!(
+            baseline_only.image_tools_for_mode(&target, true),
+            Err(ToolRuntimeError::MissingTool(ManagedTool::HashlineSearch))
+        ));
+
+        // Baseline mode never downloads hashline artifacts even when they are pinned.
+        let mut with_unreachable_hashline =
+            script_distribution_with_hashline(&target, "1.0.0", files.path(), file_artifact);
+        for artifact in &mut with_unreachable_hashline.artifacts {
+            if artifact.tool.is_hashline() {
+                artifact.url = unreachable_artifact(Path::new(""));
+            }
+        }
+        let baseline_prepared = with_unreachable_hashline
+            .prepare_local_bundle(&target, cache.path(), false)
+            .await
+            .unwrap();
+        assert!(
+            baseline_prepared
+                .bin_dir()
+                .join(ManagedTool::ApplyPatch.executable_name(&target))
+                .is_file()
+        );
+        assert!(
+            !baseline_prepared
+                .bin_dir()
+                .join(ManagedTool::HashlineSearch.executable_name(&target))
+                .exists()
+        );
+        assert!(
+            !baseline_prepared
+                .bin_dir()
+                .join(ManagedTool::HashlineEdit.executable_name(&target))
+                .exists()
+        );
+
+        // Hashline mode never downloads apply_patch, exposes search/edit, and isolates its runtime.
+        let mut with_unreachable_patch =
+            script_distribution_with_hashline(&target, "1.0.0", files.path(), file_artifact);
+        for artifact in &mut with_unreachable_patch.artifacts {
+            if artifact.tool == ManagedTool::ApplyPatch {
+                artifact.url = unreachable_artifact(Path::new(""));
+            }
+        }
+        let hashline_prepared = with_unreachable_patch
+            .prepare_local_bundle(&target, cache.path(), true)
+            .await
+            .unwrap();
+        assert_ne!(hashline_prepared.bin_dir(), baseline_prepared.bin_dir());
+        assert!(
+            hashline_prepared
+                .bin_dir()
+                .join(ManagedTool::HashlineSearch.executable_name(&target))
+                .is_file()
+        );
+        assert!(
+            hashline_prepared
+                .bin_dir()
+                .join(ManagedTool::HashlineEdit.executable_name(&target))
+                .is_file()
+        );
+        assert!(
+            !hashline_prepared
+                .bin_dir()
+                .join(ManagedTool::ApplyPatch.executable_name(&target))
+                .exists()
+        );
+        let rendered = hashline_prepared.catalog().render(true).unwrap();
+        assert!(rendered.contains("- search\n"), "{rendered}");
+        assert!(rendered.contains("- edit\n"), "{rendered}");
+        assert!(!rendered.contains("- apply_patch\n"), "{rendered}");
+
+        // Both baseline and hashline runtime manifests reuse independently without archives.
+        std::fs::remove_dir_all(cache.path().join("artifacts")).unwrap();
+        for entry in std::fs::read_dir(files.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let reused_baseline = with_unreachable_hashline
+            .prepare_local_bundle(&target, cache.path(), false)
+            .await
+            .unwrap();
+        let reused_hashline = with_unreachable_patch
+            .prepare_local_bundle(&target, cache.path(), true)
+            .await
+            .unwrap();
+        assert_eq!(reused_baseline.bin_dir(), baseline_prepared.bin_dir());
+        assert_eq!(reused_hashline.bin_dir(), hashline_prepared.bin_dir());
+    }
+
+    #[tokio::test]
+    async fn stage_image_tools_stages_hashline_when_pinned_and_rejects_partial_pins() {
+        let files = tempfile::tempdir().unwrap();
+        let out = unlocking_tempdir();
+        let target = ToolTarget::native().unwrap();
+        let distribution =
+            script_distribution_with_hashline(&target, "1.0.0", files.path(), file_artifact);
+
+        let staged = distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+        let baseline_image = distribution.image_tools_for_mode(&target, false).unwrap();
+        let hashline_image = distribution.image_tools_for_mode(&target, true).unwrap();
+        assert_eq!(
+            staged,
+            std::fs::canonicalize(out.path())
+                .unwrap()
+                .join(baseline_image.cache_key().unwrap())
+        );
+        // Baseline directory has apply_patch and omits search/edit.
+        assert!(
+            staged
+                .join("bin")
+                .join(ManagedTool::ApplyPatch.executable_name(&target))
+                .is_file()
+        );
+        assert!(
+            !staged
+                .join("bin")
+                .join(ManagedTool::HashlineSearch.executable_name(&target))
+                .exists()
+        );
+        assert!(
+            !staged
+                .join("bin")
+                .join(ManagedTool::HashlineEdit.executable_name(&target))
+                .exists()
+        );
+
+        // Hashline directory is staged alongside baseline with search/edit and without apply_patch.
+        let hashline_key = hashline_image.cache_key().unwrap();
+        let hashline_dir = std::fs::canonicalize(out.path())
+            .unwrap()
+            .join(&hashline_key);
+        assert!(
+            hashline_dir
+                .join("bin")
+                .join(ManagedTool::HashlineSearch.executable_name(&target))
+                .is_file()
+        );
+        assert!(
+            hashline_dir
+                .join("bin")
+                .join(ManagedTool::HashlineEdit.executable_name(&target))
+                .is_file()
+        );
+        assert!(
+            !hashline_dir
+                .join("bin")
+                .join(ManagedTool::ApplyPatch.executable_name(&target))
+                .exists()
+        );
+        assert!(
+            !out.path().join(format!(".{hashline_key}.lock")).exists(),
+            "hashline staging lock must not be left behind in the image context"
+        );
+
+        // A partial hashline pin (search without edit) fails fast during staging.
+        let mut partial = distribution;
+        partial
+            .artifacts
+            .retain(|artifact| artifact.tool != ManagedTool::HashlineEdit);
+        let partial_out = unlocking_tempdir();
+        assert!(matches!(
+            partial
+                .stage_image_tools(&target, &files.path().join("cache"), partial_out.path())
+                .await,
+            Err(ToolRuntimeError::MissingTool(ManagedTool::HashlineEdit))
+        ));
     }
 
     #[tokio::test]
