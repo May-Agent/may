@@ -218,6 +218,7 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["package-args"], "--workspace")
         self.assertEqual(out["linux-package-args"], "--workspace")
         self.assertEqual(out["cargo-flags"], "--workspace --all-targets")
+        self.assertEqual(out["linux-cargo-flags"], "--workspace --all-targets")
         self.assertEqual(out["unit-test"], "true")
         self.assertEqual(
             out["unit-cargo-flags"], "--workspace --exclude may-agent --all-targets"
@@ -251,7 +252,9 @@ class ComputeTests(unittest.TestCase):
         out = compute(report(owners={}))
         self.assertEqual(out["rust"], "false")
         self.assertEqual(out["packages"], "")
-        for key in ["fmt", "clippy", "ui-clippy", "test", "e2e", "acceptance", "web_ui"]:
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
+        for key in ["fmt", "clippy", "ui-clippy", "test", "unit-test", "e2e", "acceptance", "web_ui"]:
             self.assertEqual(out[key], "false", key)
 
     def test_prose_only_runs_nothing(self):
@@ -288,6 +291,9 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["package-args"], "")
         self.assertEqual(out["e2e"], "false")
         self.assertEqual(out["acceptance"], "false")
+        self.assertEqual(out["unit-test"], "false")
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
         self.assertEqual(out["ui-clippy"], "false")
         self.assertEqual(out["web_ui"], "false")
 
@@ -302,6 +308,10 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["e2e"], "true")
         self.assertEqual(out["acceptance"], "true")
         self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tasks --all-targets")
+        self.assertEqual(out["linux-cargo-flags"], "-p may-agent -p may-tasks --all-targets")
+        self.assertEqual(out["unit-test"], "true")
+        self.assertEqual(out["unit-cargo-flags"], "-p may-tasks --all-targets")
+        self.assertEqual(out["linux-unit-cargo-flags"], "-p may-tasks --all-targets")
         self.assertEqual(out["ui-clippy"], "false")
         self.assertEqual(out["web_ui"], "false")
 
@@ -389,6 +399,9 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["ui-clippy"], "true")
         self.assertEqual(out["ui-args"], "-p may-agent")
         self.assertEqual(out["e2e"], "false")
+        self.assertEqual(out["unit-test"], "false")
+        self.assertEqual(out["unit-cargo-flags"], "")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
 
     def test_web_ui_plus_rust_source(self):
         out = compute(
@@ -499,6 +512,8 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(out["linux-package-args"], "-p may-agent")
         self.assertEqual(out["cargo-flags"], "-p may-agent -p may-tui --all-targets")
         self.assertEqual(out["linux-cargo-flags"], "-p may-agent --all-targets")
+        self.assertEqual(out["unit-cargo-flags"], "-p may-tui --all-targets")
+        self.assertEqual(out["linux-unit-cargo-flags"], "")
 
     def test_malformed_report_raises(self):
         with self.assertRaises(KeyError):
