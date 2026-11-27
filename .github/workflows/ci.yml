@@ -32,6 +32,7 @@ jobs:
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       sed: ${{ steps.scope.outputs.sed }}
+      hashline: ${{ steps.scope.outputs.hashline }}
       fmt: ${{ steps.scope.outputs.fmt }}
       clippy: ${{ steps.scope.outputs.clippy }}
       ui-clippy: ${{ steps.scope.outputs.ui-clippy }}
@@ -131,10 +132,13 @@ jobs:
           if [ "${{ needs.scope.outputs.sed }}" = "true" ] || [ "${{ needs.scope.result }}" != "success" ]; then
             cargo fmt --manifest-path sed/Cargo.toml -- --check
           fi
+          if [ "${{ needs.scope.outputs.hashline }}" = "true" ] || [ "${{ needs.scope.result }}" != "success" ]; then
+            cargo fmt --manifest-path hashline/Cargo.toml -- --check
+          fi
 
   # Default and `--features ui` clippy share one runner so the second pass
-  # reuses `target/` and compiled build scripts from the first. `sed/` stays
-  # separate as its own standalone workspace.
+  # reuses `target/` and compiled build scripts from the first. `sed/` and
+  # `hashline/` stay separate as their own standalone workspaces.
   clippy:
     name: clippy
     needs: scope
@@ -267,6 +271,110 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest (sed)
         run: cargo nextest run --locked --manifest-path sed/Cargo.toml --all-targets
+      - name: Report stow cache stats
+        if: always()
+        run: stow stats || true
+
+  clippy-hashline:
+    name: clippy (hashline)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.hashline == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: water-rs/stow@main
+        with:
+          shared-key: ci-hashline
+          workspaces: hashline
+      - name: cargo clippy (hashline)
+        run: cargo clippy --locked --manifest-path hashline/Cargo.toml --profile ci-check --all-targets -- -D warnings
+      - name: Report stow cache stats
+        if: always()
+        run: stow stats || true
+
+  test-hashline-ubuntu:
+    name: test-hashline (ubuntu-latest)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.hashline == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: water-rs/stow@main
+        with:
+          shared-key: ci-hashline
+          workspaces: hashline
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (hashline)
+        run: cargo nextest run --locked --manifest-path hashline/Cargo.toml --all-targets
+      - name: cargo build (hashline)
+        run: cargo build --locked --manifest-path hashline/Cargo.toml --bins
+      - name: Pack the debug hashline binaries
+        env:
+          GZIP: '-1'
+        run: tar -czf "${{ runner.temp }}/hashline-debug.tar.gz" -C hashline/target/debug search edit
+      - name: Upload the debug hashline binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashline-debug-linux-x64
+          path: ${{ runner.temp }}/hashline-debug.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+      - name: Report stow cache stats
+        if: always()
+        run: stow stats || true
+
+  test-hashline-macos:
+    name: test-hashline (macos-latest)
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.hashline == 'true') }}
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: water-rs/stow@main
+        with:
+          shared-key: ci-hashline
+          workspaces: hashline
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest (hashline)
+        run: cargo nextest run --locked --manifest-path hashline/Cargo.toml --all-targets
+      - name: cargo build (hashline)
+        run: cargo build --locked --manifest-path hashline/Cargo.toml --bins
+      - name: Pack the debug hashline binaries
+        env:
+          GZIP: '-1'
+        run: tar -czf "${{ runner.temp }}/hashline-debug.tar.gz" -C hashline/target/debug search edit
+      - name: Upload the debug hashline binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashline-debug-macos-arm64
+          path: ${{ runner.temp }}/hashline-debug.tar.gz
+          retention-days: 90
+          if-no-files-found: error
       - name: Report stow cache stats
         if: always()
         run: stow stats || true
@@ -470,6 +578,9 @@ jobs:
       - clippy-sed
       - test-sed-ubuntu
       - test-sed-macos
+      - clippy-hashline
+      - test-hashline-ubuntu
+      - test-hashline-macos
       - build-tests-ubuntu
       - test-ubuntu-unit
       - test-ubuntu-e2e
