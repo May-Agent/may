@@ -189,9 +189,13 @@ where
             )
         } else {
             let tools = self.tools.local_tools()?;
-            let heel = tools.heel().ok_or(ShellAssemblyError::NoHeel)?;
-            let path = heel.path().to_path_buf();
-            let heel = blocking::unblock(move || HeelBinary::verify(path)).await?;
+            let heel = if let Some(verified) = self.tools.verified_heel() {
+                verified.clone()
+            } else {
+                let heel = tools.heel().ok_or(ShellAssemblyError::NoHeel)?;
+                let path = heel.path().to_path_buf();
+                blocking::unblock(move || HeelBinary::verify(path)).await?
+            };
             let snapshot = self.grants.snapshot();
             let extra_roots: Vec<PathBuf> = snapshot
                 .writable

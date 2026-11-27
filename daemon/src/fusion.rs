@@ -250,9 +250,13 @@ impl DaemonSidekickExecutor {
             }
         };
 
-        let diff_roots = Self::workspace_roots_for_diff(&parent_sandbox_dir);
-        let baseline_roots = diff_roots.clone();
-        let baseline = blocking::unblock(move || capture_workspace_baseline(&baseline_roots)).await;
+        let sandbox_for_diff = parent_sandbox_dir.clone();
+        let (diff_roots, baseline) = blocking::unblock(move || {
+            let roots = Self::workspace_roots_for_diff(&sandbox_for_diff);
+            let baseline = capture_workspace_baseline(&roots);
+            (roots, baseline)
+        })
+        .await;
 
         let (result_tx, result_rx) = watch::channel(None);
         self.active_runs

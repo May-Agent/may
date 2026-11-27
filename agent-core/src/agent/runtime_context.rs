@@ -181,7 +181,7 @@ impl RuntimeSystemContext {
     }
 
     /// Marks the launch directory `AGENTS.md` is discovered from, so
-    /// [`Self::sync_agents_md`] can rescan it every turn. `label` is the
+    /// [`Self::sync_live_files`] can rescan it every turn. `label` is the
     /// launch directory as the model sees it, when it sees the host path.
     pub fn with_agents_source(mut self, workdir: PathBuf, label: Option<&str>) -> Self {
         self.agents_workdir = Some(workdir);
@@ -189,7 +189,7 @@ impl RuntimeSystemContext {
         self
     }
 
-    /// Marks the global rules file, so [`Self::sync_agents_md`] re-reads it
+    /// Marks the global rules file, so [`Self::sync_live_files`] re-reads it
     /// every turn.
     pub fn with_global_agents_source(mut self, path: PathBuf) -> Self {
         self.global_agents_path = Some(path);
@@ -257,6 +257,7 @@ impl RuntimeSystemContext {
     /// the `AGENTS.md` files it links to. The reconcile stages any difference
     /// with a diff alert, so the cached prefix stays warm until reassembly
     /// folds it in.
+    #[cfg(test)]
     pub async fn sync_agents_md(&mut self, handoff: Option<&str>) {
         let workdir = self.agents_workdir.clone();
         let reload = handoff != self.last_handoff.as_deref();
@@ -296,8 +297,109 @@ impl RuntimeSystemContext {
         );
     }
 
+    /// Refreshes both memory files and `AGENTS.md` blocks concurrently, then
+    /// records any memory-file change alerts on `context`.
+    pub async fn sync_live_files(
+        &mut self,
+        context: &mut aither_agent::Context,
+        handoff: Option<&str>,
+    ) {
+        let memory_enabled = self.memory_enabled;
+        let memory_path = self.memory_path.clone();
+        let memory_fut = async move {
+            if !memory_enabled {
+                return None;
+            }
+            let index_fut = async {
+                match async_fs::read_to_string(&memory_path).await {
+                    Ok(index_text) => Some(index_text),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Some(String::new())
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to read global memory file");
+                        None
+                    }
+                }
+            };
+            let memories_dir = memory_path.parent().map(Path::to_path_buf);
+            let scan_fut = async move {
+                match memories_dir {
+                    Some(dir) => Some(
+                        blocking::unblock(move || {
+                            let mut next = HashMap::new();
+                            scan_memories_dir(&dir, &dir, &mut next);
+                            next
+                        })
+                        .await,
+                    ),
+                    None => None,
+                }
+            };
+            Some(futures_lite::future::zip(index_fut, scan_fut).await)
+        };
+
+        let workdir = self.agents_workdir.clone();
+        let global_agents_path = self.global_agents_path.clone();
+        let reload = handoff != self.last_handoff.as_deref();
+        let agents_fut = async move {
+            let global_fut = async {
+                match &global_agents_path {
+                    Some(path) => agents_md::load_global(path).await,
+                    None => None,
+                }
+            };
+            let index_fut = async {
+                match &workdir {
+                    Some(dir) => agents_md::discover(dir).await,
+                    None => AgentsIndex::default(),
+                }
+            };
+            let docs_fut = async {
+                if !reload {
+                    return Vec::new();
+                }
+                match handoff {
+                    Some(markdown) => {
+                        agents_md::load_referenced(markdown, workdir.as_deref()).await
+                    }
+                    None => Vec::new(),
+                }
+            };
+            futures_lite::future::zip(futures_lite::future::zip(global_fut, index_fut), docs_fut)
+                .await
+        };
+
+        let (memory_result, ((global, index), docs)) =
+            futures_lite::future::zip(memory_fut, agents_fut).await;
+
+        if let Some((index_content, scanned)) = memory_result {
+            if let Some(content) = index_content {
+                self.last_memory_content = content;
+            }
+            if let Some(next) = scanned {
+                self.apply_memories_snapshot(context, next);
+            }
+        } else {
+            self.last_memory_content.clear();
+            self.memories_snapshot = None;
+        }
+
+        if reload {
+            self.last_handoff = handoff.map(str::to_string);
+            self.handoff_agents = docs;
+        }
+        self.agents = build_agents_md_blocks(
+            global.as_ref(),
+            &index,
+            &self.agents_root_source,
+            &self.handoff_agents,
+        );
+    }
+
     /// Re-read the memory index and watch the whole memories directory,
     /// alerting on changes to files this session has actually seen.
+    #[cfg(test)]
     pub async fn sync_memory_content(&mut self, context: &mut aither_agent::Context) {
         if !self.memory_enabled {
             self.last_memory_content.clear();
@@ -323,10 +425,19 @@ impl RuntimeSystemContext {
             next
         })
         .await;
-        let Some(snapshot) = self.memories_snapshot.replace(next.clone()) else {
+        self.apply_memories_snapshot(context, next);
+    }
+
+    fn apply_memories_snapshot(
+        &mut self,
+        context: &mut aither_agent::Context,
+        next: HashMap<String, String>,
+    ) {
+        let Some(snapshot) = self.memories_snapshot.replace(next) else {
             // First scan is a silent baseline: nothing counts as changed.
             return;
         };
+        let current = self.memories_snapshot.as_ref().expect("just inserted");
 
         // A file counts as read only if a memory path reached the
         // conversation — changes to never-surfaced files stay silent.
@@ -336,7 +447,7 @@ impl RuntimeSystemContext {
         }
 
         let mut changes = Vec::new();
-        for (rel, content) in &next {
+        for (rel, content) in current {
             if rel == "MEMORY.md" || !seen.contains(rel) {
                 continue;
             }
@@ -345,7 +456,7 @@ impl RuntimeSystemContext {
             }
         }
         for rel in snapshot.keys() {
-            if rel != "MEMORY.md" && !next.contains_key(rel) && seen.contains(rel) {
+            if rel != "MEMORY.md" && !current.contains_key(rel) && seen.contains(rel) {
                 changes.push(format!("{rel} (deleted)"));
             }
         }

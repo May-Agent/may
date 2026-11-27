@@ -28,7 +28,12 @@ use super::transport::{
 /// The home backend's tools, typed by where that backend sees them.
 #[derive(Debug, Clone)]
 enum PreparedHome {
-    Local(PreparedTools<PathBuf>),
+    Local {
+        tools: PreparedTools<PathBuf>,
+        /// Host `heel` verified once during host tool preparation so agent
+        /// builds reuse it without spawning `heel --version` every time.
+        verified_heel: Option<heel::HeelBinary>,
+    },
     Container {
         container_id: String,
         tools: PreparedTools<ContainerPath>,
@@ -38,7 +43,7 @@ enum PreparedHome {
 impl PreparedHome {
     const fn catalog(&self) -> &ToolCatalog {
         match self {
-            Self::Local(tools) => tools.catalog(),
+            Self::Local { tools, .. } => tools.catalog(),
             Self::Container { tools, .. } => tools.catalog(),
         }
     }
@@ -84,14 +89,26 @@ impl ToolEnvironments {
         hashline: bool,
     ) -> Result<Self, ToolRuntimeError> {
         let target = ToolTarget::native()?;
-        let ((), tools, heel) = futures::try_join!(
+        let ((), tools, (heel, verified_heel)) = futures::try_join!(
             ensure_command_line_tools(&LocalToolTransport, &target),
             distribution.prepare_local_bundle(&target, cache_root, hashline),
-            distribution.prepare_host_program(HostProgram::Heel, &target, cache_root),
+            async {
+                let heel = distribution
+                    .prepare_host_program(HostProgram::Heel, &target, cache_root)
+                    .await?;
+                let path = heel.path().to_path_buf();
+                let verified = blocking::unblock(move || heel::HeelBinary::verify(path))
+                    .await
+                    .ok();
+                Ok::<_, ToolRuntimeError>((heel, verified))
+            },
         )?;
         let tools = tools.with_heel(heel);
         Ok(Self::new(
-            PreparedHome::Local(tools),
+            PreparedHome::Local {
+                tools,
+                verified_heel,
+            },
             distribution,
             cache_root,
             hashline,
@@ -164,7 +181,7 @@ impl ToolEnvironments {
     pub fn container_launch(&self) -> Result<ContainerLaunch, ToolRuntimeError> {
         match &self.home {
             PreparedHome::Container { tools, .. } => Ok(tools.container_launch()),
-            PreparedHome::Local(_) => Err(ToolRuntimeError::NotInitialized(
+            PreparedHome::Local { .. } => Err(ToolRuntimeError::NotInitialized(
                 "container environment".into(),
             )),
         }
@@ -175,7 +192,7 @@ impl ToolEnvironments {
     pub fn container_id(&self) -> Option<&str> {
         match &self.home {
             PreparedHome::Container { container_id, .. } => Some(container_id),
-            PreparedHome::Local(_) => None,
+            PreparedHome::Local { .. } => None,
         }
     }
 
@@ -186,10 +203,19 @@ impl ToolEnvironments {
     /// cannot run; use [`Self::host_tools`] for tools the host runs.
     pub fn local_tools(&self) -> Result<&PreparedTools<PathBuf>, ToolRuntimeError> {
         match &self.home {
-            PreparedHome::Local(tools) => Ok(tools),
+            PreparedHome::Local { tools, .. } => Ok(tools),
             PreparedHome::Container { .. } => {
                 Err(ToolRuntimeError::NotInitialized("local environment".into()))
             }
+        }
+    }
+
+    /// The already-verified host `heel` binary, when prepared for a local home.
+    #[must_use]
+    pub const fn verified_heel(&self) -> Option<&heel::HeelBinary> {
+        match &self.home {
+            PreparedHome::Local { verified_heel, .. } => verified_heel.as_ref(),
+            PreparedHome::Container { .. } => None,
         }
     }
 
@@ -204,7 +230,7 @@ impl ToolEnvironments {
     /// Fails when the distribution has no verified artifacts for the host
     /// platform.
     pub async fn host_tools(&self) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
-        if let PreparedHome::Local(tools) = &self.home {
+        if let PreparedHome::Local { tools, .. } = &self.home {
             return Ok(tools.clone());
         }
         strip_for_hashline(
@@ -262,7 +288,15 @@ impl ToolEnvironments {
         distribution: &ToolDistribution,
         cache_root: &Path,
     ) -> Self {
-        Self::new(PreparedHome::Local(tools), distribution, cache_root, false)
+        Self::new(
+            PreparedHome::Local {
+                tools,
+                verified_heel: None,
+            },
+            distribution,
+            cache_root,
+            false,
+        )
     }
 }
 

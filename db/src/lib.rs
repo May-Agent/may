@@ -142,8 +142,10 @@ impl ChatDb {
     /// the schema fails.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
         let db = Self::connect(db_path).await?;
-        Self::apply_schema(&db).await?;
-        Self::check_schema(&db, db_path).await?;
+        let ((), expected_schema) =
+            futures_lite::future::try_zip(Self::apply_schema(&db), Self::expected_schema_columns())
+                .await?;
+        Self::check_schema_against(&db, db_path, &expected_schema).await?;
         Ok(Self {
             db,
             session_pools: session_ids::SessionPools::default(),
@@ -188,16 +190,20 @@ impl ChatDb {
     }
 
     async fn initialize_schema(db: &SkyDb) -> Result<(), ChatDbError> {
+        let mut tx = db.begin().await?;
         for statement in db_sql::statements(db_sql::CHAT_SCHEMA) {
-            query!(db, statement).execute().await?;
+            query!(tx, statement).execute().await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
     async fn ensure_session_context_snapshot_table(db: &SkyDb) -> Result<(), ChatDbError> {
+        let mut tx = db.begin().await?;
         for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
-            query!(db, statement).execute().await?;
+            query!(tx, statement).execute().await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

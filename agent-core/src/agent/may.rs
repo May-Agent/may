@@ -534,6 +534,13 @@ pub struct MayAgent {
     /// Set on freshly built agents so Turn 1 skips redundant disk/tokenizer
     /// re-sync right after `MayAgent::new`.
     runtime_context_fresh: bool,
+    /// Last synced `(cwd, workspace.toml raw bytes, memory_off, skills_dir)` so
+    /// unchanged warm turns skip redundant `WorkspaceConfig::load` and `git2`
+    /// project discovery in `MayWorkspace::new`.
+    workspace_sync_key: Option<(PathBuf, Option<Vec<u8>>, bool, PathBuf)>,
+    /// Last synced `(secrets.json raw bytes, secret names)` so unchanged warm
+    /// turns skip redundant macOS Keychain IPC when rendering `<permissions>`.
+    secret_names_cache: Option<(Vec<u8>, Vec<String>)>,
     /// This agent's entry among the daemon's btw fork hosts, while it is the
     /// session's agent.
     _fork_registration: Option<crate::agent_link::ForkRegistration>,
@@ -730,14 +737,39 @@ impl MayAgent {
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
-        // Create workspace with permissions (only used for local environment context)
-        let workspace = MayWorkspace::new(
-            config.sandbox_dir.clone(),
-            config.cwd.clone(),
-            session_paths.workspace_config(),
-        )?;
+        // Create workspace with permissions (only used for local environment context),
+        // off the async executor because `WorkspaceConfig::load` and `MayWorkspace::new`
+        // read disk and inspect git repositories.
+        let ws_config_path = session_paths.workspace_config();
+        let (workspace, initial_ws_bytes) = {
+            let sandbox_dir = config.sandbox_dir.clone();
+            let cwd = config.cwd.clone();
+            let ws_path = ws_config_path.clone();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "synchronous file read runs inside blocking::unblock"
+            )]
+            blocking::unblock(move || {
+                let raw = match std::fs::read(&ws_path) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                };
+                let workspace = MayWorkspace::new(sandbox_dir, cwd, ws_path)?;
+                Ok::<_, crate::workspace::WorkspaceConfigError>((workspace, raw.ok()))
+            })
+            .await?
+        };
 
         let skills_dir = profile_skills_dir(&config.may_dir, config.profile_id.as_deref());
+        let workspace_sync_key = initial_ws_bytes.map(|bytes| {
+            (
+                config.cwd.clone(),
+                bytes,
+                config.memory_off,
+                skills_dir.clone(),
+            )
+        });
 
         // Mount workspace grants into the sandbox: read-only dirs become
         // readable mounts, read-write dirs writable mounts. The launch
@@ -1802,6 +1834,8 @@ impl MayAgent {
             agent_path,
             read_epochs,
             runtime_context_fresh: true,
+            workspace_sync_key,
+            secret_names_cache: None,
             _fork_registration: fork_registration,
             db: config.db,
             live_config: config.live_config,
@@ -2102,6 +2136,7 @@ impl MayAgent {
         attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
+        self.runtime_context_fresh = false;
         self.loops.begin_run();
         if let Some(tracker) = &self.edit_tracker {
             tracker.begin_turn();
@@ -2131,6 +2166,7 @@ impl MayAgent {
     /// [`Self::run`].
     pub fn resume(&mut self) -> MayRun<impl Future<Output = Result<(), AgentError>> + '_> {
         self.interrupted = false;
+        self.runtime_context_fresh = false;
         self.loops.begin_run();
         if let Some(tracker) = &self.edit_tracker {
             tracker.begin_turn();
@@ -2256,6 +2292,7 @@ impl MayAgent {
     /// Returns [`AgentError`] when the underlying agent run fails.
     pub async fn query(&mut self, prompt: &str) -> Result<String, AgentError> {
         self.sync_runtime_context().await;
+        self.runtime_context_fresh = false;
         Box::pin(self.inner.query(prompt)).await
     }
 
@@ -2294,14 +2331,18 @@ impl MayAgent {
         hidden_context: Option<&str>,
         attachments: impl IntoIterator<Item = LlmAttachment>,
     ) -> Result<Vec<LlmMessage>, AgentError> {
-        self.sync_runtime_context().await;
+        self.sync_runtime_context_for_turn().await;
         // aither populates the static system blocks into `Agent::context`
         // during the first request assembly; they must land on the live
         // context, not on the fork that is discarded below. `profile` is set
         // by that same first assembly, so a missing profile means the context
         // has not been initialized yet.
         if self.inner.profile().is_none() {
-            self.inner.snapshot_context_window().await?;
+            let snapshot = self.inner.snapshot_context_window().await?;
+            self.watch.estimated(
+                snapshot.metrics.estimated_tokens,
+                snapshot.metrics.context_window,
+            );
         }
         let mut preview_context = self.inner.context().fork();
         if let Some(hidden_context) = hidden_context
@@ -2737,10 +2778,10 @@ impl MayAgent {
 
     /// Synchronizes runtime-generated system context for a turn when the agent
     /// may have changed since it was constructed (or after prior turns); skips
-    /// redundant disk/tokenizer work on an untouched freshly built agent.
+    /// redundant disk/tokenizer work on an untouched freshly built agent and
+    /// avoids re-syncing between preview and turn execution within the same turn.
     pub async fn sync_runtime_context_for_turn(&mut self) {
         if self.runtime_context_fresh {
-            self.runtime_context_fresh = false;
             return;
         }
         self.sync_runtime_context().await;
@@ -2748,28 +2789,25 @@ impl MayAgent {
 
     /// Synchronizes runtime-generated system context into the agent's context.
     pub async fn sync_runtime_context(&mut self) {
-        self.runtime_context_fresh = false;
         if let Some(swarm) = &self.swarm
             && let Err(error) = swarm.reconcile().await
         {
             tracing::warn!(session_id = %self.session_id, %error, "failed to reconcile swarm before syncing runtime context");
         }
-        self.runtime_system_context
-            .sync_memory_content(self.inner.context_mut())
-            .await;
         let handoff = handoff_markdown(self.inner.context());
-        self.runtime_system_context
-            .sync_agents_md(handoff.as_deref())
-            .await;
-        // A skill may have been added, changed or removed since the last turn.
-        match build_capabilities(
-            &self.command_descriptions,
-            &self.core_commands,
-            self.inner.parameters(),
-            &self.skills_dir,
+        let params = self.inner.parameters().clone();
+        let command_descriptions = &self.command_descriptions;
+        let core_commands = &self.core_commands;
+        let skills_dir = &self.skills_dir;
+        let runtime_system_context = &mut self.runtime_system_context;
+        let inner_context = self.inner.context_mut();
+        let ((), capabilities_res) = futures_lite::future::zip(
+            runtime_system_context.sync_live_files(inner_context, handoff.as_deref()),
+            build_capabilities(command_descriptions, core_commands, &params, skills_dir),
         )
-        .await
-        {
+        .await;
+        // A skill may have been added, changed or removed since the last turn.
+        match capabilities_res {
             Ok(capabilities) => self.runtime_system_context.set_capabilities(capabilities),
             Err(error) => {
                 tracing::warn!(%error, "failed to refresh skill catalog capabilities");
@@ -2794,6 +2832,7 @@ impl MayAgent {
                 tracing::warn!(%error, "could not measure the context window");
             }
         }
+        self.runtime_context_fresh = true;
     }
 
     /// Applies every mid-session input change to this running agent in place
@@ -2872,30 +2911,91 @@ impl MayAgent {
         }
 
         let skills_dir = profile_skills_dir(&self.may_dir, input.profile_id);
-        self.skills_dir.clone_from(&skills_dir);
+        if self.skills_dir != skills_dir {
+            self.skills_dir = skills_dir;
+            self.runtime_context_fresh = false;
+        }
 
         let session_paths = SessionPaths::new(self.sandbox_dir.clone());
-        let workspace = MayWorkspace::new(
-            self.sandbox_dir.clone(),
-            input.cwd.to_path_buf(),
-            session_paths.workspace_config(),
-        )?;
-        sync_grants_with_workspace(
-            &self.grants,
-            &workspace,
-            &self.sandbox_dir,
-            (!input.memory_off).then_some(self.memories_dir.as_path()),
-            &self.skills_dir,
-            &self.readonly_checkouts,
-        );
+        let ws_config_path = session_paths.workspace_config();
+        let secrets_index_path = self.may_dir.join("secrets.json");
+        let (ws_bytes_res, secrets_bytes_res) = futures_lite::future::zip(
+            read_optional_file(&ws_config_path),
+            read_optional_file(&secrets_index_path),
+        )
+        .await;
+
+        let next_ws_key = ws_bytes_res.ok().map(|bytes| {
+            (
+                input.cwd.to_path_buf(),
+                bytes,
+                input.memory_off,
+                self.skills_dir.clone(),
+            )
+        });
+        let workspace_changed = next_ws_key.is_none() || self.workspace_sync_key != next_ws_key;
+
+        let cached_secret_names = match &secrets_bytes_res {
+            // An absent secrets.json means no stored secrets in keychain; skip Keychain IPC.
+            Ok(None) => Some(Vec::new()),
+            Ok(Some(bytes)) => self
+                .secret_names_cache
+                .as_ref()
+                .filter(|(cached, _)| cached == bytes)
+                .map(|(_, names)| names.clone()),
+            Err(_) => None,
+        };
+
+        let (workspace_res, secrets_res) = futures_lite::future::zip(
+            async {
+                if !workspace_changed {
+                    return Ok(None);
+                }
+                let sandbox_dir = self.sandbox_dir.clone();
+                let cwd = input.cwd.to_path_buf();
+                let ws_path = ws_config_path;
+                blocking::unblock(move || MayWorkspace::new(sandbox_dir, cwd, ws_path))
+                    .await
+                    .map(Some)
+                    .map_err(MayAgentError::from)
+            },
+            async {
+                if let Some(names) = cached_secret_names {
+                    return Ok(names);
+                }
+                let store = crate::secrets::SecretStore::new(&self.may_dir);
+                let cfg = input.may_config.clone();
+                let sid = self.session_id.as_str().to_string();
+                let secrets = blocking::unblock(move || {
+                    crate::secrets::Secrets::load_for_session(&store, &cfg, &sid)
+                })
+                .await?;
+                Ok::<_, MayAgentError>(secrets.names().into_iter().map(str::to_string).collect())
+            },
+        )
+        .await;
+
+        if let Some(workspace) = workspace_res? {
+            sync_grants_with_workspace(
+                &self.grants,
+                &workspace,
+                &self.sandbox_dir,
+                (!input.memory_off).then_some(self.memories_dir.as_path()),
+                &self.skills_dir,
+                &self.readonly_checkouts,
+            );
+            if !matches!(self.environment, AgentEnvironment::Container { .. }) {
+                self.runtime_system_context
+                    .set_workdirs(build_workspace_workdirs_context(&workspace));
+            }
+            self.workspace_sync_key = next_ws_key;
+        }
         if let Some(parent_sandbox) = self.session_role.parent_sandbox_dir() {
             mirror_parent_grants(&self.grants, parent_sandbox, self.shared_grants.as_ref());
         }
-        self.inner
-            .set_restore_roots(crate::shell::shell_restore_roots(&self.shell));
-        if !matches!(self.environment, AgentEnvironment::Container { .. }) {
-            self.runtime_system_context
-                .set_workdirs(build_workspace_workdirs_context(&workspace));
+        if workspace_changed || self.session_role.parent_sandbox_dir().is_some() {
+            self.inner
+                .set_restore_roots(crate::shell::shell_restore_roots(&self.shell));
         }
 
         let network_policy = input
@@ -2905,19 +3005,19 @@ impl MayAgent {
             .compile()
             .map_err(|error| MayAgentError::Sandbox(error.to_string()))?;
         self.permissions.set_network_policy(network_policy.clone());
-        let secrets = {
-            let store = crate::secrets::SecretStore::new(&self.may_dir);
-            let cfg = input.may_config.clone();
-            let sid = self.session_id.as_str().to_string();
-            blocking::unblock(move || crate::secrets::Secrets::load_for_session(&store, &cfg, &sid))
-                .await?
-        };
+        let secret_names = secrets_res?;
+        if let Ok(Some(bytes)) = secrets_bytes_res {
+            self.secret_names_cache = Some((bytes, secret_names.clone()));
+        } else if matches!(secrets_bytes_res, Ok(None)) {
+            self.secret_names_cache = None;
+        }
+        let secret_name_refs: Vec<&str> = secret_names.iter().map(String::as_str).collect();
         self.runtime_system_context.set_instruction_opt(
             tag::PERMISSIONS,
             Some(build_permissions(
                 &self.environment,
                 self.non_interactive,
-                secrets.names(),
+                secret_name_refs,
                 network_policy.as_ref(),
             )),
         );
@@ -3030,6 +3130,14 @@ impl MayAgent {
             .set_environment(environment_block);
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
+    }
+}
+
+async fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
+    match async_fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
 

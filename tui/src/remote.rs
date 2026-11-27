@@ -230,15 +230,18 @@ pub fn spawn_build_watch(
     .detach();
 }
 
-/// Follow worktree index coverage for `cwd` for as long as the TUI runs.
-/// The session worker is not required: a new TUI has no daemon session
-/// until the first message.
+/// Follow worktree index coverage for `cwd` until the returned task is
+/// dropped.
+///
+/// Typically once a session worker attaches and takes over `session_index`
+/// streaming. The session worker is not required: a new TUI has no daemon
+/// session until the first message.
 pub fn spawn_index_coverage(
     client: DaemonClient,
     cwd: std::path::PathBuf,
     app_events: EventSender,
-) {
-    executor_core::spawn(follow_index(client, cwd, app_events)).detach();
+) -> executor_core::AnyExecutorTask<()> {
+    executor_core::spawn(follow_index(client, cwd, app_events))
 }
 
 async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events: EventSender) {
@@ -714,15 +717,17 @@ async fn follow_session(
                 }
                 // Frames this client missed are gone: the turn it followed
                 // ended unseen. The turn in progress, if any, follows from
-                // its start.
+                // its start. A pending turn whose `Start` was missed must
+                // also settle so the TUI does not stay stuck on `Preparing`.
                 "reset" => {
-                    if let Some(turn) = current.take() {
-                        turn.end().await;
-                    }
-                    if let Some(app_event) = stream_app_event(&event.kind, &event.data, &mut state)
-                    {
-                        let _ = forwarding.app_events.send(app_event).await;
-                    }
+                    handle_reset_frame(
+                        &event.data,
+                        &mut current,
+                        &shared,
+                        &mut state,
+                        &forwarding.app_events,
+                    )
+                    .await;
                 }
                 _ => {
                     if let Some(app_event) = stream_app_event(&event.kind, &event.data, &mut state)
@@ -736,6 +741,24 @@ async fn follow_session(
         // continues it from the frame after the last one received.
         shared.attached.store(false, Ordering::Release);
         async_io::Timer::after(RECONNECT_DELAY).await;
+    }
+}
+
+async fn handle_reset_frame(
+    data: &str,
+    current: &mut Option<ForwardedTurn>,
+    shared: &Shared,
+    state: &mut StreamState,
+    app_events: &EventSender,
+) {
+    if let Some(turn) = current.take() {
+        turn.end().await;
+    }
+    if let Some(pending) = shared.take_pending() {
+        let _ = pending.send(TuiEvent::Complete).await;
+    }
+    if let Some(app_event) = stream_app_event("reset", data, state) {
+        let _ = app_events.send(app_event).await;
     }
 }
 
@@ -1533,5 +1556,21 @@ mod tests {
                 may_client::client::TurnStage::WaitingForModel
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn reset_frame_settles_pending_turn_and_signals_stale_history() {
+        let shared = Shared::default();
+        let (events, rx) = unbounded();
+        shared.set_pending(events);
+        let mut current = None;
+        let mut state = StreamState::default();
+        let (app_events, app_rx) = unbounded();
+
+        handle_reset_frame("{}", &mut current, &shared, &mut state, &app_events).await;
+
+        assert!(matches!(rx.try_recv(), Ok(TuiEvent::Complete)));
+        assert!(shared.take_pending().is_none());
+        assert!(matches!(app_rx.try_recv(), Ok(AppEvent::HistoryStale)));
     }
 }

@@ -136,23 +136,10 @@ pub async fn start(
         crate::tools::embedded_distribution().context("embedded tool distribution is invalid")?,
     );
 
-    // Try to detect a container runtime (OrbStack/Docker/Podman)
-    let container_manager = match crate::container::ContainerRuntime::detect().await {
-        Ok(runtime) => {
-            tracing::info!(kind = %runtime.kind, "Container runtime detected");
-            Some(Arc::new(
-                crate::container::lifecycle::ContainerManager::new(
-                    Arc::new(runtime),
-                    may_dir.clone(),
-                )
-                .with_live_config(live_config.clone()),
-            ))
-        }
-        Err(e) => {
-            tracing::debug!("No container runtime available: {e}");
-            None
-        }
-    };
+    // Container runtime detection runs asynchronously after the daemon starts
+    // so probing an inactive socket or managed Podman never delays local client
+    // connections; container sessions and tasks also resolve on demand.
+    let container_manager = Arc::new(arc_swap::ArcSwapOption::empty());
 
     // Capacity must be high enough that a slow SSE client cannot block the
     // browser actor's hot path; lifecycle events are small and high-volume
@@ -260,7 +247,7 @@ pub async fn start(
                 let _ = task_bot_wake_tx.try_send(bot_id.to_string());
             }),
         );
-    let mut task_runtime = crate::scheduler::TaskRuntime::load(
+    let task_runtime = crate::scheduler::TaskRuntime::load(
         db_for_archive.clone(),
         may_dir.clone(),
         tool_distribution.clone(),
@@ -273,10 +260,8 @@ pub async fn start(
     .map_err(|error| anyhow!(error))?
     .with_connectivity(connectivity.clone())
     .with_job_server(job_server.clone())
-    .with_session_prompts(session_prompts.clone());
-    if let Some(ref manager) = container_manager {
-        task_runtime = task_runtime.with_container_manager(manager.clone());
-    }
+    .with_session_prompts(session_prompts.clone())
+    .with_shared_container_manager(container_manager.clone());
     let task_runtime = Arc::new(task_runtime);
     let container_prepare = super::state::ContainerPrepareTracker::new(ui_event_bus.clone());
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
@@ -389,7 +374,7 @@ pub async fn start(
         live_limits,
         ui_event_bus: ui_event_bus.clone(),
         container_prepare,
-        container_manager: arc_swap::ArcSwapOption::from(container_manager),
+        container_manager,
         pending_transcripts: super::disk_exhaustion::PendingTranscriptStore::default(),
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
@@ -433,6 +418,7 @@ pub async fn start(
         parked_agents: super::chat::ParkedAgents::default(),
         session_prewarms: super::chat::SessionPrewarms::default(),
         repo_gate_locks: std::sync::Mutex::default(),
+        repo_gate_stamps: std::sync::Mutex::default(),
         agent_forks: crate::agent_link::ForkHosts::default(),
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
@@ -531,8 +517,32 @@ pub async fn start(
         });
     }
     super::archive::spawn(state.clone());
-    if let Some(cm) = state.container_manager.load_full() {
-        let _auto_stop = cm.spawn_auto_stop_task();
+    {
+        let warm_state = state.clone();
+        state.tokio_handle.spawn(async move {
+            if warm_state.container_manager.load_full().is_some() {
+                return;
+            }
+            match crate::container::ContainerRuntime::detect().await {
+                Ok(runtime) => {
+                    tracing::info!(kind = %runtime.kind, "Container runtime detected");
+                    let manager = Arc::new(
+                        crate::container::lifecycle::ContainerManager::new(
+                            Arc::new(runtime),
+                            warm_state.may_dir.clone(),
+                        )
+                        .with_live_config(warm_state.config.clone()),
+                    );
+                    if warm_state.container_manager.load_full().is_none() {
+                        let _auto_stop = manager.spawn_auto_stop_task();
+                        warm_state.container_manager.store(Some(manager));
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!("No container runtime available: {error}");
+                }
+            }
+        });
     }
     super::disk_exhaustion::spawn_pending_transcript_flusher(&state);
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
