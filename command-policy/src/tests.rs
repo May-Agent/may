@@ -1144,6 +1144,7 @@ async fn hashline_edit_bypass_catches_cd_python_heredoc_and_edge_cases() {
     let sandbox = dir.path().join("sandbox");
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&sandbox).expect("mkdir sandbox");
+    std::fs::create_dir_all(repo.join(".git")).expect("mkdir .git");
     std::fs::create_dir_all(repo.join("src/_pytest")).expect("mkdir src/_pytest");
     std::fs::write(
         repo.join("src/_pytest/logging.py"),

@@ -428,9 +428,10 @@ impl PolicySet {
             builder
         };
         let hashline = self.edit_bypass_notices.is_some();
-        let builder = builder.policy(SedInPlace::new(hashline));
         let builder = if let Some(notices) = self.edit_bypass_notices {
-            builder.policy(HashlineEditBypassPolicy::new(notices))
+            builder
+                .policy(SedInPlace::new(true))
+                .policy(HashlineEditBypassPolicy::new(notices))
         } else {
             builder
         };
