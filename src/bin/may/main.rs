@@ -40,11 +40,14 @@ use crossterm::{
     event::{
         DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
         EnableFocusChange, EnableMouseCapture, KeyCode, KeyModifiers, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
-    execute,
+    execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
 };
 use executor_core::tokio::TokioGlobal;
 use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
@@ -330,6 +333,7 @@ async fn async_main() -> anyhow::Result<()> {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            EndSynchronizedUpdate,
             LeaveAlternateScreen,
             DisableBracketedPaste,
             DisableFocusChange,
@@ -345,6 +349,9 @@ async fn async_main() -> anyhow::Result<()> {
         default_hook(panic_info);
     }));
 
+    // Prioritize interactive TUI rendering/input on macOS ahead of background builds.
+    may_agent::tui::event::promote_thread_qos();
+
     // The band colour comes from the terminal's own colours: asked once,
     // on a blocking thread so the runtime keeps turning, before raw mode.
     let band_bg = blocking::unblock(may_agent::tui::ui::band::query_band_color).await;
@@ -352,9 +359,10 @@ async fn async_main() -> anyhow::Result<()> {
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
-    // Setup terminal (alternate screen)
+    // Setup terminal (alternate screen) with a 64 KiB buffered writer so
+    // frame diffs flush in bulk instead of 1 KiB line-buffered writes.
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = io::BufWriter::with_capacity(64 * 1024, io::stdout());
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -374,7 +382,7 @@ async fn async_main() -> anyhow::Result<()> {
     let build = may_agent::daemon::lifecycle::ClientBuild::current()?;
 
     // Create app and run
-    let result = run_app(
+    let result = Box::pin(run_app(
         &mut terminal,
         image_support,
         band_bg,
@@ -382,13 +390,14 @@ async fn async_main() -> anyhow::Result<()> {
         resume,
         tui_args,
         build.clone(),
-    )
+    ))
     .await;
 
     // Cleanup terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        EndSynchronizedUpdate,
         LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableFocusChange,
@@ -396,6 +405,7 @@ async fn async_main() -> anyhow::Result<()> {
         PopKeyboardEnhancementFlags
     )?;
     terminal.show_cursor()?;
+    io::Write::flush(terminal.backend_mut())?;
 
     match result {
         Ok(LoopExit {
@@ -503,7 +513,55 @@ async fn run_mode_command(args: cli::ModeCliArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_app<B: Backend>(
+/// Draw one TUI frame inside a DEC 2026 synchronized-update bracket so
+/// terminal preemption mid-write never presents a torn frame.
+fn draw_frame<B: Backend + io::Write>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let draw_result = terminal.draw(|frame| ui::render(frame, app)).map(|_| ());
+    let end_result = queue!(terminal.backend_mut(), EndSynchronizedUpdate);
+    let flush_result = io::Write::flush(terminal.backend_mut());
+    draw_result?;
+    end_result?;
+    flush_result?;
+    Ok(())
+}
+
+/// Target frame cadence (~60 Hz) for coalescing streaming deltas and continuous
+/// mouse-move/scroll bursts while discrete keystrokes still draw immediately.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Maximum queued terminal/app events drained and coalesced before one draw.
+const MAX_TERMINAL_DRAIN: usize = 256;
+
+/// Maximum queued agent events drained in one burst before yielding to render.
+const MAX_AGENT_DRAIN: usize = 128;
+
+/// Time budget for draining ready agent deltas in a single event-loop turn.
+const AGENT_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// Whether `event` is a turn milestone that should bypass the 16 ms frame
+/// pacing window and draw immediately.
+const fn is_urgent_agent_event(event: &TuiEvent) -> bool {
+    !matches!(
+        event,
+        TuiEvent::Stage(_)
+            | TuiEvent::Agent(Ok(TimedEvent {
+                event: AgentEvent::BlockDelta { .. }
+                    | AgentEvent::ToolCallDelta { .. }
+                    | AgentEvent::RequestStarted { .. }
+                    | AgentEvent::RequestEnded { .. },
+                ..
+            }))
+    )
+}
+
+async fn run_app<B: Backend + io::Write>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
     band_bg: Option<ratatui::style::Color>,
@@ -554,17 +612,17 @@ where
     // Agents run in the May daemon; the TUI is its client. Starting or
     // replacing the daemon shows on the status line meanwhile.
     app.set_status("Connecting to the May daemon…");
-    terminal.draw(|frame| ui::render(frame, &mut app))?;
+    draw_frame(terminal, &mut app)?;
     let paths = may_agent::daemon::DaemonPaths::user()?;
     let runtime_deps = match may_agent::daemon::lifecycle::ensure_running(&paths, |message| {
         app.set_status(message);
-        let _ = terminal.draw(|frame| ui::render(frame, &mut app));
+        let _ = draw_frame(terminal, &mut app);
     })
     .await
     {
         Ok(client) => {
             app.set_status("Loading profiles…");
-            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            draw_frame(terminal, &mut app)?;
             app.btw_daemon = Some(client.clone());
             if let Ok(health) = client.health().await {
                 app.daemon_addr = health.local_listener;
@@ -631,7 +689,7 @@ where
     let mut worker_build = None;
     if let Some(session_id) = pending_resume.take() {
         app.set_status("Resuming session…");
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        draw_frame(terminal, &mut app)?;
         let build = resume_into_session(&mut app, &mut worker, &runtime_deps, &session_id)
             .await
             .with_context(|| format!("cannot resume session {}", session_id.as_str()))?;
@@ -641,7 +699,7 @@ where
         });
     } else if app.is_configured() {
         app.set_status("Starting session…");
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
+        draw_frame(terminal, &mut app)?;
         if let Err(e) = runtime_deps.begin_new_session(&mut app, &mut worker).await {
             report_startup_failure(&mut app, &e);
         }
@@ -773,7 +831,7 @@ async fn finish_worker_build(
 /// This loop NEVER directly calls `agent.run()` or `stream.next()` - all agent processing
 /// happens in background tasks that communicate via channels.
 #[allow(clippy::too_many_arguments)]
-async fn main_event_loop<B: Backend>(
+async fn main_event_loop<B: Backend + io::Write>(
     app: &mut App,
     worker: &mut Option<AgentWorker>,
     mut worker_build: Option<WorkerBuild>,
@@ -808,12 +866,13 @@ where
     // not reopened before the daemon clears it.
     let mut shown_prompts = std::collections::HashSet::<String>::new();
 
-    // Frames are drawn when something changed: every event but the idle
-    // tick redraws. A tick redraws while a turn animates its spinner, and
-    // otherwise at most once a second so elapsed counters, auto-collapsing
-    // tool calls and expiring notices still advance.
-    let mut needs_draw = true;
+    // Frames draw promptly on discrete user input / mode changes / idle wakeups
+    // (`urgent_draw`), and pace continuous streaming/mouse bursts to ~60 Hz
+    // (`FRAME_INTERVAL`) so burst deltas coalesce into one draw.
+    let mut dirty = true;
+    let mut urgent_draw = true;
     let mut last_draw = std::time::Instant::now();
+    let jank_threshold = may_agent::tui::perf::jank_threshold();
 
     loop {
         enum Event {
@@ -822,6 +881,7 @@ where
             ForeignTurn(may_agent::agent::ForeignTurn),
             Context(Option<TuiEvent>),
             Terminal(Box<AppEvent>),
+            FrameTick,
         }
 
         // Once a session worker attaches, its `follow_session_globals` stream
@@ -841,19 +901,20 @@ where
 
         tracing::trace!("=== LOOP START ===");
         let mut phases = may_agent::tui::perf::LoopPhases::default();
-        let jank_threshold = may_agent::tui::perf::jank_threshold();
 
-        // First draw: updates content_height/view_height for accurate overflow calculation.
-        if needs_draw {
+        // Draw when something changed and either the change is urgent or the
+        // 16 ms frame pacing window has elapsed.
+        if dirty && (urgent_draw || last_draw.elapsed() >= FRAME_INTERVAL) {
             let draw_start = std::time::Instant::now();
-            terminal.draw(|frame| ui::render(frame, app))?;
+            draw_frame(terminal, app)?;
             phases.draw = draw_start.elapsed();
             last_draw = draw_start;
+            dirty = false;
+            urgent_draw = false;
             tracing::trace!("after draw");
         }
-        // Any path back to the top of the loop redraws unless an idle tick
-        // below says otherwise.
-        needs_draw = true;
+
+        let mode_before = mem::discriminant(&app.mode);
 
         // Check for model fetch results (non-blocking)
         if let Some(ref mut rx) = app.model_fetch_rx
@@ -861,6 +922,8 @@ where
         {
             app.handle_fetched_models(models);
             app.model_fetch_rx = None;
+            dirty = true;
+            urgent_draw = true;
         }
 
         // Check for provider catalog results for the model-select popup
@@ -869,10 +932,14 @@ where
         {
             app.merge_model_select_models(models);
             app.model_select_rx = None;
+            dirty = true;
+            urgent_draw = true;
         }
 
         // Apply finished file diffs to their tool-call blocks (non-blocking)
-        app.poll_file_diffs();
+        if app.poll_file_diffs() {
+            dirty = true;
+        }
 
         // Check for clipboard paste results (non-blocking)
         if let Some(ref mut rx) = app.clipboard_rx {
@@ -881,6 +948,8 @@ where
                     app.clipboard_rx = None;
                     app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
                     app.enqueue_clipboard_result(result);
+                    dirty = true;
+                    urgent_draw = true;
                 }
                 Err(TryRecvError::Closed) => {
                     app.clipboard_rx = None;
@@ -890,6 +959,8 @@ where
                             "clipboard task closed before sending a result".to_string(),
                         ),
                     )));
+                    dirty = true;
+                    urgent_draw = true;
                 }
                 Err(TryRecvError::Empty) => {}
             }
@@ -898,6 +969,8 @@ where
         let step_start = std::time::Instant::now();
         while let Some(paste) = app.dequeue_pending_paste() {
             app.handle_pending_paste(paste).await;
+            dirty = true;
+            urgent_draw = true;
         }
         phases.step("paste_results", step_start.elapsed());
 
@@ -935,9 +1008,16 @@ where
         // dock icon bounces. Later additions only update the count.
         let step_start = std::time::Instant::now();
         if app.reconcile_open_questions() {
-            let _ = io::stdout()
+            let backend = terminal.backend_mut();
+            let _ = backend
                 .write_all(b"\x07")
-                .and_then(|()| io::stdout().flush());
+                .and_then(|()| io::Write::flush(backend));
+            dirty = true;
+            urgent_draw = true;
+        }
+        if mem::discriminant(&app.mode) != mode_before {
+            dirty = true;
+            urgent_draw = true;
         }
 
         phases.step("questions+listeners", step_start.elapsed());
@@ -960,6 +1040,8 @@ where
                     app.worker_settings = may_agent::agent::AgentLiveSettings::of(&app.config);
                     app.chat
                         .push_error(&format!("Failed to apply the saved settings: {error}"));
+                    dirty = true;
+                    urgent_draw = true;
                 }
             }
         }
@@ -979,6 +1061,8 @@ where
                             .await?,
                     );
                     assistant_response.clear();
+                    dirty = true;
+                    urgent_draw = true;
                     continue;
                 }
                 QueuedRunStart::Busy => {
@@ -987,11 +1071,19 @@ where
                         app.set_status(
                             "This session is running elsewhere; the message stays queued",
                         );
+                        dirty = true;
+                        urgent_draw = true;
                     }
                 }
                 QueuedRunStart::Nothing => busy_elsewhere_notified = false,
             }
             phases.step("begin_queued_run", step_start.elapsed());
+        }
+
+        // If housekeeping opened a modal or applied an urgent background result
+        // after our draw, present it immediately before sleeping in select.
+        if dirty && urgent_draw {
+            continue;
         }
 
         tracing::trace!("entering select");
@@ -1004,48 +1096,59 @@ where
         } else {
             futures_lite::future::or(
                 async {
-                    match worker_build.as_mut() {
-                        Some(pending) => {
-                            Some(Event::WorkerBuilt(Box::new(pending.build.wait().await)))
-                        }
-                        None => futures_lite::future::pending().await,
+                    if dirty && !urgent_draw {
+                        let remaining = FRAME_INTERVAL.saturating_sub(last_draw.elapsed());
+                        async_io::Timer::after(remaining).await;
+                        Some(Event::FrameTick)
+                    } else {
+                        futures_lite::future::pending().await
                     }
                 },
                 futures_lite::future::or(
                     async {
-                        if let Some(ref handle) = agent_handle {
-                            let result = handle.recv().await;
-                            tracing::trace!("agent handle.recv() RETURNED");
-                            result.map(Event::Agent)
-                        } else if let Some(worker) = worker.as_ref() {
-                            // A turn another client started, rendered
-                            // while this TUI has none of its own.
-                            worker.next_foreign_turn().await.map(Event::ForeignTurn)
-                        } else {
-                            futures_lite::future::pending().await
+                        match worker_build.as_mut() {
+                            Some(pending) => {
+                                Some(Event::WorkerBuilt(Box::new(pending.build.wait().await)))
+                            }
+                            None => futures_lite::future::pending().await,
                         }
                     },
                     futures_lite::future::or(
                         async {
-                            if let Some(ref handle) = context_handle {
-                                // None means the report channel closed —
-                                // surface it as an event so the handle is
-                                // cleared instead of quitting the loop.
-                                Some(Event::Context(handle.recv().await))
+                            if let Some(ref handle) = agent_handle {
+                                let result = handle.recv().await;
+                                tracing::trace!("agent handle.recv() RETURNED");
+                                result.map(Event::Agent)
+                            } else if let Some(worker) = worker.as_ref() {
+                                // A turn another client started, rendered
+                                // while this TUI has none of its own.
+                                worker.next_foreign_turn().await.map(Event::ForeignTurn)
                             } else {
                                 futures_lite::future::pending().await
                             }
                         },
-                        async {
-                            let result = events.next().await;
-                            if !matches!(result, Some(AppEvent::Tick)) {
-                                tracing::trace!(
-                                    "events.next() RETURNED: {:?}",
-                                    result.as_ref().map(|_| "event")
-                                );
-                            }
-                            result.map(|event| Event::Terminal(Box::new(event)))
-                        },
+                        futures_lite::future::or(
+                            async {
+                                if let Some(ref handle) = context_handle {
+                                    // None means the report channel closed —
+                                    // surface it as an event so the handle is
+                                    // cleared instead of quitting the loop.
+                                    Some(Event::Context(handle.recv().await))
+                                } else {
+                                    futures_lite::future::pending().await
+                                }
+                            },
+                            async {
+                                let result = events.next().await;
+                                if !matches!(result, Some(AppEvent::Tick)) {
+                                    tracing::trace!(
+                                        "events.next() RETURNED: {:?}",
+                                        result.as_ref().map(|_| "event")
+                                    );
+                                }
+                                result.map(|event| Event::Terminal(Box::new(event)))
+                            },
+                        ),
                     ),
                 ),
             )
@@ -1060,6 +1163,7 @@ where
                 Some(Event::ForeignTurn(_)) => "ForeignTurn",
                 Some(Event::Context(_)) => "Context",
                 Some(Event::Terminal(_)) => "Terminal",
+                Some(Event::FrameTick) => "FrameTick",
                 None => "None",
             }
         );
@@ -1069,25 +1173,21 @@ where
             agent_left_running = agent_handle.is_some() || app.agent_working();
             break;
         };
-        if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
-            let hover_modifier_changed = app.refresh_host_open_modifiers();
-            // The fireworks redraw every tick, and once more on the tick
-            // that ends them so no spark stays on screen.
-            needs_draw = hover_modifier_changed
-                || app.processing
-                || app.new_year.animating()
-                || app.compaction.is_holding()
-                || last_draw.elapsed() >= std::time::Duration::from_secs(1);
-        }
         let event_kind = match &event {
             Event::Terminal(e) => e.kind(),
             Event::WorkerBuilt(_) => "worker_built",
             Event::Agent(_) => "agent",
             Event::ForeignTurn(_) => "foreign_turn",
             Event::Context(_) => "context",
+            Event::FrameTick => "frame_tick",
         };
 
         match event {
+            Event::FrameTick => {
+                // Frame pacing deadline elapsed; guarantee the next top-of-loop draws.
+                urgent_draw = true;
+            }
+
             Event::WorkerBuilt(built) => {
                 let finished = worker_build
                     .take()
@@ -1099,6 +1199,8 @@ where
                     agent_handle = Some(w.send(turn));
                     assistant_response.clear();
                 }
+                dirty = true;
+                urgent_draw = true;
             }
 
             Event::ForeignTurn(turn) => {
@@ -1126,171 +1228,185 @@ where
                 app.set_turn_started_at(turn.started_at);
                 assistant_response.clear();
                 agent_handle = Some(turn.handle);
+                dirty = true;
+                urgent_draw = true;
             }
 
-            Event::Agent(tui_event) => {
-                // The handed-over turn has started in the daemon: what was
-                // sent behind it now queues after it.
-                if let Some(held) = held_turn.take_if(|held| held.turn.is_none()) {
-                    for message in &held.behind {
-                        let posted = runtime_deps.post_enqueue(app, message).await;
-                        app.settle(posted);
-                    }
-                }
-                match tui_event {
-                    TuiEvent::Stage(stage) => {
-                        app.activity_phase = may_agent::tui::ui::chat::ActivityPhase::Stage(stage);
-                    }
-                    TuiEvent::Agent(result) => {
-                        // The wait that followed a failure is over.
-                        app.clear_persistent_status();
-                        // Capture text for title generation
-                        if let Ok(TimedEvent {
-                            at,
-                            event:
-                                AgentEvent::BlockDelta {
-                                    kind: OutputKind::Text,
-                                    ref text,
-                                    ..
-                                },
-                            ref agent,
-                            ..
-                        }) = result
-                            && agent.is_main()
-                        {
-                            let at = jiff::Timestamp::new(at.as_second(), at.subsec_nanosecond())
-                                .expect("valid timestamp");
-                            assistant_response.push(text, at);
+            Event::Agent(first_tui_event) => {
+                let batch_start = std::time::Instant::now();
+                let mut current = Some(first_tui_event);
+                let mut drained = 0usize;
+                while let Some(tui_event) = current.take() {
+                    drained += 1;
+                    dirty = true;
+                    urgent_draw |= is_urgent_agent_event(&tui_event);
+                    // The handed-over turn has started in the daemon: what was
+                    // sent behind it now queues after it.
+                    if let Some(held) = held_turn.take_if(|held| held.turn.is_none()) {
+                        for message in &held.behind {
+                            let posted = runtime_deps.post_enqueue(app, message).await;
+                            app.settle(posted);
                         }
-                        let ended = app.handle_agent_event(result).await;
-                        if ended {
-                            runtime_deps
-                                .finish_agent_task(
+                    }
+                    match tui_event {
+                        TuiEvent::Stage(stage) => {
+                            app.activity_phase =
+                                may_agent::tui::ui::chat::ActivityPhase::Stage(stage);
+                        }
+                        TuiEvent::Agent(result) => {
+                            // The wait that followed a failure is over.
+                            app.clear_persistent_status();
+                            // Capture text for title generation
+                            if let Ok(TimedEvent {
+                                at,
+                                event:
+                                    AgentEvent::BlockDelta {
+                                        kind: OutputKind::Text,
+                                        ref text,
+                                        ..
+                                    },
+                                ref agent,
+                                ..
+                            }) = result
+                                && agent.is_main()
+                            {
+                                let at =
+                                    jiff::Timestamp::new(at.as_second(), at.subsec_nanosecond())
+                                        .expect("valid timestamp");
+                                assistant_response.push(text, at);
+                            }
+                            let ended = app.handle_agent_event(result);
+                            if ended {
+                                runtime_deps.finish_agent_task(
                                     app,
                                     &mut agent_handle,
                                     &mut pending_title_gen,
                                     &assistant_response,
                                     RunOutcome::Completed,
-                                )
-                                .await;
+                                );
+                            }
                         }
-                    }
-                    TuiEvent::ContextReport(_)
-                    | TuiEvent::UsageReport(_)
-                    | TuiEvent::ContextDump(_)
-                    | TuiEvent::ContextMessages(_)
-                    | TuiEvent::SideModel(_)
-                    | TuiEvent::ContextDumpSaved { .. } => {
-                        // Reports arrive on the context channel; the agent
-                        // channel only carries them if the channels raced.
-                    }
-                    TuiEvent::ReasoningEnd { seconds } => {
-                        app.chat.finish_thinking(seconds);
-                    }
-                    TuiEvent::ToolReading { call_id, reading } => {
-                        app.chat.set_tool_reading(&call_id, reading);
-                    }
-                    TuiEvent::ToolCard { call_id, card } => {
-                        app.chat.set_tool_card(&call_id, card);
-                    }
-                    TuiEvent::ToolEnd { call_id, refused } => {
-                        if refused {
-                            app.chat.set_tool_refused(&call_id);
+                        TuiEvent::ContextReport(_)
+                        | TuiEvent::UsageReport(_)
+                        | TuiEvent::ContextDump(_)
+                        | TuiEvent::ContextMessages(_)
+                        | TuiEvent::SideModel(_)
+                        | TuiEvent::ContextDumpSaved { .. } => {
+                            // Reports arrive on the context channel; the agent
+                            // channel only carries them if the channels raced.
                         }
-                    }
-                    TuiEvent::Hold { reason, .. } => match reason {
-                        HoldReason::Retry { until, retry } => {
-                            let at = until
-                                .to_zoned_datetime(jiff::tz::TimeZone::system())
-                                .strftime("%H:%M:%S")
-                                .to_string();
-                            app.set_persistent_status(format!(
-                                "Provider error — retrying ({retry}) at {at} · esc to cancel"
-                            ));
+                        TuiEvent::ReasoningEnd { seconds } => {
+                            app.finish_thinking(seconds);
                         }
-                        HoldReason::Quota { until } => {
-                            let at = until
-                                .to_zoned_datetime(jiff::tz::TimeZone::system())
-                                .strftime("%b %d, %Y %H:%M %Z")
-                                .to_string();
-                            app.chat.push_notice(&format!(
-                                "Usage limit reached — continuing automatically at {at}"
-                            ));
-                            app.set_persistent_status(format!(
-                                "Usage limit — continuing automatically at {at} · esc to cancel"
-                            ));
+                        TuiEvent::ToolReading { call_id, reading } => {
+                            app.chat.set_tool_reading(&call_id, reading);
                         }
-                        HoldReason::Network => {
-                            app.set_persistent_status(
-                                "Waiting for the network — continuing automatically · esc to cancel"
-                                    .to_string(),
-                            );
+                        TuiEvent::ToolCard { call_id, card } => {
+                            app.chat.set_tool_card(&call_id, card);
                         }
-                    },
-                    TuiEvent::Retract => {
-                        app.retract_response();
-                        assistant_response.clear();
-                    }
-                    TuiEvent::ReplyTranslated { text, language } => {
-                        app.chat.set_translation(text, &language);
-                    }
-                    TuiEvent::Withdrawn { content, own } => {
-                        assistant_response.clear();
-                        app.withdraw_turn(content, own);
-                    }
-                    TuiEvent::Compacted(result) => match result {
-                        Ok(Some(stats)) => {
-                            app.set_status(format!(
-                                "Compacted {} messages",
-                                stats.messages_compacted
-                            ));
+                        TuiEvent::ToolEnd { call_id, refused } => {
+                            if refused {
+                                app.chat.set_tool_refused(&call_id);
+                            }
                         }
-                        Ok(None) => {
-                            app.set_status("Nothing to compact");
+                        TuiEvent::Hold { reason, .. } => match reason {
+                            HoldReason::Retry { until, retry } => {
+                                let at = until
+                                    .to_zoned_datetime(jiff::tz::TimeZone::system())
+                                    .strftime("%H:%M:%S")
+                                    .to_string();
+                                app.set_persistent_status(format!(
+                                    "Provider error — retrying ({retry}) at {at} · esc to cancel"
+                                ));
+                            }
+                            HoldReason::Quota { until } => {
+                                let at = until
+                                    .to_zoned_datetime(jiff::tz::TimeZone::system())
+                                    .strftime("%b %d, %Y %H:%M %Z")
+                                    .to_string();
+                                app.chat.push_notice(&format!(
+                                    "Usage limit reached — continuing automatically at {at}"
+                                ));
+                                app.set_persistent_status(format!(
+                                    "Usage limit — continuing automatically at {at} · esc to cancel"
+                                ));
+                            }
+                            HoldReason::Network => {
+                                app.set_persistent_status(
+                                    "Waiting for the network — continuing automatically · esc to cancel"
+                                        .to_string(),
+                                );
+                            }
+                        },
+                        TuiEvent::Retract => {
+                            app.retract_response();
+                            assistant_response.clear();
                         }
-                        Err(err) => {
-                            app.chat.push_error(&format!("Compaction failed: {err}"));
+                        TuiEvent::ReplyTranslated { text, language } => {
+                            app.chat.set_translation(text, &language);
                         }
-                    },
-                    TuiEvent::Complete => {
-                        runtime_deps
-                            .finish_agent_task(
+                        TuiEvent::Withdrawn { content, own } => {
+                            assistant_response.clear();
+                            app.withdraw_turn(content, own);
+                        }
+                        TuiEvent::Compacted(result) => match result {
+                            Ok(Some(stats)) => {
+                                app.set_status(format!(
+                                    "Compacted {} messages",
+                                    stats.messages_compacted
+                                ));
+                            }
+                            Ok(None) => {
+                                app.set_status("Nothing to compact");
+                            }
+                            Err(err) => {
+                                app.chat.push_error(&format!("Compaction failed: {err}"));
+                            }
+                        },
+                        TuiEvent::Complete => {
+                            runtime_deps.finish_agent_task(
                                 app,
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Completed,
-                            )
-                            .await;
-                    }
-                    TuiEvent::LoopStopped(message) => {
-                        app.chat.push_notice(&message);
-                        runtime_deps
-                            .finish_agent_task(
+                            );
+                        }
+                        TuiEvent::LoopStopped(message) => {
+                            app.chat.push_notice(&message);
+                            runtime_deps.finish_agent_task(
                                 app,
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Cancelled,
-                            )
-                            .await;
-                    }
-                    TuiEvent::Error(err) => {
-                        app.chat.push_error(&err);
-                        runtime_deps
-                            .finish_agent_task(
+                            );
+                        }
+                        TuiEvent::Error(err) => {
+                            app.chat.push_error(&err);
+                            runtime_deps.finish_agent_task(
                                 app,
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Failed,
-                            )
-                            .await;
+                            );
+                        }
                     }
+                    if drained >= MAX_AGENT_DRAIN
+                        || batch_start.elapsed() >= AGENT_DRAIN_BUDGET
+                        || events.backlog() > 0
+                    {
+                        break;
+                    }
+                    current = agent_handle.as_ref().and_then(AgentHandle::try_recv);
                 }
+                phases.event = batch_start.elapsed();
             }
 
             Event::Context(event) => {
+                dirty = true;
+                urgent_draw = true;
                 context_handle = None;
                 match event {
                     Some(TuiEvent::ContextReport(Ok(report))) => {
@@ -1353,62 +1469,108 @@ where
                 }
             }
 
-            Event::Terminal(terminal_event) => {
-                // Interrupt only from plain chat mode — while a popup or
-                // dialog is open, Esc/Ctrl+C belong to that view's own
-                // handler (Esc closes it instead of aborting the agent).
-                if agent_handle.is_some()
-                    && matches!(app.mode, may_agent::tui::AppMode::Chat)
-                    && let AppEvent::Key(key_code, modifiers) = &*terminal_event
-                {
-                    let is_ctrl_c = *key_code == KeyCode::Char('c')
-                        && modifiers.contains(KeyModifiers::CONTROL);
-                    let is_esc = *key_code == KeyCode::Esc;
-                    // Esc while a subagent runs stops just that run; a second
-                    // Esc (or Ctrl+C) still aborts the whole turn.
-                    if is_esc && app.cancel_all_subagents() {
-                        continue;
-                    }
-                    if is_ctrl_c || is_esc {
-                        tracing::info!("Agent interrupted by user");
-                        app.last_esc_at = Some(std::time::Instant::now());
-                        if let Some(handle) = agent_handle.take() {
-                            handle.cancel();
+            Event::Terminal(first_terminal_event) => {
+                let ev_start = std::time::Instant::now();
+                let mut raw_batch = Vec::with_capacity(16);
+                raw_batch.push(*first_terminal_event);
+                events.drain_ready(&mut raw_batch, MAX_TERMINAL_DRAIN);
+                let batch = may_agent::tui::event::coalesce_events(raw_batch);
+                let mut should_quit = false;
+
+                for terminal_event in batch {
+                    match &terminal_event {
+                        AppEvent::Tick => {
+                            let hover_modifier_changed = app.refresh_host_open_modifiers();
+                            let tick_redraw = hover_modifier_changed
+                                || app.processing
+                                || app.index_loading
+                                || app.new_year.animating()
+                                || app.compaction.is_holding()
+                                || (matches!(app.mode, may_agent::tui::AppMode::SessionSelect)
+                                    && app.session_list.iter().any(|session| session.working))
+                                || last_draw.elapsed() >= std::time::Duration::from_secs(1);
+                            if tick_redraw {
+                                dirty = true;
+                            }
                         }
-                        app.status = None;
-                        // Clean up loading/streaming state before adding interrupt message
-                        app.chat.collapse_thinking();
-                        app.chat.end_text();
-                        app.chat.push_text("\n\n[Interrupted]");
-                        app.chat.end_text();
-                        runtime_deps
-                            .finish_agent_task(
+                        AppEvent::Mouse(mouse)
+                            if matches!(
+                                mouse.kind,
+                                MouseEventKind::Moved
+                                    | MouseEventKind::Drag(_)
+                                    | MouseEventKind::ScrollUp
+                                    | MouseEventKind::ScrollDown
+                            ) =>
+                        {
+                            dirty = true;
+                        }
+                        AppEvent::MouseScroll { .. }
+                        | AppEvent::TerminalOutputs(_)
+                        | AppEvent::PipelineStageOutputs(_) => {
+                            dirty = true;
+                        }
+                        _ => {
+                            dirty = true;
+                            urgent_draw = true;
+                        }
+                    }
+
+                    // Interrupt only from plain chat mode — while a popup or
+                    // dialog is open, Esc/Ctrl+C belong to that view's own
+                    // handler (Esc closes it instead of aborting the agent).
+                    if agent_handle.is_some()
+                        && matches!(app.mode, may_agent::tui::AppMode::Chat)
+                        && let AppEvent::Key(key_code, modifiers) = &terminal_event
+                    {
+                        let is_ctrl_c = *key_code == KeyCode::Char('c')
+                            && modifiers.contains(KeyModifiers::CONTROL);
+                        let is_esc = *key_code == KeyCode::Esc;
+                        // Esc while a subagent runs stops just that run; a second
+                        // Esc (or Ctrl+C) still aborts the whole turn.
+                        if is_esc && app.cancel_all_subagents() {
+                            dirty = true;
+                            urgent_draw = true;
+                            continue;
+                        }
+                        if is_ctrl_c || is_esc {
+                            tracing::info!("Agent interrupted by user");
+                            app.last_esc_at = Some(std::time::Instant::now());
+                            if let Some(handle) = agent_handle.take() {
+                                handle.cancel();
+                            }
+                            app.status = None;
+                            // Clean up loading/streaming state before adding interrupt message
+                            app.flush_pending_reasoning();
+                            app.chat.collapse_thinking();
+                            app.chat.end_text();
+                            app.chat.push_text("\n\n[Interrupted]");
+                            app.chat.end_text();
+                            runtime_deps.finish_agent_task(
                                 app,
                                 &mut agent_handle,
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Cancelled,
-                            )
-                            .await;
-                        continue;
+                            );
+                            dirty = true;
+                            urgent_draw = true;
+                            continue;
+                        }
                     }
-                }
 
-                if let AppEvent::SessionDeleted {
-                    deleted: Some(session_id),
-                    ..
-                } = &*terminal_event
-                {
-                    runtime_deps.evict_session(session_id);
-                }
+                    if let AppEvent::SessionDeleted {
+                        deleted: Some(session_id),
+                        ..
+                    } = &terminal_event
+                    {
+                        runtime_deps.evict_session(session_id);
+                    }
 
-                // Handle normal terminal events
-                let ev_start = std::time::Instant::now();
-                // The handler boundary: a failed request or session operation
-                // while handling this event is reported in the chat by
-                // `App::settle`; it never leaves the loop.
-                let dispatched = async {
-                match app.handle_event(*terminal_event)? {
+                    // The handler boundary: a failed request or session operation
+                    // while handling this event is reported in the chat by
+                    // `App::settle`; it never leaves the loop.
+                    let dispatched = async {
+                    match app.handle_event(terminal_event)? {
                     Some(SendAction::Quit) => {
                         agent_left_running = agent_handle.is_some() || app.agent_working();
                         return Ok(LoopFlow::Quit);
@@ -1663,7 +1825,7 @@ where
                         }
                     }
                     Some(SendAction::ReloadHistory) => {
-                        app.reload_chat().await;
+                        app.spawn_reload_chat();
                     }
                     Some(SendAction::DesktopNotification(notification)) => {
                         // The terminal write stays off the event loop; a
@@ -2453,10 +2615,15 @@ where
                 Ok::<LoopFlow, anyhow::Error>(LoopFlow::Continue)
                 }
                 .await;
-                if app.settle(dispatched) == Some(LoopFlow::Quit) {
-                    break;
+                    if app.settle(dispatched) == Some(LoopFlow::Quit) {
+                        should_quit = true;
+                        break;
+                    }
                 }
                 phases.event = ev_start.elapsed();
+                if should_quit {
+                    break;
+                }
             }
         }
 
@@ -2494,7 +2661,7 @@ where
 }
 
 /// Run the GitHub Copilot OAuth device flow.
-async fn run_copilot_auth<B: Backend>(
+async fn run_copilot_auth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2506,7 +2673,7 @@ where
     use may_agent::copilot::save_copilot_token;
 
     app.start_copilot_auth();
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     let device_code = match auth::request_device_code().await {
         Ok(dc) => dc,
@@ -2522,7 +2689,7 @@ where
         device_code.user_code.clone(),
         device_code.verification_uri.clone(),
     );
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     let poll_interval = std::time::Duration::from_secs(device_code.interval.max(5));
 
@@ -2550,7 +2717,7 @@ where
                     if !matches!(app.mode, may_agent::tui::AppMode::CopilotAuth) {
                         return Ok(());
                     }
-                    terminal.draw(|frame| ui::render(frame, app))?;
+                    draw_frame(terminal, app)?;
                 }
                 Ok(None) => return Ok(()),
                 Err(_) => {}
@@ -2594,7 +2761,7 @@ where
                 return Ok(());
             }
             Err(aither_copilot::CopilotError::AuthorizationPending) => {
-                terminal.draw(|frame| ui::render(frame, app))?;
+                draw_frame(terminal, app)?;
             }
             Err(e) => {
                 app.copilot_auth_failed(e.to_string());
@@ -2659,7 +2826,7 @@ async fn run_forge_logout(app: &mut App, host: String) -> anyhow::Result<()> {
 
 /// Run a forge host's OAuth device flow: start it, show the device code in
 /// the forge screen, and poll until the user authorizes or closes it.
-async fn run_forge_oauth<B: Backend>(
+async fn run_forge_oauth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2707,7 +2874,7 @@ where
             .unwrap_or_else(|| device.verification_uri.clone()),
         status: "pending".to_string(),
     });
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
     let mut interval = std::time::Duration::from_secs(device.interval_secs.max(1));
     loop {
         let event = tokio::select! {
@@ -2721,7 +2888,7 @@ where
             if !matches!(app.mode, may_agent::tui::AppMode::ForgeAuth) {
                 return Ok(());
             }
-            terminal.draw(|frame| ui::render(frame, app))?;
+            draw_frame(terminal, app)?;
             continue;
         }
         match client
@@ -2759,7 +2926,7 @@ where
                 return Ok(());
             }
         }
-        terminal.draw(|frame| ui::render(frame, app))?;
+        draw_frame(terminal, app)?;
     }
 }
 
@@ -2768,7 +2935,7 @@ where
 /// Uses the PKCE browser loopback on localhost:1455. Over SSH (where the
 /// redirect cannot reach this machine) or when the listener fails to bind,
 /// falls back to `OpenAI`'s device-authorization flow.
-async fn run_chatgpt_auth<B: Backend>(
+async fn run_chatgpt_auth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2779,7 +2946,7 @@ where
     use aither_codex::auth;
 
     app.start_chatgpt_auth();
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     let over_ssh =
         std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
@@ -2790,7 +2957,7 @@ where
     let pkce = auth::Pkce::generate();
     let url = pkce.authorize_url();
     app.set_chatgpt_auth_url(url.clone());
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
     open_url_in_background(url, None);
 
     let listener = auth::listen_for_callback(pkce.state());
@@ -2822,7 +2989,7 @@ where
                     if !matches!(app.mode, may_agent::tui::AppMode::ChatgptAuth) {
                         return Ok(());
                     }
-                    terminal.draw(|frame| ui::render(frame, app))?;
+                    draw_frame(terminal, app)?;
                 }
                 None => return Ok(()),
             }
@@ -2842,7 +3009,7 @@ where
 }
 
 /// Device-authorization variant of the `ChatGPT` OAuth flow.
-async fn run_chatgpt_device_auth<B: Backend>(
+async fn run_chatgpt_device_auth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2865,7 +3032,7 @@ where
         device.user_code.clone(),
         aither_codex::constant::DEVICE_VERIFICATION_URL.to_string(),
     );
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     let poll_interval = std::time::Duration::from_secs(
         device
@@ -2895,7 +3062,7 @@ where
                     if !matches!(app.mode, may_agent::tui::AppMode::ChatgptAuth) {
                         return Ok(());
                     }
-                    terminal.draw(|frame| ui::render(frame, app))?;
+                    draw_frame(terminal, app)?;
                 }
                 Ok(None) => return Ok(()),
                 Err(_) => {}
@@ -2905,7 +3072,7 @@ where
         match auth::poll_device_code(&device.device_auth_id, &device.user_code).await {
             Ok(result) => break result,
             Err(aither_codex::CodexError::AuthorizationPending) => {
-                terminal.draw(|frame| ui::render(frame, app))?;
+                draw_frame(terminal, app)?;
             }
             Err(e) => {
                 app.chatgpt_auth_failed(e.to_string());
@@ -2929,7 +3096,7 @@ where
 }
 
 /// Persist credentials and register the `chatgpt` provider after OAuth success.
-async fn finish_chatgpt_auth<B: Backend>(
+async fn finish_chatgpt_auth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2961,7 +3128,7 @@ where
 }
 
 /// Wait for the user to dismiss the auth result screen.
-async fn wait_for_auth_dismiss<B: Backend>(
+async fn wait_for_auth_dismiss<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2970,7 +3137,7 @@ async fn wait_for_auth_dismiss<B: Backend>(
 where
     B::Error: Send + Sync + 'static,
 {
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     loop {
         if let Some(event) = events.next().await {
@@ -2979,14 +3146,14 @@ where
                 break;
             }
         }
-        terminal.draw(|frame| ui::render(frame, app))?;
+        draw_frame(terminal, app)?;
     }
 
     Ok(())
 }
 
 /// Run the xAI Grok subscription OAuth flow (device authorization).
-async fn run_grok_auth<B: Backend>(
+async fn run_grok_auth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -2997,7 +3164,7 @@ where
     use may_agent::grok::{self, GrokAuthError};
 
     app.start_grok_auth();
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     macro_rules! fail {
         ($error:expr) => {{
@@ -3021,7 +3188,7 @@ where
         .clone()
         .unwrap_or_else(|| device.verification_uri.clone());
     app.set_grok_device_code(device.user_code.clone(), url);
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     let credentials = loop {
         let deadline = tokio::time::Instant::now() + device.interval;
@@ -3046,7 +3213,7 @@ where
                     if !matches!(app.mode, may_agent::tui::AppMode::GrokAuth) {
                         return Ok(());
                     }
-                    terminal.draw(|frame| ui::render(frame, app))?;
+                    draw_frame(terminal, app)?;
                 }
                 Ok(None) => return Ok(()),
                 Err(_) => {}
@@ -3059,7 +3226,7 @@ where
                 break credentials;
             }
             Err(GrokAuthError::AuthorizationPending) => {
-                terminal.draw(|frame| ui::render(frame, app))?;
+                draw_frame(terminal, app)?;
             }
             Err(e) => fail!(e.to_string()),
         }
@@ -3091,7 +3258,7 @@ where
 /// this machine — or when the listener fails to bind, the screen switches to
 /// manual entry: the pasted redirect URL or code goes through the same
 /// exchange, and a pasted `sk-or-` key is validated directly.
-async fn run_openrouter_auth<B: Backend>(
+async fn run_openrouter_auth<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -3102,7 +3269,7 @@ where
     use may_agent::openrouter;
 
     app.start_openrouter_auth();
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
 
     let pkce = openrouter::Pkce::generate();
     let url = pkce.authorize_url();
@@ -3115,7 +3282,7 @@ where
     }
 
     app.set_openrouter_auth_url(url.clone());
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
     open_url_in_background(url.clone(), None);
 
     let listener = openrouter::listen_for_callback();
@@ -3147,7 +3314,7 @@ where
                     if !matches!(app.mode, may_agent::tui::AppMode::OpenrouterAuth) {
                         return Ok(());
                     }
-                    terminal.draw(|frame| ui::render(frame, app))?;
+                    draw_frame(terminal, app)?;
                 }
                 None => return Ok(()),
             }
@@ -3159,7 +3326,7 @@ where
 
 /// Manual-entry variant of the `OpenRouter` login: wait for the pasted text
 /// and resolve it — `sk-or-` key, callback URL, or bare code.
-async fn run_openrouter_manual<B: Backend>(
+async fn run_openrouter_manual<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -3184,7 +3351,7 @@ where
         }};
     }
 
-    terminal.draw(|frame| ui::render(frame, app))?;
+    draw_frame(terminal, app)?;
     loop {
         let Some(event) = events.next().await else {
             return Ok(());
@@ -3223,12 +3390,12 @@ where
         if !matches!(app.mode, may_agent::tui::AppMode::OpenrouterAuth) {
             return Ok(());
         }
-        terminal.draw(|frame| ui::render(frame, app))?;
+        draw_frame(terminal, app)?;
     }
 }
 
 /// Exchange a callback code for the `OpenRouter` API key and persist it.
-async fn finish_openrouter_code<B: Backend>(
+async fn finish_openrouter_code<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
@@ -3255,7 +3422,7 @@ where
 }
 
 /// Register the `openrouter` provider with its `sk-or-` API key.
-async fn finish_openrouter_key<B: Backend>(
+async fn finish_openrouter_key<B: Backend + io::Write>(
     app: &mut App,
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,

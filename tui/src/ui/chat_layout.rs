@@ -20,8 +20,9 @@ use std::sync::OnceLock;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr;
 
 use super::chat::{
@@ -38,14 +39,62 @@ const REUSE_LOOKAHEAD: usize = 4;
 
 /// Wrapped row count of `line` at `width`, exactly as the chat draws it
 /// (see [`wrap`]).
+#[cfg(test)]
 pub(super) fn line_rows(line: &Line<'_>, width: u16) -> usize {
     wrap::line_rows(line, width)
 }
 
 /// Plain text of each wrapped row of `lines`, read back from a scratch
 /// render so it matches the screen cell for cell (wide graphemes included).
+#[cfg(test)]
 pub(super) fn plain_rows(lines: &[Line<'_>], width: u16, rows: usize) -> Vec<String> {
     scratch(lines, width, rows).plain
+}
+
+/// Borrow `line`'s spans without cloning their backing strings.
+pub(super) fn borrow_line<'a>(line: &'a Line<'_>) -> Line<'a> {
+    let mut out = Line::from(
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.content.as_ref(), span.style))
+            .collect::<Vec<_>>(),
+    )
+    .style(line.style);
+    out.alignment = line.alignment;
+    out
+}
+
+/// Cached wrapped representation of one logical line in [`Entry::lines`].
+///
+/// Most transcript lines fit inside the column width and need no extra copy;
+/// only overflowing lines store their pre-wrapped rows.
+#[derive(Debug)]
+enum WrappedLine {
+    /// Fits within `width` as-is (one visual row equal to `Entry::lines[i]`).
+    Single,
+    /// Pre-wrapped visual rows (or empty when `width == 0`).
+    Multi(Vec<Line<'static>>),
+}
+
+impl WrappedLine {
+    const fn rows(&self) -> usize {
+        match self {
+            Self::Single => 1,
+            Self::Multi(rows) => rows.len(),
+        }
+    }
+}
+
+fn wrap_entry_line(line: &Line<'_>, width: u16) -> (WrappedLine, usize) {
+    if width == 0 {
+        return (WrappedLine::Multi(Vec::new()), 0);
+    }
+    if line.width() <= usize::from(width) {
+        return (WrappedLine::Single, 1);
+    }
+    let rows = wrap::wrap_line(line, width);
+    let count = rows.len();
+    (WrappedLine::Multi(rows), count)
 }
 
 /// What a scratch render of an element reveals.
@@ -56,14 +105,16 @@ struct Scratch {
     runs: Vec<LinkRun>,
 }
 
-fn scratch(lines: &[Line<'_>], width: u16, rows: usize) -> Scratch {
+fn scratch_wrapped(wrapped: &[Line<'_>], width: u16) -> Scratch {
+    let rows = wrapped.len();
     if width == 0 || rows == 0 {
         return Scratch::default();
     }
     let height = u16::try_from(rows).unwrap_or(u16::MAX);
     let area = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(area);
-    Paragraph::new(wrap::wrap_lines(lines, width)).render(area, &mut buf);
+    let borrowed: Vec<Line<'_>> = wrapped.iter().map(borrow_line).collect();
+    Paragraph::new(borrowed).render(area, &mut buf);
     let mut out = Vec::with_capacity(rows);
     let mut runs = Vec::new();
     for y in 0..height {
@@ -82,6 +133,13 @@ fn scratch(lines: &[Line<'_>], width: u16, rows: usize) -> Scratch {
     Scratch { plain: out, runs }
 }
 
+fn scratch(lines: &[Line<'_>], width: u16, rows: usize) -> Scratch {
+    if width == 0 || rows == 0 {
+        return Scratch::default();
+    }
+    scratch_wrapped(&wrap::wrap_lines(lines, width), width)
+}
+
 /// A pipeline stage's cells on one wrapped row of a scratch render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StageCellRun {
@@ -90,6 +148,8 @@ struct StageCellRun {
     width: u16,
     target_idx: usize,
     text: String,
+    grapheme_offset: usize,
+    total_graphemes: usize,
 }
 
 fn scan_stage_runs(
@@ -105,15 +165,15 @@ fn scan_stage_runs(
         let Some(&base_row) = line_starts.get(*line_idx) else {
             continue;
         };
-        let rows = line_rows(tagged_line, width);
+        let wrapped = wrap::wrap_line(tagged_line, width);
+        let rows = wrapped.len();
         if rows == 0 {
             continue;
         }
         let height = u16::try_from(rows).unwrap_or(u16::MAX);
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        Paragraph::new(wrap::wrap_lines(std::slice::from_ref(tagged_line), width))
-            .render(area, &mut buf);
+        Paragraph::new(wrapped).render(area, &mut buf);
         for y in 0..height {
             let mut row_runs: Vec<StageCellRun> = Vec::new();
             let mut x = 0u16;
@@ -132,6 +192,8 @@ fn scan_stage_runs(
                             width: step,
                             target_idx,
                             text: String::new(),
+                            grapheme_offset: 0,
+                            total_graphemes: 0,
                         }),
                     }
                 }
@@ -150,6 +212,17 @@ fn scan_stage_runs(
             runs.extend(row_runs);
         }
     }
+    let max_target = runs.iter().map(|run| run.target_idx).max();
+    if let Some(max_target) = max_target {
+        let mut counts = vec![0usize; max_target + 1];
+        for run in &mut runs {
+            run.grapheme_offset = counts[run.target_idx];
+            counts[run.target_idx] += run.text.graphemes(true).count();
+        }
+        for run in &mut runs {
+            run.total_graphemes = counts[run.target_idx];
+        }
+    }
     runs
 }
 
@@ -159,9 +232,14 @@ struct Entry {
     revision: u64,
     state: ElementState,
     lines: Vec<Line<'static>>,
+    /// Cached wrapped rows parallel to `lines` at the layout's current width.
+    wrapped: Vec<WrappedLine>,
     /// Row offset of each line within the entry.
     line_starts: Vec<usize>,
     rows: usize,
+    /// Local wrapped row indices carrying a running tool call's spinner cell
+    /// (column 2), patched directly into the terminal buffer each frame.
+    spinner_rows: Vec<usize>,
     /// `(key, row within the entry, caption)` of each reserved image block.
     images: Vec<(String, usize, String)>,
     /// Collapsible id a click on this entry toggles, with its active row span.
@@ -173,6 +251,9 @@ struct Entry {
     /// Interactive pipeline stage targets and their wrapped cell runs.
     stage_targets: Vec<StageTarget>,
     stage_runs: Vec<StageCellRun>,
+    /// True when at least one `stage_targets` entry is an actively running
+    /// pipeline stage requiring per-frame sweep highlighting.
+    has_active_stage: bool,
     /// The images are markdown references the TUI fetches itself.
     markdown_images: bool,
     /// Link targets, indexed by the markers of `marked`.
@@ -225,12 +306,20 @@ impl Entry {
         tilde_root: Option<&std::path::Path>,
     ) -> Self {
         let laid = element_lines(elem, state, images_supported, assets, width);
+        let mut wrapped = Vec::with_capacity(laid.lines.len());
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;
         for line in &laid.lines {
             line_starts.push(rows);
-            rows += line_rows(line, width);
+            let (wrapped_line, count) = wrap_entry_line(line, width);
+            wrapped.push(wrapped_line);
+            rows += count;
         }
+        let spinner_rows = laid
+            .spinner_lines
+            .into_iter()
+            .filter_map(|index| line_starts.get(index).copied())
+            .collect();
         let images = laid
             .images
             .into_iter()
@@ -243,7 +332,7 @@ impl Entry {
         let collapsible_key = collapsible_id(elem).map(str::to_string);
         let region_row_span = |start: usize, end: usize| {
             let last = end - 1;
-            let past = line_starts[last] + line_rows(&laid.lines[last], width);
+            let past = line_starts[last] + wrapped[last].rows();
             (line_starts[start], past)
         };
         let collapsible = collapsible_key.as_ref().map(|id| {
@@ -270,17 +359,21 @@ impl Entry {
             })
             .collect();
         let stage_runs = scan_stage_runs(&laid.stage_lines, &line_starts, width);
+        let has_active_stage = laid.stage_targets.iter().any(|target| target.active);
         let entry = Self {
             revision,
             state,
             lines: laid.lines,
+            wrapped,
             line_starts,
             rows,
+            spinner_rows,
             images,
             collapsible,
             sub_regions,
             stage_targets: laid.stage_targets,
             stage_runs,
+            has_active_stage,
             markdown_images: matches!(
                 elem,
                 ChatElement::AssistantText { .. } | ChatElement::WorkedFor { .. }
@@ -337,6 +430,7 @@ impl Entry {
 
         let settled = stream.settled;
         entry.lines.truncate(settled.lines);
+        entry.wrapped.truncate(settled.lines);
         entry.line_starts.truncate(settled.lines);
         entry.rows = settled.rows;
         entry.images.truncate(settled.images);
@@ -387,13 +481,16 @@ impl Entry {
             revision,
             state,
             lines: Vec::new(),
+            wrapped: Vec::new(),
             line_starts: Vec::new(),
             rows: 0,
+            spinner_rows: Vec::new(),
             images: Vec::new(),
             collapsible: collapsible_id(elem).map(|id| (id.to_string(), 0, 0)),
             sub_regions: Vec::new(),
             stage_targets: Vec::new(),
             stage_runs: Vec::new(),
+            has_active_stage: false,
             markdown_images: true,
             link_targets: Vec::new(),
             marked: None,
@@ -413,18 +510,19 @@ impl Entry {
         tilde_root: Option<&std::path::Path>,
         mirror: &mut Scratch,
     ) {
-        let rows = line_rows(&line, width);
+        let (wrapped_line, rows) = wrap_entry_line(&line, width);
         let first =
             u32::try_from(self.link_targets.len()).expect("link count fits the marker space");
         let marked = links::mark_line(&line, first, tilde_root);
-        let drawn = scratch(
-            std::slice::from_ref(marked.as_ref().map_or(&line, |(marked, _)| marked)),
-            width,
-            rows,
-        );
-        if let Some((_, targets)) = marked {
+        let drawn = if let Some((marked_line, targets)) = marked {
             self.link_targets.extend(targets);
-        }
+            scratch(std::slice::from_ref(&marked_line), width, rows)
+        } else {
+            match &wrapped_line {
+                WrappedLine::Single => scratch_wrapped(std::slice::from_ref(&line), width),
+                WrappedLine::Multi(wrapped_rows) => scratch_wrapped(wrapped_rows, width),
+            }
+        };
         mirror.plain.extend(drawn.plain);
         let offset = self.rows;
         mirror
@@ -436,6 +534,7 @@ impl Entry {
         self.line_starts.push(self.rows);
         self.rows += rows;
         self.lines.push(line);
+        self.wrapped.push(wrapped_line);
     }
 
     /// Anchor an image at line `index`, among the lines pushed so far.
@@ -453,10 +552,20 @@ impl Entry {
 
     fn scratch(&self, width: u16) -> &Scratch {
         self.scratch.get_or_init(|| {
-            scratch(
-                self.marked.as_deref().unwrap_or(&self.lines),
-                width,
-                self.rows,
+            self.marked.as_deref().map_or_else(
+                || {
+                    let mut rows = Vec::with_capacity(self.rows);
+                    for (line, wrapped) in self.lines.iter().zip(&self.wrapped) {
+                        match wrapped {
+                            WrappedLine::Single => rows.push(borrow_line(line)),
+                            WrappedLine::Multi(multi) => {
+                                rows.extend(multi.iter().map(borrow_line));
+                            }
+                        }
+                    }
+                    scratch_wrapped(&rows, width)
+                },
+                |marked| scratch(marked, width, self.rows),
             )
         })
     }
@@ -496,8 +605,13 @@ pub struct ChatLayout {
     offsets: Vec<usize>,
     /// Rows of all entries together.
     element_rows: usize,
-    /// Plain rows of the tail (queue, input, status) drawn last frame.
-    tail_plain: Vec<String>,
+    /// Wrapped rows of the tail (queue, input, status) drawn last frame; used
+    /// to materialize `tail_plain` lazily on first selection/click read.
+    tail_wrapped: Vec<Line<'static>>,
+    /// Number of wrapped tail rows drawn last frame.
+    tail_rows: usize,
+    /// Lazily materialized plain rows of the tail drawn last frame.
+    tail_plain: OnceLock<Vec<String>>,
     /// Doc-row span of the composer input last frame — click-to-caret
     /// hit testing. `None` when no input was drawn.
     input_span: Option<(usize, usize)>,
@@ -525,7 +639,6 @@ impl ChatLayout {
         images_supported: bool,
         hide_todos: bool,
         selected_tool: Option<&str>,
-        spinner_frame: usize,
         sandbox_dir: Option<&std::path::Path>,
     ) {
         let old_len = self.entries.len();
@@ -535,13 +648,16 @@ impl ChatLayout {
             || sandbox_dir != self.sandbox_dir.as_deref();
         if cleared {
             self.entries.clear();
+            self.tail_wrapped.clear();
+            self.tail_rows = 0;
+            self.tail_plain = OnceLock::new();
             self.width = width;
             self.images_supported = images_supported;
             self.hide_todos = hide_todos;
             self.sandbox_dir = sandbox_dir.map(std::path::Path::to_path_buf);
         }
 
-        let user_home = dirs::home_dir();
+        let user_home = crate::home_dir();
         let elements = chat.active_elements();
         let mut old = std::mem::take(&mut self.entries)
             .into_iter()
@@ -552,7 +668,7 @@ impl ChatLayout {
         self.rebuilt = 0;
         for (index, elem) in elements.iter().enumerate() {
             let revision = chat.revision(index);
-            let state = ElementState::of(elem, selected_tool, hide_todos, spinner_frame);
+            let state = ElementState::of(elem, selected_tool, hide_todos);
             let end = old.len().min(cursor + REUSE_LOOKAHEAD);
             let found = (cursor..end).find(|&i| {
                 old[i]
@@ -566,7 +682,7 @@ impl ChatLayout {
             let entry = reused.unwrap_or_else(|| {
                 self.rebuilt += 1;
                 let tilde_root = if matches!(elem, ChatElement::UserMessage { .. }) {
-                    user_home.as_deref()
+                    user_home
                 } else {
                     sandbox_dir
                 };
@@ -692,18 +808,111 @@ impl ChatLayout {
         (out, skip)
     }
 
+    /// Pre-wrapped element rows covering document rows `[top, top + height)`
+    /// (elements only), borrowing cached rows with zero per-frame re-wrapping.
+    #[must_use]
+    pub(super) fn visible_wrapped_lines(&self, top: usize, height: usize) -> Vec<Line<'_>> {
+        let mut out = Vec::new();
+        if top >= self.element_rows || height == 0 {
+            return out;
+        }
+        let bottom = top.saturating_add(height);
+        let first = self.entry_at(top);
+        for (index, entry) in self.entries.iter().enumerate().skip(first) {
+            let start = self.offsets[index];
+            if start >= bottom {
+                break;
+            }
+            let first_line = if index == first {
+                entry.line_at(top - start)
+            } else {
+                0
+            };
+            for line_index in first_line..entry.lines.len() {
+                let line_row = start + entry.line_starts[line_index];
+                if line_row >= bottom {
+                    break;
+                }
+                match &entry.wrapped[line_index] {
+                    WrappedLine::Single => {
+                        if line_row >= top {
+                            out.push(borrow_line(&entry.lines[line_index]));
+                        }
+                    }
+                    WrappedLine::Multi(rows) => {
+                        let skip = top.saturating_sub(line_row);
+                        let take = (bottom - line_row).saturating_sub(skip);
+                        for row in rows.iter().skip(skip).take(take) {
+                            out.push(borrow_line(row));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Patch the single animated spinner cell on visible running tool-call
+    /// headers directly into `buf` so 20 Hz spinner ticks never rebuild
+    /// cached entries.
+    pub(super) fn patch_running_spinners(
+        &self,
+        buf: &mut Buffer,
+        top: usize,
+        height: usize,
+        area: Rect,
+        spinner_frame: usize,
+    ) {
+        if self.entries.is_empty() || top >= self.element_rows || area.width < 3 {
+            return;
+        }
+        let x = area.x + 2;
+        if x >= area.right() || x >= buf.area.right() {
+            return;
+        }
+        let bottom = top.saturating_add(height);
+        let glyph = super::chat::spinner_glyph(spinner_frame);
+        let mut utf8 = [0u8; 4];
+        let symbol = glyph.encode_utf8(&mut utf8);
+        for (index, entry) in self.entries.iter().enumerate().skip(self.entry_at(top)) {
+            let start = self.offsets[index];
+            if start >= bottom {
+                break;
+            }
+            if entry.spinner_rows.is_empty() {
+                continue;
+            }
+            for &local_row in &entry.spinner_rows {
+                let row = start + local_row;
+                if row < top || row >= bottom {
+                    continue;
+                }
+                let y = area.y + u16::try_from(self.top_padding + row - top).unwrap_or(u16::MAX);
+                if y < area.bottom() && y < buf.area.bottom() {
+                    buf[(x, y)].set_symbol(symbol);
+                }
+            }
+        }
+    }
+
     /// Doc-row ranges of the user messages overlapping `[top, top +
     /// height)` — the shaded rows that draw the band background (excluding
     /// the trailing unshaded separator row).
     #[must_use]
     pub fn user_rows_in(&self, top: usize, height: usize) -> Vec<(usize, usize)> {
-        let bottom = top.saturating_add(height);
         let mut out = Vec::new();
-        for (index, entry) in self.entries.iter().enumerate() {
+        if self.entries.is_empty() || top >= self.element_rows || height == 0 {
+            return out;
+        }
+        let bottom = top.saturating_add(height);
+        for (index, entry) in self.entries.iter().enumerate().skip(self.entry_at(top)) {
+            let start = self.offsets[index];
+            if start >= bottom {
+                break;
+            }
             if !entry.user {
                 continue;
             }
-            let start = self.offsets[index];
             let end = start + entry.rows.saturating_sub(1);
             if end > top && start < bottom {
                 out.push((start.max(top), end.min(bottom)));
@@ -741,9 +950,23 @@ impl ChatLayout {
         out
     }
 
+    /// Record the pre-wrapped rows of the tail drawn below the elements.
+    ///
+    /// The plain-text mirror is materialized lazily on first selection/click
+    /// lookup and reused across frames whose tail did not change.
+    pub(super) fn set_tail_wrapped(&mut self, rows: Vec<Line<'static>>) {
+        self.tail_rows = rows.len();
+        if self.tail_wrapped != rows {
+            self.tail_wrapped = rows;
+            self.tail_plain = OnceLock::new();
+        }
+    }
+
     /// Record the plain rows of the tail drawn below the elements.
     pub fn set_tail_plain(&mut self, rows: Vec<String>) {
-        self.tail_plain = rows;
+        self.tail_wrapped.clear();
+        self.tail_rows = rows.len();
+        self.tail_plain = OnceLock::from(rows);
     }
 
     /// Record the blank rows drawn above underflowing content.
@@ -783,17 +1006,17 @@ impl ChatLayout {
     /// Rows of the plain-text mirror: elements, then the tail.
     #[must_use]
     pub const fn plain_len(&self) -> usize {
-        self.element_rows + self.tail_plain.len()
+        self.element_rows + self.tail_rows
     }
 
     /// Plain text of document row `row`, exactly as drawn.
     #[must_use]
     pub fn plain_line(&self, row: usize) -> Option<&str> {
         if row >= self.element_rows {
-            return self
+            let plain = self
                 .tail_plain
-                .get(row - self.element_rows)
-                .map(String::as_str);
+                .get_or_init(|| scratch_wrapped(&self.tail_wrapped, self.width).plain);
+            return plain.get(row - self.element_rows).map(String::as_str);
         }
         let index = self.entry_at(row);
         let entry = self.entries.get(index)?;
@@ -816,6 +1039,9 @@ impl ChatLayout {
             let start = self.offsets[index];
             if start >= bottom {
                 break;
+            }
+            if entry.link_targets.is_empty() {
+                continue;
             }
             for run in &entry.scratch(self.width).runs {
                 let row = start + run.row;
@@ -850,6 +1076,9 @@ impl ChatLayout {
         }
         let index = self.entry_at(row);
         let entry = self.entries.get(index)?;
+        if entry.link_targets.is_empty() {
+            return None;
+        }
         let local = row - self.offsets[index];
         entry
             .scratch(self.width)
@@ -869,6 +1098,28 @@ impl ChatLayout {
     /// `[top, top + height)`, placed on screen inside `area`.
     #[must_use]
     pub fn stage_runs(&self, top: usize, height: usize, area: Rect) -> Vec<ScreenStageRun> {
+        self.collect_stage_runs(top, height, area, false)
+    }
+
+    /// Active running pipeline stage cells overlapping `[top, top + height)`,
+    /// skipping entries with no active stage to avoid per-frame allocations.
+    #[must_use]
+    pub(super) fn active_stage_runs(
+        &self,
+        top: usize,
+        height: usize,
+        area: Rect,
+    ) -> Vec<ScreenStageRun> {
+        self.collect_stage_runs(top, height, area, true)
+    }
+
+    fn collect_stage_runs(
+        &self,
+        top: usize,
+        height: usize,
+        area: Rect,
+        active_only: bool,
+    ) -> Vec<ScreenStageRun> {
         let bottom = top.saturating_add(height);
         let mut out = Vec::new();
         if self.entries.is_empty() || top >= self.element_rows {
@@ -879,6 +1130,9 @@ impl ChatLayout {
             if start >= bottom {
                 break;
             }
+            if entry.stage_runs.is_empty() || (active_only && !entry.has_active_stage) {
+                continue;
+            }
             for run in &entry.stage_runs {
                 let row = start + run.row;
                 if row < top || row >= bottom {
@@ -887,6 +1141,9 @@ impl ChatLayout {
                 let Some(target) = entry.stage_targets.get(run.target_idx) else {
                     continue;
                 };
+                if active_only && !target.active {
+                    continue;
+                }
                 let y = self.top_padding + row - top;
                 out.push(ScreenStageRun {
                     x: area.x + run.col,
@@ -896,6 +1153,9 @@ impl ChatLayout {
                     entry: index,
                     step: target.step,
                     clickable: target.clickable,
+                    active: target.active,
+                    grapheme_offset: run.grapheme_offset,
+                    total_graphemes: run.total_graphemes,
                 });
             }
         }
@@ -978,7 +1238,7 @@ mod tests {
         sandbox_dir: Option<&std::path::Path>,
     ) -> ChatLayout {
         let mut layout = ChatLayout::default();
-        layout.sync(chat, width, false, false, None, 0, sandbox_dir);
+        layout.sync(chat, width, false, false, None, sandbox_dir);
         layout
     }
 
@@ -1119,7 +1379,7 @@ mod tests {
         // Switching sessions re-resolves cached entries to the new sandbox_dir.
         let mut switched = layout;
         let next_sandbox = std::path::Path::new("/tmp/may-session-2");
-        switched.sync(&chat, 120, false, false, None, 0, Some(next_sandbox));
+        switched.sync(&chat, 120, false, false, None, Some(next_sandbox));
         let switched_uris: std::collections::BTreeSet<String> = hits(&switched, 120)
             .into_iter()
             .map(|(.., hit)| hit.uri)
@@ -1228,7 +1488,7 @@ fn main() { println!(\"안녕\"); }\n\
         let full = Entry::build(
             elem,
             chat.revision(index),
-            ElementState::of(elem, None, false, 0),
+            ElementState::of(elem, None, false),
             width,
             images_supported,
             chat.assets(),
@@ -1266,7 +1526,7 @@ fn main() { println!(\"안녕\"); }\n\
                 let mut layout = ChatLayout::default();
                 for pair in cuts(STREAMED_REPLY, size).windows(2) {
                     chat.push_text(&STREAMED_REPLY[pair[0]..pair[1]]);
-                    layout.sync(&chat, WIDTH, images_supported, false, None, 0, None);
+                    layout.sync(&chat, WIDTH, images_supported, false, None, None);
                     assert_matches_one_pass(&layout, &chat, WIDTH, images_supported);
                 }
                 let shown: String = layout.entries[0].plain(WIDTH).concat();
@@ -1306,7 +1566,7 @@ fn main() { println!(\"안녕\"); }\n\
         let mut last = 0;
         for (index, pair) in bounds.windows(2).enumerate() {
             chat.push_text(&reply[pair[0]..pair[1]]);
-            layout.sync(&chat, WIDTH, false, false, None, 0, None);
+            layout.sync(&chat, WIDTH, false, false, None, None);
             frames += 1;
             let wrapped = wrapped_lines(&layout) - last;
             last = wrapped_lines(&layout);
@@ -1326,5 +1586,111 @@ fn main() { println!(\"안녕\"); }\n\
             total <= lines_in_reply + 2 + frames * FRAME_LINES,
             "{total} lines wrapped for {lines_in_reply} lines in {frames} frames"
         );
+    }
+
+    #[test]
+    fn link_runs_and_link_at_skip_scratch_when_entry_has_no_links() {
+        let mut chat = ChatStream::new();
+        chat.push_user("plain message without any urls", Vec::new(), 0);
+        chat.push_text("Just ordinary prose — 中文 日本語 한국어.");
+        chat.end_text();
+
+        let layout = layout_of(&chat, 80);
+        assert_eq!(layout.entries.len(), 2);
+        assert!(layout.entries.iter().all(|e| e.link_targets.is_empty()));
+        assert!(layout.entries.iter().all(|e| e.scratch.get().is_none()));
+
+        let runs = layout.link_runs(0, layout.element_rows(), Rect::new(0, 0, 80, 20));
+        assert!(runs.is_empty());
+        for row in 0..layout.element_rows() {
+            assert!(layout.link_at(row, 4).is_none());
+        }
+        assert!(
+            layout.entries.iter().all(|e| e.scratch.get().is_none()),
+            "link_runs and link_at must not allocate scratch buffers for link-less entries"
+        );
+    }
+
+    #[test]
+    fn running_tool_spinner_ticks_do_not_rebuild_entry() {
+        use crate::ui::chat::{ToolDisplay, ToolStatus, UnifiedRenderContext, render_unified};
+        use aither_sandbox::{Interpreter, SandboxMode};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "call:spin".to_string(),
+            ToolDisplay::Terminal {
+                description: "Build workspace".to_string(),
+                command: "cargo check --workspace".to_string(),
+                mode: SandboxMode::Sandboxed,
+                location: None,
+                interpreter: Interpreter::Shell,
+                reading: None,
+                card: None,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: Some(true),
+            },
+        );
+
+        let mut layout = ChatLayout::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+
+        let mut glyphs = Vec::new();
+        for frame_idx in 0..4usize {
+            let mut rendered_row = String::new();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_unified(
+                        frame,
+                        area,
+                        &chat,
+                        &mut layout,
+                        usize::MAX,
+                        UnifiedRenderContext {
+                            selected_tool: None,
+                            content_height_out: None,
+                            view_height_out: None,
+                            input_ctx: None,
+                            input_caret_active: false,
+                            queue_ctx: None,
+                            status_ctx: None,
+                            images_supported: false,
+                            hide_todos: false,
+                            image_positions_out: None,
+                            spinner_frame: frame_idx,
+                            band_bg: None,
+                            sandbox_dir: None,
+                        },
+                    );
+                    let buf = frame.buffer_mut();
+                    for y in 0..area.height {
+                        let line: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+                        if line.contains("Build workspace") {
+                            rendered_row = line;
+                            break;
+                        }
+                    }
+                })
+                .expect("draw");
+            if frame_idx == 0 {
+                assert_eq!(layout.rebuilt(), 1, "initial frame builds entry once");
+            } else {
+                assert_eq!(
+                    layout.rebuilt(),
+                    0,
+                    "spinner frame {frame_idx} must reuse cached entry without rebuilding"
+                );
+            }
+            glyphs.push(rendered_row);
+        }
+        assert!(glyphs[0].contains('⠋'), "{glyphs:?}");
+        assert!(glyphs[1].contains('⠙'), "{glyphs:?}");
+        assert!(glyphs[2].contains('⠹'), "{glyphs:?}");
+        assert!(glyphs[3].contains('⠸'), "{glyphs:?}");
     }
 }

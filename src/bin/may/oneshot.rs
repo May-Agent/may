@@ -463,21 +463,19 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 }
                 output.event(&result)?;
                 let run_failed = result.is_err();
-                let ended = app.handle_agent_event(result).await;
+                let ended = app.handle_agent_event(result);
                 if ended {
-                    runtime_deps
-                        .finish_agent_task(
-                            &mut app,
-                            &mut agent_handle,
-                            &mut pending_title_gen,
-                            &assistant_response,
-                            if run_failed {
-                                RunOutcome::Failed
-                            } else {
-                                RunOutcome::Completed
-                            },
-                        )
-                        .await;
+                    runtime_deps.finish_agent_task(
+                        &mut app,
+                        &mut agent_handle,
+                        &mut pending_title_gen,
+                        &assistant_response,
+                        if run_failed {
+                            RunOutcome::Failed
+                        } else {
+                            RunOutcome::Completed
+                        },
+                    );
                     if run_failed {
                         anyhow::bail!("oneshot agent run failed");
                     }
@@ -492,7 +490,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 }
             }
             Event::Agent(TuiEvent::ReasoningEnd { seconds }) => {
-                app.chat.finish_thinking(seconds);
+                app.finish_thinking(seconds);
                 writeln!(
                     output.stderr()?,
                     "[thought for {}]",
@@ -500,15 +498,13 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 )?;
             }
             Event::Agent(TuiEvent::Complete) => {
-                runtime_deps
-                    .finish_agent_task(
-                        &mut app,
-                        &mut None,
-                        &mut pending_title_gen,
-                        &assistant_response,
-                        RunOutcome::Completed,
-                    )
-                    .await;
+                runtime_deps.finish_agent_task(
+                    &mut app,
+                    &mut None,
+                    &mut pending_title_gen,
+                    &assistant_response,
+                    RunOutcome::Completed,
+                );
                 output.end_text_line()?;
                 let Some(handle) =
                     next_resumed_turn(&mut app, worker, &runtime_deps, &session_id).await?
@@ -582,28 +578,24 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             // caller of a one-shot run learns that from its exit status.
             Event::Agent(TuiEvent::LoopStopped(message)) => {
                 writeln!(output.stderr()?, "[stopped] {message}")?;
-                runtime_deps
-                    .finish_agent_task(
-                        &mut app,
-                        &mut None,
-                        &mut pending_title_gen,
-                        &assistant_response,
-                        RunOutcome::Cancelled,
-                    )
-                    .await;
+                runtime_deps.finish_agent_task(
+                    &mut app,
+                    &mut None,
+                    &mut pending_title_gen,
+                    &assistant_response,
+                    RunOutcome::Cancelled,
+                );
                 anyhow::bail!(message);
             }
             Event::Agent(TuiEvent::Error(error)) => {
                 writeln!(output.stderr()?, "[error] {error}")?;
-                runtime_deps
-                    .finish_agent_task(
-                        &mut app,
-                        &mut None,
-                        &mut pending_title_gen,
-                        &assistant_response,
-                        RunOutcome::Failed,
-                    )
-                    .await;
+                runtime_deps.finish_agent_task(
+                    &mut app,
+                    &mut None,
+                    &mut pending_title_gen,
+                    &assistant_response,
+                    RunOutcome::Failed,
+                );
                 anyhow::bail!(error);
             }
         }

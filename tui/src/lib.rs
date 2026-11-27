@@ -50,3 +50,11 @@ pub use event::{AppEvent, EventHandler};
 pub use history::InputHistory;
 pub use queue::{Attachment, PendingMessage};
 pub use state::{AppMode, AskUserState, SelectionPoint, TextSelection};
+
+/// Cached user home directory (`dirs::home_dir()`), queried once per process
+/// so render-path callers avoid repeated environment lookups per frame.
+#[must_use]
+pub(crate) fn home_dir() -> Option<&'static std::path::Path> {
+    static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOME.get_or_init(dirs::home_dir).as_deref()
+}

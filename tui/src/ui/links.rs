@@ -419,7 +419,7 @@ impl LinkHit {
         let Ok(path) = url.to_file_path() else {
             return self.uri.clone();
         };
-        dirs::home_dir()
+        crate::home_dir()
             .and_then(|home| {
                 path.strip_prefix(home).ok().map(|rest| {
                     if rest.as_os_str().is_empty() {
