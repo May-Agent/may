@@ -21,7 +21,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 
 ## Model and conversation
 
-- `/model` opens the model picker for this session; `/model <query>` opens it searching for the query. The last chosen model becomes `last_model`, the default for new sessions.
+- `/model` opens the model picker for this session; `/model <query>` opens it searching for the query. Results rank exact selectors and exact model ids first, then nearer model-name matches before composite ids that merely contain the query. The last chosen model becomes `last_model`, the default for new sessions.
 - `/effort` opens a left/right ladder of reasoning efforts for the current model (Enter or Esc closes; each move applies). The last choice is stored as `last_effort`.
 - `/compact [focus]` compacts the conversation into a handoff document now; the optional focus steers what it keeps. Compaction also runs by itself (see `configuration.md`, `[context]`).
 - `/recap` generates a catch-up summary card for the session. Refused while a turn runs ("run /recap when it finishes"); an empty session answers "nothing to recap". An idle session also gets one automatically (`[recap]`).
