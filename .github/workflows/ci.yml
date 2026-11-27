@@ -398,7 +398,8 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Dependencies keep Cargo's default debuginfo (`2`) so they match
       # stow's public prebuilt cache; ./.github/actions/build-tests disables
-      # debuginfo only on workspace packages via ${CARGO_HOME}/config.toml.
+      # and strips debuginfo only on workspace packages via
+      # ${CARGO_HOME}/config.toml.
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
