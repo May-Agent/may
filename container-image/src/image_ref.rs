@@ -1,9 +1,10 @@
 //! Content-addressed GHCR references for the container images.
 //!
 //! `build.rs` includes this module to bake `MAY_BASE_IMAGE` and
-//! `MAY_WORKSPACE_IMAGE` into the binary, and the `container_image` CI
-//! example prints the same references and stages the workspace context.
-//! Keeping it to `std` + `sha2` is what makes that sharing work.
+//! `MAY_WORKSPACE_IMAGE` into the binary, `may-container-image` prints the
+//! same references, and `may-tool-dist`'s `container_image` CI example stages
+//! the workspace context. Keeping it to `std` + `sha2` is what makes that
+//! sharing work.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -26,7 +27,7 @@ const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "python_shim", "tasks", "
 /// The `python3`, `python` and `uv` shim template, relative to the
 /// repository. The workspace image carries it as those three commands, so a
 /// change to it moves the workspace reference.
-pub const PYTHON_SHIM_TEMPLATE: &str = "agent-core/templates/python_shim";
+pub const PYTHON_SHIM_TEMPLATE: &str = "tool-dist/templates/python_shim";
 
 /// The directory, relative to the repository, of the `tasks` crate.
 ///

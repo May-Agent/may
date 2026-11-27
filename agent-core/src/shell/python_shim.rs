@@ -5,8 +5,8 @@
 //! time a command needs it. `uv pip` and `uv run` get that environment as
 //! `VIRTUAL_ENV` only where no project environment is found. The environment
 //! lives in the session directory and goes with it. The container image
-//! installs the same template (see `container::stage`), in front of its own
-//! `python3` and `uv`.
+//! installs the same template (see [`may_tool_dist::stage`]), in front of its
+//! own `python3` and `uv`.
 //!
 //! The managed `python3` is a verified link inside the prepared tools
 //! directory, so the commands live in the tools' shim directory
@@ -17,8 +17,7 @@
 
 use std::path::Path;
 
-/// The shim every command is.
-const PYTHON_SHIM: &str = include_str!("../../templates/python_shim");
+use may_tool_dist::PYTHON_SHIM;
 
 /// The commands the shim is installed as.
 const COMMANDS: [&str; 3] = ["python3", "python", "uv"];

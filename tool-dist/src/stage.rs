@@ -2,9 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::tools::{HostProgram, ToolTarget};
-
-use crate::tools::embedded_distribution;
+use crate::{HostProgram, PYTHON_SHIM, ToolRuntimeError, ToolTarget, embedded_distribution};
 
 /// Errors staging the workspace image's generated context can hit.
 #[derive(Debug, thiserror::Error)]
@@ -14,7 +12,7 @@ pub enum StageContextError {
     UnsupportedArch(String),
     /// Baseline tool or `heel` loading or staging failed.
     #[error("tool staging failed: {0}")]
-    Tools(#[source] crate::tools::ToolRuntimeError),
+    Tools(#[source] ToolRuntimeError),
     /// The distribution's `heel` could not be copied into the context.
     #[error("staging the heel binary failed: {0}")]
     Heel(#[source] std::io::Error),
@@ -26,18 +24,14 @@ pub enum StageContextError {
     PythonShim(#[source] std::io::Error),
 }
 
-/// The shim the image installs as `python3`, `python` and `uv`: the template
-/// a host session installs, so both behave the same.
-const PYTHON_SHIM: &str = include_str!("../../templates/python_shim");
-
 /// Stages the workspace context's generated entries for a Linux architecture.
 ///
 /// Writes the baseline tools under `<context>/tools/<cache key>/bin` (the
 /// layout the image's runtime tool verification expects), the distribution's
 /// Linux `heel` binary at `<context>/heel`, pinned at the `heel` library
-/// version this binary links, and `tasks_binary`, the `tasks` command built
-/// for the same architecture, at `<context>/tasks`, and the Python shim
-/// template at `<context>/python_shim`.
+/// version this binary links, `tasks_binary`, the `tasks` command built for
+/// the same architecture, at `<context>/tasks`, and the Python shim template
+/// at `<context>/python_shim`.
 ///
 /// `scratch` receives the transient tool artifact cache; it is safe to
 /// discard after staging.
