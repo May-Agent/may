@@ -2506,6 +2506,20 @@ fn push_image_rows(lines: &mut Vec<Line<'_>>) -> usize {
     index
 }
 
+/// Compact character-count label for a pasted-text attachment, bounded at
+/// [`may_config::pasted_text::REPASTE_INLINE_CHAR_LIMIT`] so very large pastes
+/// never stall the draw path.
+fn pasted_char_label(content: &str) -> String {
+    match may_config::pasted_text::bounded_char_count(
+        content,
+        may_config::pasted_text::REPASTE_INLINE_CHAR_LIMIT,
+    ) {
+        Some(1) => "1 char".to_string(),
+        Some(count) => format!("{count} chars"),
+        None => ">10k chars".to_string(),
+    }
+}
+
 /// One-line text marker for an attachment, matching the historical markers.
 fn attachment_label(attachment: &Attachment) -> String {
     match attachment {
@@ -2515,10 +2529,10 @@ fn attachment_label(attachment: &Attachment) -> String {
             content,
             saved_path,
         } => {
-            let size = content.len();
+            let label = pasted_char_label(content);
             saved_path.as_ref().map_or_else(
-                || format!("[pasted text: {size} bytes]"),
-                |path| format!("[pasted text: {size} bytes -> {}]", path.display()),
+                || format!("[pasted text: {label}]"),
+                |path| format!("[pasted text: {label} -> {}]", path.display()),
             )
         }
     }
@@ -3876,8 +3890,8 @@ fn render_impl(
         lines: tail,
         band_start,
         greeting_idx: greeting_line_idx,
-        input_idx: input_line_idx,
-        caret_line,
+        input_lines: input_line_range,
+        caret_lines,
         images: tail_images,
     } = build_tail(
         queue_ctx.as_ref(),
@@ -4002,22 +4016,24 @@ fn render_impl(
     layout.set_greeting_row(
         greeting_line_idx.map(|index| element_rows + tail_starts.get(index).copied().unwrap_or(0)),
     );
-    layout.set_input_span(input_line_idx.map(|index| {
-        (
-            element_rows + tail_starts.get(index).copied().unwrap_or(0),
-            chat_layout::line_rows(&tail[index], inner.width),
-        )
+    layout.set_input_span(input_line_range.as_ref().map(|range| {
+        let start = element_rows + tail_starts.get(range.start).copied().unwrap_or(0);
+        let rows: usize = tail[range.clone()]
+            .iter()
+            .map(|line| chat_layout::line_rows(line, inner.width))
+            .sum();
+        (start, rows)
     }));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
-    if let (Some(caret_line), Some(input_idx)) = (caret_line, input_line_idx)
-        && let Some((cx, cy)) = wrapped_tail_cell(&caret_line, inner.width)
+    if let (Some(caret_lines), Some(input_range)) = (caret_lines, input_line_range)
+        && let Some((cx, cy)) = wrapped_caret_cell(&caret_lines, inner.width)
     {
         let caret_row = top_padding
             + element_rows
-            + tail_starts.get(input_idx).copied().unwrap_or(0)
-            + usize::from(cy);
+            + tail_starts.get(input_range.start).copied().unwrap_or(0)
+            + cy;
         if caret_row >= top && caret_row - top < usize::from(area.height) {
             frame.set_cursor_position((
                 inner.x + cx,
@@ -4036,9 +4052,11 @@ struct Tail {
     /// the last row. `None` when there is no band.
     band_start: Option<usize>,
     greeting_idx: Option<usize>,
-    input_idx: Option<usize>,
-    /// The input up to the caret, when the caret owns the terminal cursor.
-    caret_line: Option<Line<'static>>,
+    /// Range in `lines` covering every logical line of the composer input.
+    input_lines: Option<std::ops::Range<usize>>,
+    /// The input logical lines up to the caret, when the caret owns the
+    /// terminal cursor.
+    caret_lines: Option<Vec<Line<'static>>>,
     /// Attached image blocks: `(key, index in lines, caption)`.
     images: Vec<(String, usize, String)>,
 }
@@ -4063,7 +4081,7 @@ fn build_tail(
         render_queue_lines(&mut lines, ctx, width);
     }
     let mut band_start = None;
-    let (mut greeting_idx, mut input_idx, mut caret_line) = (None, None, None);
+    let (mut greeting_idx, mut input_lines, mut caret_lines) = (None, None, None);
     if input_ctx.is_some() || status_ctx.is_some() {
         lines.push(Line::from(""));
         band_start = Some(lines.len());
@@ -4075,9 +4093,9 @@ fn build_tail(
             lines.push(greeting_line(text));
         }
         if caret_active {
-            caret_line = Some(input_caret_line(ctx));
+            caret_lines = Some(input_caret_lines(ctx));
         }
-        input_idx = Some(render_input_line(
+        input_lines = Some(render_input_line(
             &mut lines,
             ctx,
             width,
@@ -4098,8 +4116,8 @@ fn build_tail(
         lines: lines.into_iter().map(line_into_static).collect(),
         band_start,
         greeting_idx,
-        input_idx,
-        caret_line,
+        input_lines,
+        caret_lines,
         images,
     }
 }
@@ -4223,9 +4241,9 @@ fn input_prefix_spans(input: &str, attachments: &[Attachment]) -> Vec<Span<'stat
     // Pasted text attachments
     for att in attachments {
         if let Attachment::PastedText { content, .. } = att {
-            let size = content.len();
+            let label = pasted_char_label(content);
             spans.push(Span::styled(
-                format!("[pasted: {size} bytes] "),
+                format!("[pasted: {label}] "),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -4233,53 +4251,183 @@ fn input_prefix_spans(input: &str, attachments: &[Attachment]) -> Vec<Span<'stat
     spans
 }
 
-/// The byte offset of the cursor a click `column` cells into the input lands on.
+/// The byte offset of the cursor a click at wrapped `(row, column)` inside
+/// the composer lands on.
 ///
-/// `column` counts from the left edge of the input line's first row, the
-/// widths of the rows above the clicked one included. The result is the
-/// boundary before the grapheme the click hits, measured with the widths the
-/// renderer draws, and `input.len()` past the end.
+/// `row` counts wrapped rows from the top of the composer, `column` counts
+/// display cells from the left edge of `row`, and `width` is the composer's
+/// inner wrap width. The result is the grapheme boundary before the clicked
+/// cluster, clamped to the end of the clicked logical line (or `input.len()`
+/// past the last row).
 #[must_use]
-pub fn caret_at_column(input: &str, attachments: &[Attachment], column: usize) -> usize {
-    let prefix_width: usize = input_prefix_spans(input, attachments)
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum();
-    let target = column.saturating_sub(prefix_width);
-    // The leading `!` of a bash-mode input is drawn as part of the prefix.
-    let first = usize::from(bash_mode(input));
+pub fn caret_at_position(
+    input: &str,
+    attachments: &[Attachment],
+    width: u16,
+    row: usize,
+    column: usize,
+) -> usize {
     let secret_start = secret_value_start(input);
-    let mut covered = 0usize;
-    for (offset, cluster) in input[first..].grapheme_indices(true) {
-        let at = first + offset;
-        let masked = secret_start.is_some_and(|start| at >= start)
-            && !cluster.chars().all(char::is_whitespace);
-        let width = if masked {
-            UnicodeWidthStr::width("•")
+    let bash = bash_mode(input);
+    let mut remaining_row = row;
+    let mut line_start = 0usize;
+    let mut line_index = 0usize;
+    let mut parts = input.split('\n').peekable();
+    while let Some(part) = parts.next() {
+        let line_end = line_start + part.len();
+        let prefix_spans = if line_index == 0 {
+            input_prefix_spans(input, attachments)
         } else {
-            drawn_width(cluster)
+            Vec::new()
         };
-        if covered + width > target {
-            return at;
+        // The leading `!` of a bash-mode input is drawn as part of the prefix.
+        let text_start = if line_index == 0 && bash {
+            line_start + 1
+        } else {
+            line_start
+        };
+        let visible = composer_segment(&input[text_start..line_end], text_start, secret_start);
+        let mut line_spans = prefix_spans.clone();
+        line_spans.push(Span::raw(visible.into_owned()));
+        let rendered = Line::from(line_spans);
+        let wrapped = super::wrap::wrap_line(&rendered, width);
+        if remaining_row < wrapped.len() || parts.peek().is_none() {
+            let target_row = remaining_row.min(wrapped.len().saturating_sub(1));
+            return caret_on_wrapped_line(
+                input,
+                text_start..line_end,
+                secret_start,
+                &prefix_spans,
+                &wrapped,
+                target_row,
+                column,
+            );
         }
-        covered += width;
+        remaining_row -= wrapped.len();
+        line_start = line_end + 1;
+        line_index += 1;
     }
     input.len()
 }
 
-/// The input `Line` up to and including the caret marker: prompt,
-/// attachment chips and the text before the caret. The caret marker's
-/// cell is where the terminal cursor — and therefore IME composition —
-/// anchors.
-fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
-    let mut spans = input_prefix_spans(ctx.input, ctx.attachments);
+/// Map a click at `(target_row, column)` on one logical composer line back to
+/// its byte offset in `input`.
+fn caret_on_wrapped_line(
+    input: &str,
+    range: std::ops::Range<usize>,
+    secret_start: Option<usize>,
+    prefix_spans: &[Span<'static>],
+    wrapped: &[Line<'static>],
+    target_row: usize,
+    column: usize,
+) -> usize {
+    let text_start = range.start;
+    let line_end = range.end;
+    let mut stream: Vec<(&str, Option<usize>, usize)> = Vec::new();
+    for span in prefix_spans {
+        for g in span.content.graphemes(true) {
+            stream.push((g, None, text_start));
+        }
+    }
+    for (offset, cluster) in input[text_start..line_end].grapheme_indices(true) {
+        let at = text_start + offset;
+        let end = at + cluster.len();
+        let masked = secret_start.is_some_and(|start| at >= start)
+            && !cluster.chars().all(char::is_whitespace);
+        let drawn = if masked { "•" } else { cluster };
+        stream.push((drawn, Some(at), end));
+    }
+
+    let mut stream_idx = 0usize;
+    for wrapped_row in wrapped.iter().take(target_row) {
+        for span in &wrapped_row.spans {
+            for wg in span.content.graphemes(true) {
+                while stream_idx < stream.len() && stream[stream_idx].0 != wg {
+                    stream_idx += 1;
+                }
+                if stream_idx < stream.len() {
+                    stream_idx += 1;
+                }
+            }
+        }
+    }
+
+    let Some(clicked_row) = wrapped.get(target_row) else {
+        return line_end;
+    };
+    let mut covered = 0usize;
+    let mut last_end = stream
+        .get(stream_idx)
+        .and_then(|&(_, start, _)| start)
+        .unwrap_or(text_start);
+    let mut matched_any = false;
+    for span in &clicked_row.spans {
+        for wg in span.content.graphemes(true) {
+            while stream_idx < stream.len() && stream[stream_idx].0 != wg {
+                stream_idx += 1;
+            }
+            let Some(&(_, start, end)) = stream.get(stream_idx) else {
+                break;
+            };
+            stream_idx += 1;
+            matched_any = true;
+            let w = drawn_width(wg);
+            if covered + w > column {
+                return start.unwrap_or(text_start);
+            }
+            covered += w;
+            last_end = end;
+        }
+    }
+    if target_row + 1 >= wrapped.len() {
+        line_end
+    } else if matched_any {
+        last_end
+    } else {
+        text_start
+    }
+}
+
+/// The logical input `Line`s up to and including the caret marker: prompt,
+/// attachment chips and the text before the caret, split on explicit `\n`
+/// breaks. The caret marker's cell on the last line is where the terminal
+/// cursor — and therefore IME composition — anchors.
+fn input_caret_lines(ctx: &InputContext<'_>) -> Vec<Line<'static>> {
     let bash = bash_mode(ctx.input);
     let (before, _) = composer_display_split(ctx.input, ctx.cursor);
     // The bash prompt already draws the leading `!`.
     let start = usize::from(bash);
-    spans.push(Span::raw(before.get(start..).unwrap_or("").to_string()));
-    spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
-    Line::from(spans)
+    let visible_before = before.get(start..).unwrap_or("");
+    let mut out = Vec::new();
+    let mut parts = visible_before.split('\n').enumerate().peekable();
+    while let Some((idx, part)) = parts.next() {
+        let mut spans = if idx == 0 {
+            input_prefix_spans(ctx.input, ctx.attachments)
+        } else {
+            Vec::new()
+        };
+        spans.push(Span::raw(part.to_string()));
+        if parts.peek().is_none() {
+            spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Cell `(x, y)` of the caret marker across wrapped logical `lines`, where
+/// `y` is the wrapped-row offset from the first line of the composer.
+fn wrapped_caret_cell(lines: &[Line<'static>], width: u16) -> Option<(u16, usize)> {
+    if width == 0 {
+        return None;
+    }
+    let (last, above) = lines.split_last()?;
+    let rows_above: usize = above
+        .iter()
+        .map(|line| super::wrap::line_rows(line, width))
+        .sum();
+    let (cx, cy) = wrapped_tail_cell(last, width)?;
+    Some((cx, rows_above + usize::from(cy)))
 }
 
 /// Cell of `line`'s last grapheme once wrapped to `width`: the caret cell
@@ -4310,17 +4458,17 @@ fn wrapped_tail_cell(line: &Line<'static>, width: u16) -> Option<(u16, u16)> {
     None
 }
 
-/// Render the input line into the lines vector and return its index.
-/// Attached images get a placeholder block above the input row — the
-/// overlay paints the preview into it — when the terminal supports
-/// graphics.
+/// Render the input line(s) into the lines vector and return the index range
+/// covering the composer's logical lines. Attached images get a placeholder
+/// block above the input row — the overlay paints the preview into it — when
+/// the terminal supports graphics.
 fn render_input_line(
     lines: &mut Vec<Line<'_>>,
     ctx: &InputContext<'_>,
     width: u16,
     images_supported: bool,
     mut image_positions: Option<&mut Vec<(String, usize, String)>>,
-) -> usize {
+) -> std::ops::Range<usize> {
     if images_supported {
         for att in ctx.attachments {
             if let Attachment::Image { path, .. } = att {
@@ -4334,31 +4482,12 @@ fn render_input_line(
         }
     }
 
-    // Input text with caret (a byte offset on a grapheme boundary). The real
-    // terminal cursor marks the caret — the `│` stays only in the
-    // scratch anchor used for cursor placement.
-    let mut line = input_caret_line(ctx);
-    line.spans.pop();
     let display = composer_display(ctx.input);
-    let (before, after) = composer_display_split(ctx.input, ctx.cursor);
-    // The bash prompt already draws the leading `!`, which sits before the
-    // caret unless the caret is at the very start.
-    let skipped = usize::from(bash_mode(&display)).saturating_sub(before.len());
-    line.spans
-        .push(Span::raw(after.get(skipped..).unwrap_or("").to_string()));
-
-    // Ghost text trails the caret of an empty input.
-    if display.is_empty()
-        && let Some(suggestion) = ctx.suggestion
-    {
-        let ghost = format!("{suggestion}  (tab to accept)");
-        line.spans
-            .push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
-    }
+    let bash = bash_mode(&display);
 
     // The bash-mode affordance hugs the input line, below any attachment
     // previews.
-    if bash_mode(&display) {
+    if bash {
         const LABEL: &str = " (bash mode) ";
         let fill = usize::from(width).saturating_sub(UnicodeWidthStr::width(LABEL));
         lines.push(Line::from(Span::styled(
@@ -4367,9 +4496,29 @@ fn render_input_line(
         )));
     }
 
-    let index = lines.len();
-    lines.push(line);
-    index
+    let start_index = lines.len();
+    // The bash prompt already draws the leading `!`.
+    let body = display.get(usize::from(bash)..).unwrap_or("");
+    for (idx, part) in body.split('\n').enumerate() {
+        let mut spans = if idx == 0 {
+            input_prefix_spans(ctx.input, ctx.attachments)
+        } else {
+            Vec::new()
+        };
+        spans.push(Span::raw(part.to_string()));
+
+        // Ghost text trails the caret of an empty input.
+        if idx == 0
+            && display.is_empty()
+            && let Some(suggestion) = ctx.suggestion
+        {
+            let ghost = format!("{suggestion}  (tab to accept)");
+            spans.push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+    start_index..lines.len()
 }
 
 /// Render queued messages into the lines vector.
@@ -7814,9 +7963,9 @@ mod tests {
             greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
-        let index = render_input_line(&mut lines, &ctx, 80, false, None);
+        let range = render_input_line(&mut lines, &ctx, 80, false, None);
 
-        assert_eq!(index, 1);
+        assert_eq!(range, 1..2);
         let hint: String = lines[0]
             .spans
             .iter()
@@ -7828,6 +7977,91 @@ mod tests {
         assert_eq!(prompt.spans[0].style.fg, Some(Color::Yellow));
         assert_eq!(prompt.spans[0].style.bg, None);
         assert_eq!(prompt.spans[1].content, "ls -la");
+    }
+
+    #[test]
+    fn multiline_inline_input_renders_separate_lines_and_tracks_caret() {
+        let input = "你好世界\nこんにちは\n안녕하세요\n";
+        let ctx = InputContext {
+            input,
+            cursor: "你好世界\nこん".len(),
+            attachments: &[],
+            suggestion: None,
+            greeting: None,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        let range = render_input_line(&mut lines, &ctx, 80, false, None);
+        assert_eq!(range, 0..4);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rendered, ["你好世界", "こんにちは", "안녕하세요", ""]);
+
+        // Caret sits on row 1, col 4 (after two wide chars "こん").
+        let caret = super::input_caret_lines(&ctx);
+        assert_eq!(super::wrapped_caret_cell(&caret, 80), Some((4, 1)));
+
+        // Caret on the trailing empty line after the final `\n` sits at (0, 3).
+        let at_end = InputContext {
+            cursor: input.len(),
+            ..ctx
+        };
+        let end_caret = super::input_caret_lines(&at_end);
+        assert_eq!(super::wrapped_caret_cell(&end_caret, 80), Some((0, 3)));
+
+        // When line 0 wraps at width 6 ("你好世" / "界"), line 1 starts on row 2.
+        assert_eq!(super::wrapped_caret_cell(&caret, 6), Some((4, 2)));
+
+        // Clicking across wrapped and explicit multiline rows resolves exact byte offsets.
+        assert_eq!(
+            super::caret_at_position(input, &[], 80, 0, 20),
+            "你好世界".len()
+        );
+        assert_eq!(
+            super::caret_at_position(input, &[], 80, 1, 4),
+            "你好世界\nこん".len()
+        );
+        assert_eq!(
+            super::caret_at_position(input, &[], 80, 2, 2),
+            "你好世界\nこんにちは\n안".len()
+        );
+        assert_eq!(super::caret_at_position(input, &[], 80, 3, 0), input.len());
+        assert_eq!(
+            super::caret_at_position(input, &[], 6, 2, 4),
+            "你好世界\nこん".len()
+        );
+    }
+
+    #[test]
+    fn pasted_text_chip_shows_char_count_and_caps_above_repaste_limit() {
+        let cjk = "你好こんにちは안녕".repeat(60); // 540 chars (1620 bytes)
+        let huge = "a".repeat(may_config::pasted_text::REPASTE_INLINE_CHAR_LIMIT + 1);
+        let attachments = vec![
+            Attachment::PastedText {
+                content: cjk,
+                saved_path: None,
+            },
+            Attachment::PastedText {
+                content: huge,
+                saved_path: Some(PathBuf::from("/tmp/paste_0001.txt")),
+            },
+        ];
+        let ctx = InputContext {
+            input: "prompt",
+            cursor: 6,
+            attachments: &attachments,
+            suggestion: None,
+            greeting: None,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &ctx, 80, false, None);
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "[pasted: 540 chars] [pasted: >10k chars] prompt");
     }
 
     #[test]

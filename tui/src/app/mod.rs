@@ -60,6 +60,16 @@ const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_milli
 /// screen before it clears itself.
 const STATUS_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Status notice shown when attached pasted text can be inlined by pasting
+/// the exact same content a second time.
+const STATUS_TEXT_ATTACHED_REPASTE: &str = "Text attached — paste again to inline";
+/// Status notice shown when attached pasted text exceeds the re-paste inline
+/// limit and stays attached.
+const STATUS_TEXT_ATTACHED: &str = "Text attached";
+/// Status notice shown when re-pasting text that exceeds the re-paste inline
+/// limit and is already attached.
+const STATUS_TEXT_ALREADY_ATTACHED: &str = "Text already attached (too large to inline)";
+
 /// Whether two selection columns (byte offsets into `line`) are at most one
 /// character apart, the tolerance of a double click.
 fn same_click_spot(line: &str, a: usize, b: usize) -> bool {
@@ -3230,15 +3240,80 @@ impl App {
         .detach();
     }
 
+    /// Index of the last attached pasted-text item matching `text`.
+    fn find_matching_pasted_attachment(&self, text: &str) -> Option<usize> {
+        self.attachments.iter().rposition(
+            |att| matches!(att, Attachment::PastedText { content, .. } if content == text),
+        )
+    }
+
+    /// Remove the pasted-text attachment at `index` and return its on-disk
+    /// file path, if one was saved.
+    fn remove_pasted_attachment(&mut self, index: usize) -> Option<PathBuf> {
+        match self.attachments.remove(index) {
+            Attachment::PastedText { saved_path, .. } => saved_path,
+            other => {
+                self.attachments.insert(index, other);
+                None
+            }
+        }
+    }
+
+    /// Insert `text` inline into the chat composer at the current cursor.
+    fn insert_chat_inline_paste(&mut self, text: &str) {
+        self.history.reset_navigation();
+        self.cursor = grapheme::insert_str(&mut self.input, self.cursor, text);
+        self.update_completion_state();
+    }
+
     /// Route pasted text — a terminal paste event or a Ctrl+V clipboard
-    /// read — into the focused input, or an attachment when it is large.
+    /// read — into the focused input, or an attachment when it exceeds the
+    /// inline limit.
     pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
-        // Special handling for Chat mode: large pastes become attachments
-        if matches!(self.mode, AppMode::Chat)
-            && (text.contains('\n') || pasted_text::is_large(&text))
-        {
-            self.set_status("Saving pasted text...");
-            self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
+        let text = pasted_text::normalize_line_endings(text);
+
+        // Chat mode: pastes up to INLINE_PASTE_CHAR_LIMIT insert inline
+        // (multiline included). Longer pastes attach first; pasting the exact
+        // same text again inlines it up to REPASTE_INLINE_CHAR_LIMIT.
+        if matches!(self.mode, AppMode::Chat) && !pasted_text::fits_inline(&text) {
+            if let Some(index) = self.find_matching_pasted_attachment(&text) {
+                if pasted_text::can_repaste_inline(&text) {
+                    if let Some(path) = self.remove_pasted_attachment(index) {
+                        unblock(move || {
+                            #[allow(
+                                clippy::disallowed_methods,
+                                reason = "isolated inside blocking::unblock"
+                            )]
+                            let result = std::fs::remove_file(&path);
+                            if let Err(error) = result
+                                && error.kind() != std::io::ErrorKind::NotFound
+                            {
+                                tracing::debug!(
+                                    path = %path.display(),
+                                    %error,
+                                    "failed to remove inlined paste file"
+                                );
+                            }
+                        })
+                        .detach();
+                    }
+                    self.insert_chat_inline_paste(&text);
+                    self.set_status("Pasted inline");
+                    return None;
+                }
+                self.set_status(STATUS_TEXT_ALREADY_ATTACHED);
+                return None;
+            }
+            if pasted_text::is_large(&text) {
+                self.set_status("Saving pasted text...");
+                self.enqueue_paste_result(Ok(ClipboardPasteResult::text(text)));
+                return None;
+            }
+            self.attachments.push(Attachment::PastedText {
+                content: text,
+                saved_path: None,
+            });
+            self.set_status(STATUS_TEXT_ATTACHED_REPASTE);
             return None;
         }
 
@@ -3265,6 +3340,7 @@ impl App {
         match self.active_text_input() {
             Some(ActiveTextInput::Composer { input, cursor }) => {
                 *cursor = grapheme::insert_str(input, *cursor, &text);
+                self.history.reset_navigation();
                 self.update_completion_state();
             }
             Some(ActiveTextInput::Cursored { input, cursor }) => {
@@ -3950,6 +4026,10 @@ impl App {
             KeyCode::Up => {
                 if self.completion.has_matches() {
                     self.completion.prev();
+                } else if !self.history.is_navigating()
+                    && let Some(next) = grapheme::move_up(&self.input, self.cursor)
+                {
+                    self.cursor = next;
                 } else if let Some(entry) = self.history.prev(&self.input) {
                     self.input = entry.to_string();
                     self.cursor = self.input.len();
@@ -3958,6 +4038,10 @@ impl App {
             KeyCode::Down => {
                 if self.completion.has_matches() {
                     self.completion.next();
+                } else if !self.history.is_navigating()
+                    && let Some(next) = grapheme::move_down(&self.input, self.cursor)
+                {
+                    self.cursor = next;
                 } else if let Some(entry) = self.history.next_entry() {
                     self.input = entry.to_string();
                     self.cursor = self.input.len();
@@ -4204,16 +4288,15 @@ impl App {
                     && let Some((start, rows)) = self.chat_layout.input_span()
                     && (start..start + rows).contains(&p.line)
                 {
-                    // Cells from the input line's left edge to the click: the
-                    // rows above (as drawn) plus the column in the clicked row.
-                    let mut column = usize::from(mouse.column.saturating_sub(self.chat_area.x));
-                    for row in start..p.line {
-                        if let Some(text) = self.chat_layout.plain_line(row) {
-                            column += unicode_width::UnicodeWidthStr::width(text);
-                        }
-                    }
-                    self.cursor =
-                        super::ui::chat::caret_at_column(&self.input, &self.attachments, column);
+                    let column = usize::from(mouse.column.saturating_sub(self.chat_area.x));
+                    let row = p.line - start;
+                    self.cursor = super::ui::chat::caret_at_position(
+                        &self.input,
+                        &self.attachments,
+                        self.chat_area.width,
+                        row,
+                        column,
+                    );
                     self.selection = None;
                     return Ok(None);
                 }
@@ -4783,13 +4866,32 @@ impl App {
         }
 
         if let Some(text) = text {
-            // Small single-line pastes insert into the input like a
-            // terminal paste; only large or multiline text needs an
-            // attachment (and its file).
-            if !matches!(self.mode, AppMode::Chat)
-                || (!text.contains('\n') && !pasted_text::is_large(&text))
-            {
+            let text = pasted_text::normalize_line_endings(text);
+            // Pastes up to INLINE_PASTE_CHAR_LIMIT insert directly into the
+            // composer (multiline included); longer pastes attach first, and
+            // pasting the exact same text again inlines it up to
+            // REPASTE_INLINE_CHAR_LIMIT.
+            if !matches!(self.mode, AppMode::Chat) || pasted_text::fits_inline(&text) {
                 self.handle_bracketed_paste(text);
+                return Ok(());
+            }
+            if let Some(index) = self.find_matching_pasted_attachment(&text) {
+                if pasted_text::can_repaste_inline(&text) {
+                    if let Some(path) = self.remove_pasted_attachment(index)
+                        && let Err(error) = async_fs::remove_file(&path).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::debug!(
+                            path = %path.display(),
+                            %error,
+                            "failed to remove inlined paste file"
+                        );
+                    }
+                    self.insert_chat_inline_paste(&text);
+                    self.set_status("Pasted inline");
+                    return Ok(());
+                }
+                self.set_status(STATUS_TEXT_ALREADY_ATTACHED);
                 return Ok(());
             }
             let saved_path = if pasted_text::is_large(&text) {
@@ -4801,12 +4903,17 @@ impl App {
             } else {
                 None
             };
+            let status = if pasted_text::can_repaste_inline(&text) {
+                STATUS_TEXT_ATTACHED_REPASTE
+            } else {
+                STATUS_TEXT_ATTACHED
+            };
 
             self.attachments.push(Attachment::PastedText {
                 content: text,
                 saved_path,
             });
-            self.set_status("Text attached");
+            self.set_status(status);
             return Ok(());
         }
 
@@ -6199,7 +6306,9 @@ fn open_sandbox_dir(dir: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction, TimedEvent,
+        App, AppEvent, Attachment, ClipboardPasteResult, KeyCode, KeyModifiers, MayConfig,
+        MessageRole, STATUS_TEXT_ALREADY_ATTACHED, STATUS_TEXT_ATTACHED,
+        STATUS_TEXT_ATTACHED_REPASTE, SendAction, TextManager, TimedEvent, pasted_text,
     };
     use super::{AppMode, ConfigEditMode, same_click_spot, utf8_complete_len};
     use crate::ui::chat::ChatElement;
@@ -8147,6 +8256,278 @@ mod tests {
         assert_eq!(app.cursor, 1 + flag.len());
         press(&mut app, KeyCode::Backspace);
         assert_eq!((app.input.as_str(), app.cursor), ("ab", 1));
+    }
+
+    #[tokio::test]
+    async fn short_multiline_cjk_paste_inserts_inline_without_attaching() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        // Over 200 UTF-8 bytes of Chinese, Japanese, and Korean across lines,
+        // well within INLINE_PASTE_CHAR_LIMIT (500 chars).
+        let raw = "第一行：你好世界，测试多行粘贴\r\n二行目：こんにちは世界、インライン貼り付け\r三行目：안녕하세요 세계, 멀티라인 붙여넣기";
+        assert!(raw.len() > 100);
+        let expected = pasted_text::normalize_line_endings(raw.to_string());
+
+        assert!(app.handle_bracketed_paste(raw.to_string()).is_none());
+        assert_eq!(app.input, expected);
+        assert_eq!(app.cursor, expected.len());
+        assert!(app.attachments.is_empty());
+        assert!(!app.has_pending_attachments());
+
+        // Same path via `handle_paste_result` (Ctrl+V / clipboard attachment path).
+        app.input.clear();
+        app.cursor = 0;
+        app.handle_paste_result(Ok(ClipboardPasteResult::text(raw.to_string())))
+            .await
+            .expect("paste result");
+        assert_eq!(app.input, expected);
+        assert!(app.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inline_paste_boundary_is_exactly_500_unicode_chars() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let unit = "你好こんにちは안녕\n"; // 10 Unicode scalar chars
+        let at_limit: String = unit
+            .chars()
+            .cycle()
+            .take(pasted_text::INLINE_PASTE_CHAR_LIMIT)
+            .collect();
+        let over_limit: String = unit
+            .chars()
+            .cycle()
+            .take(pasted_text::INLINE_PASTE_CHAR_LIMIT + 1)
+            .collect();
+
+        // 500 chars -> inline, 0 attachments.
+        app.handle_bracketed_paste(at_limit.clone());
+        assert_eq!(app.input, at_limit);
+        assert!(app.attachments.is_empty());
+
+        // 501 chars -> attaches as PastedText with repaste hint.
+        app.input.clear();
+        app.cursor = 0;
+        app.handle_bracketed_paste(over_limit.clone());
+        assert_eq!(app.input, "");
+        assert_eq!(app.attachments.len(), 1);
+        assert!(matches!(
+            &app.attachments[0],
+            Attachment::PastedText { content, saved_path: None } if content == &over_limit
+        ));
+        assert_eq!(app.status_text(), Some(STATUS_TEXT_ATTACHED_REPASTE));
+    }
+
+    #[tokio::test]
+    async fn repasting_attached_text_up_to_10k_inlines_and_cleans_up_file() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.text_manager = Some(TextManager::new(dir.path()));
+
+        // 501..=4000 chars: bracketed first paste attaches; second paste with
+        // CRLF line endings via bracketed paste removes attachment & inlines.
+        let medium_lf: String = "你好\nこんにちは\n안녕하세요\n"
+            .chars()
+            .cycle()
+            .take(600)
+            .collect();
+        let medium_crlf = medium_lf.replace('\n', "\r\n");
+
+        app.handle_bracketed_paste(medium_lf.clone());
+        assert_eq!(app.input, "");
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.status_text(), Some(STATUS_TEXT_ATTACHED_REPASTE));
+
+        app.handle_bracketed_paste(medium_crlf);
+        assert_eq!(app.input, medium_lf);
+        assert!(app.attachments.is_empty());
+
+        // Exact 10,000 chars (> LARGE_PASTE_THRESHOLD -> saved to file):
+        // first paste attaches and writes file; second paste via
+        // `handle_paste_result` removes attachment, deletes file, and inlines.
+        app.input.clear();
+        app.cursor = 0;
+        let max_repaste: String = "中文日本語한국어\n"
+            .chars()
+            .cycle()
+            .take(pasted_text::REPASTE_INLINE_CHAR_LIMIT)
+            .collect();
+
+        app.handle_bracketed_paste(max_repaste.clone());
+        let pending = app.dequeue_pending_paste().expect("queued large paste");
+        app.handle_pending_paste(pending).await;
+        assert_eq!(app.input, "");
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.status_text(), Some(STATUS_TEXT_ATTACHED_REPASTE));
+        let saved_path = match &app.attachments[0] {
+            Attachment::PastedText {
+                content,
+                saved_path: Some(path),
+            } => {
+                assert_eq!(content, &max_repaste);
+                path.clone()
+            }
+            other => panic!("expected saved PastedText attachment, got {other:?}"),
+        };
+        assert!(async_fs::metadata(&saved_path).await.is_ok());
+
+        // Second paste via `handle_paste_result` (Ctrl+V path).
+        app.handle_paste_result(Ok(ClipboardPasteResult::text(max_repaste.clone())))
+            .await
+            .expect("repaste inline");
+        assert_eq!(app.input, max_repaste);
+        assert!(app.attachments.is_empty());
+        assert!(
+            async_fs::metadata(&saved_path).await.is_err(),
+            "inlining a saved paste removes its temp file"
+        );
+
+        // Also test second paste via `handle_bracketed_paste` on a saved paste.
+        app.input.clear();
+        app.cursor = 0;
+        app.handle_paste_result(Ok(ClipboardPasteResult::text(max_repaste.clone())))
+            .await
+            .expect("first attach");
+        let saved_path_2 = match &app.attachments[0] {
+            Attachment::PastedText {
+                saved_path: Some(path),
+                ..
+            } => path.clone(),
+            other => panic!("expected saved PastedText, got {other:?}"),
+        };
+        assert!(async_fs::metadata(&saved_path_2).await.is_ok());
+
+        app.handle_bracketed_paste(max_repaste.clone());
+        assert_eq!(app.input, max_repaste);
+        assert!(app.attachments.is_empty());
+        // Yield briefly so the detached async cleanup finishes removing the file.
+        for _ in 0..20 {
+            if async_fs::metadata(&saved_path_2).await.is_err() {
+                break;
+            }
+            async_io::Timer::after(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            async_fs::metadata(&saved_path_2).await.is_err(),
+            "bracketed repaste removes its saved file asynchronously"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_over_10k_chars_stays_attached_and_does_not_inline_or_duplicate() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.text_manager = Some(TextManager::new(dir.path()));
+
+        let over_10k: String = "你好こんにちは안녕a\n"
+            .chars()
+            .cycle()
+            .take(pasted_text::REPASTE_INLINE_CHAR_LIMIT + 1)
+            .collect();
+
+        // First paste attaches and saves to disk without the repaste hint.
+        app.handle_bracketed_paste(over_10k.clone());
+        let pending = app.dequeue_pending_paste().expect("queued paste");
+        app.handle_pending_paste(pending).await;
+        assert_eq!(app.input, "");
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.status_text(), Some(STATUS_TEXT_ATTACHED));
+        let saved_path = match &app.attachments[0] {
+            Attachment::PastedText {
+                saved_path: Some(path),
+                ..
+            } => path.clone(),
+            other => panic!("expected saved PastedText, got {other:?}"),
+        };
+
+        // Second paste via bracketed paste does NOT inline and does NOT duplicate.
+        app.handle_bracketed_paste(over_10k.clone());
+        assert_eq!(app.input, "");
+        assert_eq!(app.attachments.len(), 1);
+        assert!(!app.has_pending_attachments());
+        assert_eq!(app.status_text(), Some(STATUS_TEXT_ALREADY_ATTACHED));
+
+        // Second paste via `handle_paste_result` also leaves it attached without duplicating.
+        app.handle_paste_result(Ok(ClipboardPasteResult::text(over_10k)))
+            .await
+            .expect("second paste result");
+        assert_eq!(app.input, "");
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.status_text(), Some(STATUS_TEXT_ALREADY_ATTACHED));
+        assert!(async_fs::metadata(&saved_path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn multiline_inline_composer_draws_tracks_cursor_clicks_and_navigates() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let text = "你好世界\nこんにちは\n안녕하세요";
+        app.handle_bracketed_paste(text.to_string());
+        assert_eq!(app.input, text);
+        assert_eq!(app.cursor, text.len());
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let rows = draw_rows(&mut terminal, &mut app);
+        assert!(
+            rows.iter().any(|r| r.replace(' ', "").contains("你好世界")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.replace(' ', "").contains("こんにちは")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.replace(' ', "").contains("안녕하세요")),
+            "{rows:#?}"
+        );
+
+        let (input_start, input_rows) = app.chat_layout.input_span().expect("input span");
+        assert_eq!(input_rows, 3);
+
+        // Cursor at end of line 2 ("안녕하세요", width 10).
+        let end_cursor = terminal.get_cursor_position().expect("cursor");
+        assert_eq!(
+            usize::from(end_cursor.x - app.chat_area.x),
+            unicode_width::UnicodeWidthStr::width("안녕하세요")
+        );
+
+        // Up arrow moves from line 2 to line 1 ("こんにちは", width 10), one row higher.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.cursor, "你好世界\nこんにちは".len());
+        draw_rows(&mut terminal, &mut app);
+        let up_cursor = terminal.get_cursor_position().expect("cursor");
+        assert_eq!(up_cursor.y + 1, end_cursor.y);
+        assert_eq!(
+            usize::from(up_cursor.x - app.chat_area.x),
+            unicode_width::UnicodeWidthStr::width("こんにちは")
+        );
+
+        // Clicking row 1 col 4 places the caret right after "こん".
+        let row1_screen = app.chat_area.y
+            + u16::try_from(
+                input_start + 1 + app.chat_layout.top_padding() - app.effective_scroll(),
+            )
+            .expect("row");
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: app.chat_area.x + 4,
+            row: row1_screen,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("mouse");
+        assert_eq!(app.cursor, "你好世界\nこん".len());
+
+        // Enter submits the multiline prompt intact.
+        let Some(SendAction::Send(sent)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the multiline message");
+        };
+        assert_eq!(sent.content, text);
+        assert!(sent.attachments.is_empty());
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor, 0);
     }
 
     /// Click the input row `column` cells into the drawn text.
