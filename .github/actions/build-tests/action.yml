@@ -1,23 +1,24 @@
 name: Build and archive tests
 description: >-
-  Build and archive all affected workspace test targets (and pack the debug
-  `may` binary) in one cargo invocation when E2E is in scope, or run unit-only
-  tests inline when E2E is off.
+  Build and archive `may-agent` test targets (and pack the debug `may` binary)
+  for E2E/acceptance fan-out when `e2e` is true, or build and run affected unit
+  tests inline when `e2e` is false.
 inputs:
   e2e:
     description: >-
-      'true' when the root `may-agent` E2E and acceptance gates are in scope
-      (builds a single nextest archive for downstream fan-out and packs
-      `may-debug`), or 'false' to build and run unit tests inline.
+      'true' when building the `may-agent` nextest archive and `may-debug`
+      artifact for downstream E2E/acceptance jobs, or 'false' to build and run
+      unit tests inline.
     required: true
   cargo-flags:
     description: >-
-      Package and target selection flags passed to `cargo nextest` — the scope
-      job's `cargo-flags` / `linux-cargo-flags`.
+      Package and target selection flags passed to `cargo nextest` (`-p
+      may-agent --all-targets` for `build-e2e-*`, or `unit-cargo-flags` /
+      `linux-unit-cargo-flags` for `test-*-unit`).
     required: true
 outputs:
   run-tests:
-    description: "'true' when downstream unit and E2E jobs should run from the uploaded archive."
+    description: "'true' when downstream E2E jobs should run from the uploaded archive."
     value: ${{ steps.decide.outputs.run-tests }}
 runs:
   using: composite
@@ -112,17 +113,6 @@ runs:
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
-        # Standard 3-vCPU / 7 GiB macOS runners thrash swap when Cargo pipelining
-        # overlaps `may-agent-core` (~3 GiB RSS) and both `may-daemon` lib/test
-        # targets (~3.4 GiB RSS each). Cap build concurrency on <= 8 GiB macOS
-        # VMs while keeping full parallelism on larger macOS and Linux runners.
-        if [ "${{ runner.os }}" = "macOS" ]; then
-          mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
-          if [ "${mem_bytes}" -gt 0 ] && [ "${mem_bytes}" -le 8589934592 ]; then
-            export CARGO_BUILD_JOBS=2
-            export CARGO_BUILD_PIPELINING=false
-          fi
-        fi
         cargo nextest archive --locked ${{ inputs.cargo-flags }} \
           --archive-file "${{ runner.temp }}/tests-archive.tar.zst" --timings
     - name: cargo nextest (unit-only)
@@ -130,6 +120,17 @@ runs:
       shell: bash
       run: |
         ulimit -n 65536 2>/dev/null || true
+        # Standard 3-vCPU / 7 GiB macOS runners can thrash swap when
+        # `may-agent-core` (~3 GiB RSS), `may-daemon` test (~3.6 GiB RSS), and
+        # `may-tui` test (~1.5 GiB RSS) compile concurrently. Cap concurrency to
+        # 2 on <= 8 GiB macOS VMs while keeping Cargo pipelining enabled so
+        # smaller crates still fly.
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          mem_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+          if [ "${mem_bytes}" -gt 0 ] && [ "${mem_bytes}" -le 8589934592 ]; then
+            export CARGO_BUILD_JOBS=2
+          fi
+        fi
         if [ "${{ github.event_name }}" = "push" ] && [ "${{ steps.downloads.outputs.tools-hit }}" = "true" ]; then
           cargo nextest run --no-run --locked ${{ inputs.cargo-flags }} --timings
         elif [ "${{ runner.os }}" = "macOS" ]; then

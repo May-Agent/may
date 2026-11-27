@@ -379,16 +379,21 @@ jobs:
         if: always()
         run: stow stats || true
 
-  # One build per OS compiles and archives every affected crate plus `may-agent`
-  # when `e2e` is on, then fans out unit tests, 4 E2E shards and Container
-  # Acceptance from that archive with zero Rust compilation. When `e2e` is off
-  # (e.g. a client-only diff), `build-tests` runs the unit tests inline instead.
-  build-tests-ubuntu:
-    name: build-tests (ubuntu-latest)
+  # Split unit tests and E2E archive builds per OS so both run in parallel and
+  # never compile `may-daemon` lib + `may-daemon` test in the same job (which
+  # added 5+ minutes of duplicate compilation and exceeded 7 GiB RAM on 3-vCPU
+  # macOS runners):
+  # - `test-*-unit` builds and runs affected non-`may-agent` crates inline (no
+  #   `may-daemon` lib, no archive upload/download).
+  # - `build-e2e-*` builds and archives `-p may-agent --all-targets` alone (no
+  #   `may-daemon` / `may-agent-core` unit-test targets), packs `may-debug-*`,
+  #   and fans out E2E shards + Container Acceptance.
+  build-e2e-ubuntu:
+    name: build-e2e (ubuntu-latest)
     needs: scope
-    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true' || needs.scope.outputs.linux-unit-cargo-flags != '') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: write
@@ -406,27 +411,32 @@ jobs:
       - id: build
         uses: ./.github/actions/build-tests
         with:
-          e2e: ${{ (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') && 'true' || 'false' }}
-          cargo-flags: ${{ needs.scope.outputs.linux-cargo-flags || '--workspace --all-targets' }}
+          e2e: 'true'
+          cargo-flags: '-p may-agent --all-targets'
 
   test-ubuntu-unit:
     name: test-unit (ubuntu-latest)
-    needs: [scope, build-tests-ubuntu]
-    if: ${{ !cancelled() && needs.build-tests-ubuntu.result == 'success' && needs.build-tests-ubuntu.outputs.run-tests == 'true' && (needs.scope.result != 'success' || needs.scope.outputs.linux-unit-cargo-flags != '') }}
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.linux-unit-cargo-flags != '') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/run-tests
+      - uses: ./.github/actions/build-tests
         with:
-          filter: 'not package(may-agent)'
+          e2e: 'false'
+          cargo-flags: ${{ needs.scope.outputs.linux-unit-cargo-flags || '--workspace --exclude may-agent --all-targets' }}
 
   test-ubuntu-e2e:
     name: test-e2e (ubuntu-latest, ${{ matrix.shard }}/4)
-    needs: [scope, build-tests-ubuntu]
-    if: ${{ !cancelled() && needs.build-tests-ubuntu.result == 'success' && needs.build-tests-ubuntu.outputs.run-tests == 'true' }}
+    needs: [scope, build-e2e-ubuntu]
+    if: ${{ !cancelled() && needs.build-e2e-ubuntu.result == 'success' && needs.build-e2e-ubuntu.outputs.run-tests == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -443,16 +453,16 @@ jobs:
           shard: ${{ matrix.shard }}
           total-shards: 4
 
-  # Pull requests skip macOS jobs; the merge queue runs them on the tree that
-  # lands on main, using one archive build -> unit + 2 E2E shards (keeping peak
-  # concurrent macOS runners at 3 to avoid runner-pool queuing delays while both
-  # E2E shards finish under `test-unit`'s wall time).
-  build-tests-macos:
-    name: build-tests (macos-latest)
+  # Pull requests skip macOS jobs; the merge queue runs `test-macos-unit` and
+  # `build-e2e-macos` -> 2 E2E shards in parallel (peak concurrent macOS
+  # runners stays at 3, avoiding runner-pool queuing delays while keeping every
+  # macOS build under 7 GiB RAM).
+  build-e2e-macos:
+    name: build-e2e (macos-latest)
     needs: scope
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true' || needs.scope.outputs.unit-cargo-flags != '') }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') }}
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: write
@@ -466,27 +476,32 @@ jobs:
       - id: build
         uses: ./.github/actions/build-tests
         with:
-          e2e: ${{ (needs.scope.result != 'success' || needs.scope.outputs.e2e == 'true') && 'true' || 'false' }}
-          cargo-flags: ${{ needs.scope.outputs.cargo-flags || '--workspace --all-targets' }}
+          e2e: 'true'
+          cargo-flags: '-p may-agent --all-targets'
 
   test-macos-unit:
     name: test-unit (macos-latest)
-    needs: [scope, build-tests-macos]
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-tests-macos.result == 'success' && needs.build-tests-macos.outputs.run-tests == 'true' && (needs.scope.result != 'success' || needs.scope.outputs.unit-cargo-flags != '') }}
+    needs: scope
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (needs.scope.result != 'success' || needs.scope.outputs.unit-cargo-flags != '') }}
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/run-tests
+      - uses: ./.github/actions/build-tests
         with:
-          filter: 'not package(may-agent)'
+          e2e: 'false'
+          cargo-flags: ${{ needs.scope.outputs.unit-cargo-flags || '--workspace --exclude may-agent --all-targets' }}
 
   test-macos-e2e:
     name: test-e2e (macos-latest, ${{ matrix.shard }}/2)
-    needs: [scope, build-tests-macos]
-    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-tests-macos.result == 'success' && needs.build-tests-macos.outputs.run-tests == 'true' }}
+    needs: [scope, build-e2e-macos]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.build-e2e-macos.result == 'success' && needs.build-e2e-macos.outputs.run-tests == 'true' }}
     runs-on: macos-latest
     timeout-minutes: 20
     strategy:
@@ -503,13 +518,12 @@ jobs:
           shard: ${{ matrix.shard }}
           total-shards: 2
 
-  # Starts as soon as `container-image` and `build-tests-ubuntu` finish,
-  # running in parallel with `test-ubuntu-unit` and all 4 `test-ubuntu-e2e`
-  # shards.
+  # Starts as soon as `container-image` and `build-e2e-ubuntu` finish,
+  # running in parallel with all 4 `test-ubuntu-e2e` shards.
   container-acceptance:
     name: Container Acceptance
-    needs: [scope, container-image, build-tests-ubuntu]
-    if: ${{ !cancelled() && needs.container-image.result == 'success' && needs.build-tests-ubuntu.result == 'success' && (needs.scope.result != 'success' || needs.scope.outputs.acceptance == 'true') }}
+    needs: [scope, container-image, build-e2e-ubuntu]
+    if: ${{ !cancelled() && needs.container-image.result == 'success' && needs.build-e2e-ubuntu.result == 'success' && (needs.scope.result != 'success' || needs.scope.outputs.acceptance == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -584,10 +598,10 @@ jobs:
       - clippy-hashline
       - test-hashline-ubuntu
       - test-hashline-macos
-      - build-tests-ubuntu
+      - build-e2e-ubuntu
       - test-ubuntu-unit
       - test-ubuntu-e2e
-      - build-tests-macos
+      - build-e2e-macos
       - test-macos-unit
       - test-macos-e2e
       - container-image
