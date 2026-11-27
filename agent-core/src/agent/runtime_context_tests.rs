@@ -850,9 +850,41 @@ fn hashline_prepared_tools_inject_complete_syntax_for_main_and_subagents() {
         .image_tools(&target)
         .expect("image tools");
 
-    let hashline_catalog = tools
-        .without(crate::tools::ManagedTool::ApplyPatch)
-        .catalog();
+    let target_json = serde_json::json!({ "os": target.os(), "arch": target.arch() });
+    let artifacts: Vec<_> = target
+        .tools_for_mode(true)
+        .into_iter()
+        .map(|tool| {
+            serde_json::json!({
+                "tool": tool,
+                "version": "1.0.0",
+                "target": target_json,
+                "url": format!("https://example.invalid/{}", tool.command()),
+                "sha256": "00".repeat(32),
+                "size": 1,
+                "encoding": { "format": "executable" },
+            })
+        })
+        .collect();
+    let python: Vec<_> = target
+        .provides_python()
+        .then(|| {
+            serde_json::json!({
+                "version": "3.13.1",
+                "target": target_json,
+                "interpreter_sha256": "00".repeat(32),
+            })
+        })
+        .into_iter()
+        .collect();
+    let manifest = serde_json::json!({ "artifacts": artifacts, "python": python });
+    let hashline_catalog = crate::tools::ToolDistribution::from_json(
+        &serde_json::to_vec(&manifest).expect("manifest json"),
+    )
+    .expect("hashline fixture distribution")
+    .image_tools_for_mode(&target, true)
+    .expect("hashline image tools")
+    .catalog();
     let hashline_tools =
         super::build_prepared_tools(&hashline_catalog, true).expect("hashline prepared tools");
     let subagent_blocks = super::build_subagent_instructions(

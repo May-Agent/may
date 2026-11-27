@@ -598,6 +598,43 @@ mod tests {
         image.verify(&image_transport(&out)).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn image_verification_exposes_only_selected_mode_tools() {
+        use crate::distribution::tests::{file_artifact, script_distribution_with_hashline};
+        let files = tempfile::tempdir().unwrap();
+        let out = crate::runtime::tests::unlocking_tempdir();
+        let target = ToolTarget::native().unwrap();
+        let distribution =
+            script_distribution_with_hashline(&target, "1.0.0", files.path(), file_artifact);
+        distribution
+            .stage_image_tools(&target, &files.path().join("cache"), out.path())
+            .await
+            .unwrap();
+
+        let baseline = distribution
+            .image_tools_for_mode(&target, false)
+            .unwrap()
+            .verify(&image_transport(&out))
+            .await
+            .unwrap();
+        let baseline_catalog = baseline.catalog().render(false).unwrap();
+        assert!(baseline_catalog.contains("- apply_patch\n"));
+        assert!(!baseline_catalog.contains("- search\n"));
+        assert!(!baseline_catalog.contains("- edit\n"));
+
+        let hashline = distribution
+            .image_tools_for_mode(&target, true)
+            .unwrap()
+            .verify(&image_transport(&out))
+            .await
+            .unwrap();
+        assert_ne!(hashline.bin_dir(), baseline.bin_dir());
+        let hashline_catalog = hashline.catalog().render(true).unwrap();
+        assert!(hashline_catalog.contains("- search\n"));
+        assert!(hashline_catalog.contains("- edit\n"));
+        assert!(!hashline_catalog.contains("- apply_patch\n"));
+    }
+
     struct LocalTransport;
     impl ToolTransport for LocalTransport {
         async fn run(

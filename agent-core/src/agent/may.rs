@@ -639,33 +639,35 @@ impl std::fmt::Debug for MayAgent {
     }
 }
 
-/// Pre-warms the shared local host [`ToolEnvironments`] slot on daemon startup
-/// so the first session does not wait for binary verification or staging.
+/// Acquires the shared local host [`ToolEnvironments`] preparation lease for
+/// `hashline` before returning, then runs download and verification in a
+/// background task on `handle`.
+///
+/// Holding the lease before returning closes the startup and live-reload race
+/// window: any session starting afterward for `(HomeBackend::Local, hashline)`
+/// blocks on the in-flight preparation until it finishes (or fails fast if
+/// preparation fails). When the slot is already ready or another preparation
+/// is already in flight, this returns immediately without spawning duplicate
+/// work.
 pub async fn prewarm_host_tools(
-    may_dir: &Path,
-    tool_distribution: &crate::tools::ToolDistribution,
+    handle: &tokio::runtime::Handle,
+    may_dir: PathBuf,
+    tool_distribution: Arc<crate::tools::ToolDistribution>,
     tool_environments: &ToolEnvironmentCache,
     hashline: bool,
 ) {
-    let session_id = SessionId::from_string("__daemon_prewarm__".to_string());
-    let tools_dir = crate::session::MayHomePaths::new(may_dir.to_path_buf()).tools_dir();
-    match tool_environments
-        .acquire(&session_id, HomeBackend::Local, hashline)
-        .await
-    {
-        Ok(Acquired::Ready(_)) => {}
-        Ok(Acquired::Prepare(lease)) => {
-            match ToolEnvironments::prepare_host(tool_distribution, &tools_dir, hashline).await {
-                Ok(tools) => lease.complete(tools),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to pre-warm host tool environments");
-                }
+    let Some(lease) = tool_environments.try_lease_local(hashline).await else {
+        return;
+    };
+    let tools_dir = crate::session::MayHomePaths::new(may_dir).tools_dir();
+    handle.spawn(async move {
+        match ToolEnvironments::prepare_host(&tool_distribution, &tools_dir, hashline).await {
+            Ok(tools) => lease.complete(tools),
+            Err(error) => {
+                tracing::warn!(%error, hashline, "failed to pre-warm host tool environments");
             }
         }
-        Err(error) => {
-            tracing::debug!(%error, "skipped host tool environment pre-warm");
-        }
-    }
+    });
 }
 
 /// The session's prepared tools: the cached ones when the session's home

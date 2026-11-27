@@ -159,6 +159,23 @@ impl ToolEnvironmentCache {
         })
     }
 
+    /// Acquires a preparation lease for the shared local host slot when it is
+    /// neither ready nor already being prepared, returning `None` immediately
+    /// otherwise.
+    ///
+    /// Used by daemon startup and live configuration reloads so the preparation
+    /// lease is held before returning and any subsequent [`Self::acquire`] for
+    /// `(HomeBackend::Local, hashline)` blocks on the in-flight download rather
+    /// than racing ahead of it.
+    pub async fn try_lease_local(&self, hashline: bool) -> Option<PreparationLease> {
+        let (reply, response) = oneshot::channel();
+        self.send(Request::TryLease {
+            slot_key: SlotKey::Local { hashline },
+            reply,
+        });
+        response.await.ok().flatten()
+    }
+
     /// Forgets a deleted session's container environments and drops any pending
     /// waiters belonging to that session.
     pub fn evict(&self, session: &SessionId) {
@@ -214,6 +231,10 @@ impl SlotKey {
 #[derive(Debug)]
 enum Request {
     Acquire(Waiter),
+    TryLease {
+        slot_key: SlotKey,
+        reply: oneshot::Sender<Option<PreparationLease>>,
+    },
     Complete {
         slot_key: SlotKey,
         generation: u64,
@@ -266,6 +287,7 @@ async fn run_cache_actor(
     while let Some(request) = requests.recv().await {
         match request {
             Request::Acquire(waiter) => state.serve(VecDeque::from([waiter])),
+            Request::TryLease { slot_key, reply } => state.try_lease(slot_key, reply),
             Request::Complete {
                 slot_key,
                 generation,
@@ -341,6 +363,36 @@ impl CacheState {
                 requests: Some(requests),
             }));
         }
+    }
+
+    fn try_lease(&mut self, slot_key: SlotKey, reply: oneshot::Sender<Option<PreparationLease>>) {
+        if self.slots.iter().any(|(key, _)| *key == slot_key) {
+            let _ = reply.send(None);
+            return;
+        }
+        let Some(requests) = self.requests.upgrade() else {
+            let _ = reply.send(None);
+            return;
+        };
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        tracing::debug!(
+            ?slot_key,
+            generation,
+            "tool environment pre-warm preparation leased"
+        );
+        self.slots.push((
+            slot_key.clone(),
+            Slot::Preparing {
+                generation,
+                waiters: VecDeque::new(),
+            },
+        ));
+        let _ = reply.send(Some(PreparationLease {
+            slot_key,
+            generation,
+            requests: Some(requests),
+        }));
     }
 
     fn complete(&mut self, slot_key: SlotKey, generation: u64, registry: ToolEnvironments) {
@@ -680,5 +732,68 @@ mod tests {
 
         first.complete(registry());
         lease(&cache, &session, key).await;
+    }
+
+    #[tokio::test]
+    async fn prewarm_lease_blocks_hashline_acquire_until_ready_and_does_not_hang_on_failure() {
+        let cache = ToolEnvironmentCache::spawn();
+        let session = SessionId::from_string("one");
+
+        // Pre-warm acquires the lease synchronously; duplicate pre-warms return None immediately.
+        let prewarm = cache
+            .try_lease_local(true)
+            .await
+            .expect("empty slot grants prewarm lease");
+        assert!(
+            cache.try_lease_local(true).await.is_none(),
+            "in-flight slot must not grant a second prewarm lease"
+        );
+
+        // A session requesting hashline = true blocks while prewarm holds the lease,
+        // while hashline = false remains unaffected.
+        let mut waiter = tokio::spawn({
+            let cache = cache.clone();
+            let session = session.clone();
+            async move { acquire_with_hashline(&cache, &session, HomeBackend::Local, true).await }
+        });
+        assert_pending(&mut waiter).await;
+
+        let baseline = cache
+            .try_lease_local(false)
+            .await
+            .expect("baseline slot is isolated from hashline prewarm");
+        baseline.complete(registry());
+        ready_with_hashline(&cache, &session, HomeBackend::Local, false).await;
+
+        // Dropping the failed prewarm lease wakes the waiter immediately so it can
+        // surface the real failure rather than hanging.
+        drop(prewarm);
+        let Acquired::Prepare(retry) = waiter.await.expect("waiter should wake on prewarm failure")
+        else {
+            panic!("waiter must retry after a failed prewarm");
+        };
+        drop(retry);
+
+        // Once a subsequent prewarm succeeds, queued waiters receive the ready environment
+        // and another try_lease_local returns None without re-preparing.
+        let prewarm = cache
+            .try_lease_local(true)
+            .await
+            .expect("abandoned slot can be leased again");
+        let mut waiter = tokio::spawn({
+            let cache = cache.clone();
+            let session = session.clone();
+            async move { acquire_with_hashline(&cache, &session, HomeBackend::Local, true).await }
+        });
+        assert_pending(&mut waiter).await;
+        prewarm.complete(registry());
+        assert!(matches!(
+            waiter.await.expect("waiter should join"),
+            Acquired::Ready(_)
+        ));
+        assert!(
+            cache.try_lease_local(true).await.is_none(),
+            "ready slot must not grant a new prewarm lease"
+        );
     }
 }

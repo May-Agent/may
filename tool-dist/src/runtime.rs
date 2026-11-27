@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use aither_sandbox::{ContainerLaunch, ContainerPath, RemoteLaunch};
 
-use super::python::{PYTHON_COMMAND, unlock_tree};
+use super::python::{PYTHON_COMMAND, unlock_dirs, unlock_tree};
 pub use super::python::{PythonPin, PythonRuntime};
 
 /// Commands guaranteed by a prepared execution environment.
@@ -17,6 +17,12 @@ pub use super::python::{PythonPin, PythonRuntime};
 pub enum ManagedTool {
     /// Contextual multi-file editing.
     ApplyPatch,
+    /// Hash-anchored line and structural code search (`[experimental] hashline`).
+    #[serde(rename = "search")]
+    HashlineSearch,
+    /// Hash-anchored file editing (`[experimental] hashline`).
+    #[serde(rename = "edit")]
+    HashlineEdit,
     /// Parallel text and file search.
     Ripgrep,
     /// Syntax-aware code search.
@@ -159,9 +165,27 @@ pub const COREUTILS_ALIASES: &[&str] = &[
 ];
 
 impl ManagedTool {
-    /// Every managed tool, in stable prompt order. The tools a platform must
-    /// provide are [`ToolTarget::required_tools`].
-    pub const ALL: [Self; 10] = [
+    /// Every managed tool, in stable prompt order, including experimental
+    /// opt-in tools. The default baseline tools a platform must provide are
+    /// [`ToolTarget::required_tools`].
+    pub const ALL: [Self; 12] = [
+        Self::ApplyPatch,
+        Self::HashlineSearch,
+        Self::HashlineEdit,
+        Self::Ripgrep,
+        Self::AstGrep,
+        Self::Jq,
+        Self::Bash,
+        Self::Coreutils,
+        Self::Xargs,
+        Self::Fd,
+        Self::Sed,
+        Self::Uv,
+    ];
+
+    /// The default baseline tools on Unix platforms (excluding experimental
+    /// opt-in tools).
+    pub const BASELINE: [Self; 10] = [
         Self::ApplyPatch,
         Self::Ripgrep,
         Self::AstGrep,
@@ -174,14 +198,26 @@ impl ManagedTool {
         Self::Uv,
     ];
 
-    /// The tools with an artifact on every platform, Windows included.
+    /// The baseline tools with an artifact on every platform, Windows included.
     const PORTABLE: [Self; 4] = [Self::ApplyPatch, Self::Ripgrep, Self::AstGrep, Self::Jq];
+
+    /// The experimental hashline tools that replace `apply_patch` when
+    /// `[experimental] hashline` is enabled.
+    pub const HASHLINE: [Self; 2] = [Self::HashlineSearch, Self::HashlineEdit];
+
+    /// Whether this tool is part of the experimental hashline toolset.
+    #[must_use]
+    pub const fn is_hashline(self) -> bool {
+        matches!(self, Self::HashlineSearch | Self::HashlineEdit)
+    }
 
     /// Name used by the model in every execution environment.
     #[must_use]
     pub const fn command(self) -> &'static str {
         match self {
             Self::ApplyPatch => "apply_patch",
+            Self::HashlineSearch => "search",
+            Self::HashlineEdit => "edit",
             Self::Ripgrep => "rg",
             Self::AstGrep => "ast-grep",
             Self::Jq => "jq",
@@ -237,6 +273,8 @@ impl ManagedTool {
             | Self::Sed
             | Self::Uv
             | Self::ApplyPatch
+            | Self::HashlineSearch
+            | Self::HashlineEdit
             | Self::Ripgrep
             | Self::AstGrep => second_word()?,
         };
@@ -369,16 +407,45 @@ impl ToolTarget {
         &self.arch
     }
 
-    /// The tools every environment of this platform must provide: Windows
-    /// has no `bash`, `coreutils`, `xargs`, `fd`, `aither-sed` or `uv` artifacts, every other
-    /// platform the complete set.
+    /// The default baseline tools every environment of this platform must
+    /// provide: Windows has no `bash`, `coreutils`, `xargs`, `fd`,
+    /// `aither-sed` or `uv` artifacts, every other platform the complete
+    /// baseline set. Experimental opt-in tools (`search`, `edit`) are excluded.
     #[must_use]
     pub fn required_tools(&self) -> &'static [ManagedTool] {
         if self.os == "windows" {
             &ManagedTool::PORTABLE
         } else {
-            &ManagedTool::ALL
+            &ManagedTool::BASELINE
         }
+    }
+
+    /// The experimental hashline tools (`search`, `edit`) for this platform.
+    #[must_use]
+    pub const fn hashline_tools(&self) -> &'static [ManagedTool] {
+        &ManagedTool::HASHLINE
+    }
+
+    /// The tools required for this platform under `hashline` mode, in stable
+    /// prompt order.
+    ///
+    /// When `hashline` is `false`, returns [`Self::required_tools`].
+    /// When `hashline` is `true`, replaces `apply_patch` with `search` and
+    /// `edit`.
+    #[must_use]
+    pub fn tools_for_mode(&self, hashline: bool) -> Vec<ManagedTool> {
+        if !hashline {
+            return self.required_tools().to_vec();
+        }
+        let mut tools: Vec<ManagedTool> = self
+            .required_tools()
+            .iter()
+            .copied()
+            .filter(|tool| *tool != ManagedTool::ApplyPatch)
+            .chain(self.hashline_tools().iter().copied())
+            .collect();
+        tools.sort_unstable();
+        tools
     }
 
     /// Whether the environment of this platform carries the managed
@@ -583,7 +650,7 @@ pub struct ToolBundle {
 }
 
 impl ToolBundle {
-    /// Constructs a complete baseline from verified binaries and, on a
+    /// Constructs a complete baseline bundle from verified binaries and, on a
     /// platform that provides one, the interpreter its `uv` installs.
     ///
     /// # Errors
@@ -591,8 +658,26 @@ impl ToolBundle {
     /// interpreter pin; partial bundles cannot become ready.
     pub fn new(
         target: ToolTarget,
+        binaries: Vec<ToolBinary>,
+        python: Option<PythonRuntime>,
+    ) -> Result<Self, ToolRuntimeError> {
+        Self::for_mode(target, binaries, python, false)
+    }
+
+    /// Constructs a complete verified bundle for `target` and `hashline` mode.
+    ///
+    /// When `hashline` is `false`, requires [`ToolTarget::required_tools`].
+    /// When `hashline` is `true`, requires [`ToolTarget::tools_for_mode`] with
+    /// `search` and `edit` in place of `apply_patch`.
+    ///
+    /// # Errors
+    /// Rejects missing, duplicate or unexpected commands, and a missing or
+    /// unexpected interpreter pin; partial bundles cannot become ready.
+    pub fn for_mode(
+        target: ToolTarget,
         mut binaries: Vec<ToolBinary>,
         python: Option<PythonRuntime>,
+        hashline: bool,
     ) -> Result<Self, ToolRuntimeError> {
         binaries.sort_by_key(|binary| binary.tool);
         for pair in binaries.windows(2) {
@@ -600,14 +685,14 @@ impl ToolBundle {
                 return Err(ToolRuntimeError::DuplicateTool(pair[0].tool));
             }
         }
-        let required = target.required_tools();
+        let expected = target.tools_for_mode(hashline);
         if let Some(binary) = binaries
             .iter()
-            .find(|binary| !required.contains(&binary.tool))
+            .find(|binary| !expected.contains(&binary.tool))
         {
             return Err(ToolRuntimeError::UnexpectedTool(binary.tool));
         }
-        for &tool in required {
+        for &tool in &expected {
             if !binaries.iter().any(|binary| binary.tool == tool) {
                 return Err(ToolRuntimeError::MissingTool(tool));
             }
@@ -618,26 +703,6 @@ impl ToolBundle {
             binaries: binaries.into(),
             python,
         })
-    }
-
-    /// The bundle with `tool` left out — a verified bundle stays verified,
-    /// and its dropped binary changes the cache key, so the stripped bundle
-    /// prepares its own content-addressed directory.
-    ///
-    /// Used by the experimental hashline mode to serve sessions an
-    /// environment without `apply_patch`.
-    #[must_use]
-    pub fn without(&self, tool: ManagedTool) -> Self {
-        Self {
-            target: self.target.clone(),
-            binaries: self
-                .binaries
-                .iter()
-                .filter(|binary| binary.tool != tool)
-                .cloned()
-                .collect(),
-            python: self.python.clone(),
-        }
     }
 
     /// The target platform; never inferred from the coordinator for a remote backend.
@@ -781,6 +846,111 @@ impl ToolBundle {
             discarded.close()?;
         }
         self.verify_prepared(&destination)
+    }
+
+    /// Stages this bundle at `<root>/<key>`, hardlinking shared executables
+    /// and the read-only `.python` tree from an already-verified sibling
+    /// `peer_bin` directory under `root`.
+    ///
+    /// Used by container image staging so the baseline and hashline tool
+    /// directories share identical binaries and `CPython` without duplicating
+    /// bytes or running `uv python install` twice.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous staging and lock operations execute inside blocking::unblock"
+    )]
+    pub(crate) fn prepare_local_from_peer_sync(
+        &self,
+        root: &Path,
+        key: &str,
+        peer_bin: &Path,
+    ) -> Result<PreparedTools<PathBuf>, ToolRuntimeError> {
+        std::fs::create_dir_all(root)?;
+        let root = std::fs::canonicalize(root)?;
+        let destination = root.join(key);
+        if let Some(prepared) = self.reusable(&destination)? {
+            return Ok(prepared);
+        }
+        let lock_path = root.join(format!(".{key}.lock"));
+        let mut lock = fd_lock::RwLock::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)?,
+        );
+        let _guard = lock.write()?;
+        if let Some(prepared) = self.reusable(&destination)? {
+            return Ok(prepared);
+        }
+        let stage = self.stage_scratch_from_peer(&root, peer_bin)?;
+        let discarded = if destination.try_exists()? {
+            let discarded = tempfile::Builder::new()
+                .prefix(".invalid-")
+                .tempdir_in(&root)?;
+            std::fs::rename(&destination, discarded.path().join("runtime"))?;
+            Some(discarded)
+        } else {
+            None
+        };
+        match std::fs::rename(stage.path(), &destination) {
+            Ok(()) => {}
+            Err(error) if destination.try_exists()? => {
+                tracing::debug!(%error, "another initializer activated the tool bundle");
+                let _ = unlock_dirs(stage.path());
+            }
+            Err(error) => {
+                let _ = unlock_dirs(stage.path());
+                return Err(error.into());
+            }
+        }
+        if let Some(discarded) = discarded {
+            let _ = unlock_dirs(&discarded.path().join("runtime"));
+            discarded.close()?;
+        }
+        self.verify_prepared(&destination)
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous staging runs inside prepare_local_from_peer_sync under blocking::unblock"
+    )]
+    fn stage_scratch_from_peer(
+        &self,
+        root: &Path,
+        peer_bin: &Path,
+    ) -> Result<tempfile::TempDir, ToolRuntimeError> {
+        let stage = tempfile::Builder::new()
+            .prefix(".initializing-")
+            .tempdir_in(root)?;
+        let bin = stage.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        for binary in self.binaries.iter() {
+            let exe = binary.tool.executable_name(&self.target);
+            let path = bin.join(&exe);
+            let peer_exe = peer_bin.join(&exe);
+            if !binary.tool.is_hashline()
+                && peer_exe.is_file()
+                && std::fs::hard_link(&peer_exe, &path).is_ok()
+            {
+                // Shared read-only executable already verified in peer_bin.
+            } else {
+                std::fs::write(&path, &binary.bytes)?;
+                set_executable_readonly(&path)?;
+            }
+            if !binary.tool.aliases().is_empty() {
+                if binary.tool.lists_aliases() && self.target == ToolTarget::native()? {
+                    ensure_aliases_provided(binary.tool, &path)?;
+                }
+                for alias in binary.tool.aliases() {
+                    link_alias(binary.tool, &bin.join(alias))?;
+                }
+            }
+        }
+        if let Some(python) = &self.python {
+            python.stage_from_peer(&self.target, stage.path(), peer_bin)?;
+        }
+        Ok(stage)
     }
 
     /// Opens up the read-only managed interpreter tree under `runtime` so the
@@ -1099,22 +1269,6 @@ impl ImageTools {
                 .map(|python| (python.version(), python.interpreter_sha256())),
         };
         Ok(hex::encode(digest(&serde_json::to_vec(&identity)?)))
-    }
-
-    /// The pinned tools with `tool` left out, for the experimental hashline
-    /// mode's `apply_patch`-free images.
-    #[must_use]
-    pub fn without(&self, tool: ManagedTool) -> Self {
-        Self {
-            target: self.target.clone(),
-            tools: self
-                .tools
-                .iter()
-                .filter(|entry| entry.tool != tool)
-                .cloned()
-                .collect(),
-            python: self.python.clone(),
-        }
     }
 
     /// Where the image carries these tools: `/opt/aither/tools/<cache key>`.
@@ -2193,7 +2347,10 @@ printf '%s\n' 'uv @VERSION@'
     #[test]
     fn required_tools_depend_on_the_platform() {
         for os in ["Darwin", "Linux"] {
-            assert_eq!(target(os).required_tools(), ManagedTool::ALL, "{os}");
+            let required = target(os).required_tools();
+            assert_eq!(required, ManagedTool::BASELINE, "{os}");
+            assert!(!required.contains(&ManagedTool::HashlineSearch), "{os}");
+            assert!(!required.contains(&ManagedTool::HashlineEdit), "{os}");
         }
         let windows = target("Windows_NT").required_tools();
         assert_eq!(
@@ -2207,6 +2364,46 @@ printf '%s\n' 'uv @VERSION@'
         );
         assert!(!windows.contains(&ManagedTool::Coreutils));
         assert!(!windows.contains(&ManagedTool::Bash));
+        assert!(!windows.contains(&ManagedTool::HashlineSearch));
+        assert!(!windows.contains(&ManagedTool::HashlineEdit));
+    }
+
+    #[test]
+    fn hashline_tools_replace_apply_patch_and_serialize_by_command_name() {
+        assert_eq!(
+            serde_json::to_string(&ManagedTool::HashlineSearch).unwrap(),
+            "\"search\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ManagedTool::HashlineEdit).unwrap(),
+            "\"edit\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ManagedTool>("\"search\"").unwrap(),
+            ManagedTool::HashlineSearch
+        );
+        assert_eq!(
+            serde_json::from_str::<ManagedTool>("\"edit\"").unwrap(),
+            ManagedTool::HashlineEdit
+        );
+        assert!(ManagedTool::HashlineSearch.is_hashline());
+        assert!(ManagedTool::HashlineEdit.is_hashline());
+        assert!(!ManagedTool::ApplyPatch.is_hashline());
+        assert_eq!(ManagedTool::HashlineSearch.command(), "search");
+        assert_eq!(ManagedTool::HashlineEdit.command(), "edit");
+
+        for os in ["Darwin", "Linux", "Windows_NT"] {
+            let platform = target(os);
+            let baseline = platform.tools_for_mode(false);
+            assert!(baseline.contains(&ManagedTool::ApplyPatch), "{os}");
+            assert!(!baseline.contains(&ManagedTool::HashlineSearch), "{os}");
+            assert!(!baseline.contains(&ManagedTool::HashlineEdit), "{os}");
+
+            let hashline = platform.tools_for_mode(true);
+            assert!(!hashline.contains(&ManagedTool::ApplyPatch), "{os}");
+            assert!(hashline.contains(&ManagedTool::HashlineSearch), "{os}");
+            assert!(hashline.contains(&ManagedTool::HashlineEdit), "{os}");
+        }
     }
 
     fn script_binaries(tools: &[ManagedTool]) -> Vec<ToolBinary> {
@@ -2229,7 +2426,11 @@ printf '%s\n' 'uv @VERSION@'
         )
         .unwrap();
         assert!(matches!(
-            ToolBundle::new(windows.clone(), script_binaries(&ManagedTool::ALL), None),
+            ToolBundle::new(
+                windows.clone(),
+                script_binaries(&ManagedTool::BASELINE),
+                None
+            ),
             Err(ToolRuntimeError::UnexpectedTool(ManagedTool::Bash))
         ));
         // Windows has no managed `uv`, so no interpreter pin either.
@@ -2249,12 +2450,12 @@ printf '%s\n' 'uv @VERSION@'
         let linux = target("Linux");
         assert!(linux.provides_python());
         assert!(matches!(
-            ToolBundle::new(linux.clone(), script_binaries(&ManagedTool::ALL), None),
+            ToolBundle::new(linux.clone(), script_binaries(&ManagedTool::BASELINE), None),
             Err(ToolRuntimeError::MissingPython)
         ));
         ToolBundle::new(
             linux,
-            script_binaries(&ManagedTool::ALL),
+            script_binaries(&ManagedTool::BASELINE),
             Some(fixture_python()),
         )
         .unwrap();
@@ -2263,13 +2464,70 @@ printf '%s\n' 'uv @VERSION@'
     #[test]
     fn unix_bundle_without_coreutils_is_incomplete() {
         let linux = target("Linux");
-        let tools = ManagedTool::ALL
+        let tools = ManagedTool::BASELINE
             .into_iter()
             .filter(|tool| *tool != ManagedTool::Coreutils)
             .collect::<Vec<_>>();
         assert!(matches!(
             ToolBundle::new(linux, script_binaries(&tools), Some(fixture_python())),
             Err(ToolRuntimeError::MissingTool(ManagedTool::Coreutils))
+        ));
+    }
+
+    #[test]
+    fn hashline_bundle_requires_search_and_edit_and_rejects_apply_patch() {
+        let linux = target("Linux");
+        let tools = linux.tools_for_mode(true);
+        let bundle = ToolBundle::for_mode(
+            linux.clone(),
+            script_binaries(&tools),
+            Some(fixture_python()),
+            true,
+        )
+        .unwrap();
+        let rendered = bundle.catalog().render(true).unwrap();
+        assert!(rendered.contains("- search\n"), "{rendered}");
+        assert!(rendered.contains("- edit\n"), "{rendered}");
+        assert!(!rendered.contains("- apply_patch\n"), "{rendered}");
+        assert!(rendered.contains("search rg"), "{rendered}");
+        assert!(rendered.contains("edit <<'PATCH'"), "{rendered}");
+        assert!(!rendered.contains("*** Begin Patch"), "{rendered}");
+
+        // Baseline bundle rejects hashline binaries.
+        assert!(matches!(
+            ToolBundle::new(
+                linux.clone(),
+                script_binaries(&tools),
+                Some(fixture_python())
+            ),
+            Err(ToolRuntimeError::UnexpectedTool(
+                ManagedTool::HashlineSearch
+            ))
+        ));
+
+        // Hashline bundle rejects missing `edit` and rejects `apply_patch`.
+        let missing_edit = tools
+            .iter()
+            .copied()
+            .filter(|tool| *tool != ManagedTool::HashlineEdit)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            ToolBundle::for_mode(
+                linux.clone(),
+                script_binaries(&missing_edit),
+                Some(fixture_python()),
+                true
+            ),
+            Err(ToolRuntimeError::MissingTool(ManagedTool::HashlineEdit))
+        ));
+        assert!(matches!(
+            ToolBundle::for_mode(
+                linux,
+                script_binaries(&ManagedTool::BASELINE),
+                Some(fixture_python()),
+                true
+            ),
+            Err(ToolRuntimeError::UnexpectedTool(ManagedTool::ApplyPatch))
         ));
     }
 
@@ -2291,6 +2549,8 @@ printf '%s\n' 'uv @VERSION@'
             ),
             (ManagedTool::Fd, "fd 10.5.0\n", "10.5.0"),
             (ManagedTool::Sed, "aither-sed 0.13.0\n", "0.13.0"),
+            (ManagedTool::HashlineSearch, "search 0.1.0\n", "0.1.0"),
+            (ManagedTool::HashlineEdit, "edit 0.1.0\n", "0.1.0"),
             (
                 ManagedTool::Ripgrep,
                 "ripgrep 15.2.0\nfeatures:+pcre2\n",
@@ -2414,7 +2674,7 @@ printf '%s\n' 'uv @VERSION@'
     #[tokio::test]
     async fn alias_the_binary_does_not_provide_is_a_staging_error() {
         let cache = unlocking_tempdir();
-        let mut binaries = script_binaries(&ManagedTool::ALL);
+        let mut binaries = script_binaries(&ManagedTool::BASELINE);
         let limited = b"#!/bin/sh\ncase \"$1\" in --list) printf 'cat\\n'; exit 0;; esac\nprintf '%s\\n' 'coreutils 1.0.0'\n".to_vec();
         let position = binaries
             .iter()
@@ -2954,7 +3214,7 @@ printf '%s\n' 'uv @VERSION@'
             },
         )
         .unwrap();
-        let binaries = script_binaries(&ManagedTool::ALL);
+        let binaries = script_binaries(&ManagedTool::BASELINE);
         let bundle = ToolBundle::new(foreign.clone(), binaries, Some(fixture_python())).unwrap();
         let root = unlocking_tempdir();
         let key = bundle.cache_key().unwrap();
@@ -3083,7 +3343,12 @@ printf '%s\n' 'uv @VERSION@'
 
     #[test]
     fn hashline_prompt_catalog_injects_compact_search_and_edit_syntax() {
-        let catalog = bundle().without(ManagedTool::ApplyPatch).catalog();
+        let target = ToolTarget::native().unwrap();
+        let tools = target.tools_for_mode(true);
+        let python = target.provides_python().then(fixture_python);
+        let catalog = ToolBundle::for_mode(target, script_binaries(&tools), python, true)
+            .unwrap()
+            .catalog();
         let rendered = catalog.render(true).unwrap();
         assert_eq!(rendered, catalog.render(true).unwrap());
 

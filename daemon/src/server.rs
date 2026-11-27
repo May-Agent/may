@@ -437,6 +437,17 @@ pub async fn start(
     });
 
     state.ensure_session_publisher();
+    // Acquire the local tool-environment preparation lease before resuming
+    // sessions or serving requests so any agent starting while tools download
+    // blocks on this preparation until it completes (or fails fast).
+    crate::agent::prewarm_host_tools(
+        &state.tokio_handle,
+        state.may_dir.clone(),
+        state.tool_distribution.clone(),
+        &state.tool_environments,
+        state.config_snapshot().experimental.hashline,
+    )
+    .await;
     if let Some(browser_manager) = state.browser_manager() {
         state.attach_browser_idle_hooks(&browser_manager);
     }
@@ -473,21 +484,6 @@ pub async fn start(
         .context("failed to resume persisted pending session runs")?;
 
     // Spawn background tasks
-    {
-        let may_dir = state.may_dir.clone();
-        let tool_distribution = state.tool_distribution.clone();
-        let tool_environments = state.tool_environments.clone();
-        let hashline = state.config_snapshot().experimental.hashline;
-        state.tokio_handle.spawn(async move {
-            crate::agent::prewarm_host_tools(
-                &may_dir,
-                &tool_distribution,
-                &tool_environments,
-                hashline,
-            )
-            .await;
-        });
-    }
     // Build the shared HTTP transport — TLS engine and the platform trust
     // store — at daemon startup, off the async worker, so the first session's
     // LLM request never pays the one-time verifier construction.

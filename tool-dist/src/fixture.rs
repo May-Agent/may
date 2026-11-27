@@ -149,8 +149,9 @@ async fn heel_pin(target: &ToolTarget) -> serde_json::Value {
     pin
 }
 
-/// A distribution of one script per tool the native platform requires, written
-/// under `dir`, and the pinned `heel`; keep `dir` alive while it is used.
+/// A distribution of one script per tool the native platform requires plus the
+/// experimental hashline tools, written under `dir`, and the pinned `heel`;
+/// keep `dir` alive while it is used.
 ///
 /// # Panics
 /// Panics when `dir` is not writable or the platform is unsupported.
@@ -161,6 +162,7 @@ pub async fn fixture_distribution(dir: &Path) -> ToolDistribution {
     let artifacts: Vec<_> = target
         .required_tools()
         .iter()
+        .chain(target.hashline_tools().iter())
         .map(|&tool| {
             let bytes = script_tool(tool);
             let path = dir.join(tool.command());
