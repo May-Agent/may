@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The `edit` executable: reads a hashline patch on standard input and
 //! applies it to files relative to the current directory.
 //!

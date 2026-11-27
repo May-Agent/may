@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! The `search` executable: line and structural search whose output carries
 //! hashline anchors — `[path#TAG]` sections of `N:content` lines an `edit`
 //! patch references directly.
