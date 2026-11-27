@@ -283,7 +283,7 @@ impl ToolDistribution {
         hashline: bool,
     ) -> Result<Vec<ToolArtifact>, ToolRuntimeError> {
         let required = target.tools_for_mode(hashline);
-        let mut selected = self
+        let selected = self
             .artifacts
             .iter()
             .filter(|artifact| &artifact.target == target && required.contains(&artifact.tool))
@@ -300,7 +300,6 @@ impl ToolDistribution {
                 _ => return Err(ToolRuntimeError::DuplicateTool(tool)),
             }
         }
-        selected.sort_by_key(|artifact| artifact.tool);
         Ok(selected)
     }
 
@@ -777,10 +776,11 @@ async fn try_verify_manifest_runtime(
     runtimes_root: &Path,
     manifest_path: &Path,
 ) -> Result<Option<PreparedTools<PathBuf>>, ToolRuntimeError> {
-    let expected_tools: Vec<(ManagedTool, semver::Version)> = selected
+    let mut expected_tools: Vec<(ManagedTool, semver::Version)> = selected
         .iter()
         .map(|artifact| Ok((artifact.tool, semver::Version::parse(&artifact.version)?)))
         .collect::<Result<_, ToolRuntimeError>>()?;
+    expected_tools.sort_by_key(|(tool, _)| *tool);
     let target = target.clone();
     let python = python.cloned();
     let runtimes_root = runtimes_root.to_path_buf();
