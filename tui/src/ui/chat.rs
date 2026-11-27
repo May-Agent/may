@@ -3429,6 +3429,7 @@ pub(super) fn element_lines(
     images_supported: bool,
     assets: &ChatAssets,
     width: u16,
+    tilde_root: Option<&std::path::Path>,
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
@@ -3532,6 +3533,7 @@ pub(super) fn element_lines(
                 state.open,
                 state.spinner_frame,
                 &assets.highlighting,
+                tilde_root,
                 Some(&mut stage_marks),
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
@@ -3765,7 +3767,14 @@ pub(super) fn element_lines(
                     // `state` describes the group row itself.
                     let inner_state =
                         ElementState::of(inner, None, state.hide_todos, state.spinner_frame);
-                    let sub = element_lines(inner, inner_state, images_supported, assets, width);
+                    let sub = element_lines(
+                        inner,
+                        inner_state,
+                        images_supported,
+                        assets,
+                        width,
+                        tilde_root,
+                    );
                     let offset = lines.len();
                     let target_base = u32::try_from(stage_targets.len()).unwrap_or(0);
                     lines.extend(sub.lines);
@@ -3983,9 +3992,11 @@ fn render_impl(
         ..inner
     };
     // Rows come pre-wrapped so none reaches past the column (see `wrap`).
-    Paragraph::new(super::wrap::wrap_lines(&lines, inner.width))
+    let wrapped = super::wrap::wrap_lines(&lines, inner.width);
+    Paragraph::new(wrapped.clone())
         .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
         .render(body, frame.buffer_mut());
+    super::wrap::paint_line_backgrounds(&wrapped, skip, body, frame.buffer_mut());
 
     // The band background: every cell of the band's rows and of user
     // message rows — padding columns and trailing space included.
@@ -5109,6 +5120,7 @@ fn render_tool_inline<'a>(
         0,
         &super::highlight::Highlighting::default(),
         None,
+        None,
     );
 }
 
@@ -5123,6 +5135,7 @@ fn render_tool_inline_at<'a>(
     open: bool,
     spinner_frame: usize,
     highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
     stage_marks: Option<&mut StageMarks<'_>>,
 ) {
     let selection_style = if is_selected {
@@ -5156,7 +5169,12 @@ fn render_tool_inline_at<'a>(
             ..
         } = display
         {
-            lines.extend(edit_preview_lines(reading, selection_style));
+            lines.extend(edit_preview_lines(
+                reading,
+                selection_style,
+                highlighting,
+                tilde_root,
+            ));
         }
         return;
     }
@@ -5208,7 +5226,12 @@ fn render_tool_inline_at<'a>(
             }
             .into_iter();
             if let Some(reading) = recognised {
-                lines.extend(reading_lines(reading, selection_style));
+                lines.extend(reading_lines(
+                    reading,
+                    selection_style,
+                    highlighting,
+                    tilde_root,
+                ));
             } else if let Some(first) = command_rows.next() {
                 let mut first_spans = vec![
                     Span::styled(
@@ -5840,25 +5863,115 @@ pub fn card_lines(card: &Card, selection_style: Style, open: bool) -> Vec<Line<'
     lines
 }
 
+/// Subtle dark code-block surface for diff context and framing rows.
+const DIFF_CODE_BG: Color = Color::Rgb(26, 29, 36);
+/// Subtle dark green row tint for added diff lines.
+const DIFF_ADD_BG: Color = Color::Rgb(22, 46, 32);
+/// Brighter green inline tint for emphasized changed tokens on added lines.
+const DIFF_ADD_EMPH_BG: Color = Color::Rgb(36, 86, 52);
+/// Subtle dark red row tint for removed diff lines.
+const DIFF_DEL_BG: Color = Color::Rgb(54, 24, 28);
+/// Brighter red inline tint for emphasized changed tokens on removed lines.
+const DIFF_DEL_EMPH_BG: Color = Color::Rgb(96, 36, 42);
+/// Muted gray line-number foreground on context lines.
+const DIFF_LINE_NUM_CTX: Color = Color::Rgb(110, 118, 129);
+/// Muted green line-number foreground on added lines.
+const DIFF_LINE_NUM_ADD: Color = Color::Rgb(98, 168, 118);
+/// Muted red line-number foreground on removed lines.
+const DIFF_LINE_NUM_DEL: Color = Color::Rgb(186, 102, 108);
+/// Muted blue-gray foreground for hunk `@@` anchor lines.
+const DIFF_ANCHOR_FG: Color = Color::Rgb(128, 146, 170);
+/// Default code foreground when no syntax highlighter matches a file extension.
+const DIFF_CODE_FG: Color = Color::Rgb(192, 197, 206);
+/// Minimum column width for right-aligned diff line numbers.
+const MIN_DIFF_LINE_NUM_WIDTH: usize = 3;
+
 /// The rows a recognised script renders as: one line per step in plain
-/// words (an unknown step as its raw command), and a line-numbered diff
-/// under every edit.
+/// words (an unknown step as its raw command), and a syntax-highlighted,
+/// line-numbered diff under every edit.
 #[must_use]
-pub fn reading_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
-    reading_rows(reading, selection_style, false, EDIT_PREVIEW_ROWS)
+pub fn reading_lines(
+    reading: &CommandReading,
+    selection_style: Style,
+    highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
+) -> Vec<Line<'static>> {
+    reading_rows(
+        reading,
+        selection_style,
+        highlighting,
+        tilde_root,
+        false,
+        EDIT_PREVIEW_ROWS,
+    )
+}
+
+/// Row count [`reading_lines`] produces for `reading`, computed without
+/// running syntax highlighting or inline diff refinement.
+#[must_use]
+pub fn reading_line_count(reading: &CommandReading) -> usize {
+    let mut rows = 0usize;
+    let mut diff_rows = 0usize;
+    for step in &reading.steps {
+        match &step.intent {
+            Intent::Unknown { source } => {
+                rows += source.lines().count().max(1);
+            }
+            Intent::Edit { files } => {
+                if files.len() > 1 {
+                    rows += 1;
+                }
+                for file in files {
+                    rows += 1;
+                    for (anchor, hunk_rows) in file_hunks(&file.change) {
+                        if anchor.is_some() && diff_rows < EDIT_PREVIEW_ROWS {
+                            rows += 1;
+                        }
+                        for _ in hunk_rows {
+                            if diff_rows == EDIT_PREVIEW_ROWS {
+                                rows += 1;
+                            }
+                            diff_rows += 1;
+                            if diff_rows <= EDIT_PREVIEW_ROWS {
+                                rows += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                rows += 1;
+            }
+        }
+    }
+    rows
 }
 
 /// What a finished, collapsed call keeps of its edits: each file and a
 /// compact diff preview capped at [`DIFF_PREVIEW_LINES`] rows. Empty when
 /// the script edits nothing.
 #[must_use]
-pub fn edit_preview_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
-    reading_rows(reading, selection_style, true, DIFF_PREVIEW_LINES)
+pub fn edit_preview_lines(
+    reading: &CommandReading,
+    selection_style: Style,
+    highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
+) -> Vec<Line<'static>> {
+    reading_rows(
+        reading,
+        selection_style,
+        highlighting,
+        tilde_root,
+        true,
+        DIFF_PREVIEW_LINES,
+    )
 }
 
 fn reading_rows(
     reading: &CommandReading,
     selection_style: Style,
+    highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
     edits_only: bool,
     max_diff_rows: usize,
 ) -> Vec<Line<'static>> {
@@ -5880,14 +5993,12 @@ fn reading_rows(
         if edits_only && !matches!(step.intent, Intent::Edit { .. }) {
             continue;
         }
-        let marker = Span::styled(
-            if edits_only {
-                ""
-            } else {
-                link_marker(step.link)
-            },
-            dim.patch(selection_style),
-        );
+        let marker_text = if edits_only {
+            ""
+        } else {
+            link_marker(step.link)
+        };
+        let marker = Span::styled(marker_text, dim.patch(selection_style));
         if let Intent::Unknown { source } = &step.intent {
             let mut rows = source.lines();
             let first = rows.next().unwrap_or_default();
@@ -5907,6 +6018,51 @@ fn reading_rows(
             }
             continue;
         }
+        if let Intent::Edit { files } = &step.intent {
+            let single_file = files.len() == 1;
+            if !edits_only && !single_file {
+                lines.push(Line::from(vec![
+                    marker.clone(),
+                    Span::styled(
+                        step.line.clone(),
+                        Style::default().fg(Color::Cyan).patch(selection_style),
+                    ),
+                ]));
+            }
+            for file in files {
+                let header_marker =
+                    (!edits_only && single_file && !marker_text.is_empty()).then(|| marker.clone());
+                lines.push(file_heading_line(
+                    file,
+                    header_marker,
+                    tilde_root,
+                    selection_style,
+                ));
+                let body = render_file_diff_body(
+                    file,
+                    highlighting,
+                    selection_style,
+                    &mut diff_rows,
+                    max_diff_rows,
+                    total_diff_rows,
+                );
+                let last_idx = body.len().saturating_sub(1);
+                let rail_style = Style::default()
+                    .fg(Color::DarkGray)
+                    .bg(Color::Reset)
+                    .patch(selection_style);
+                for (idx, (row_spans, row_bg)) in body.into_iter().enumerate() {
+                    let rail = if idx == last_idx { "└ " } else { "│ " };
+                    let mut spans = Vec::with_capacity(row_spans.len() + 1);
+                    spans.push(Span::styled(rail, rail_style));
+                    spans.extend(row_spans);
+                    lines.push(
+                        Line::from(spans).style(Style::default().bg(row_bg).patch(selection_style)),
+                    );
+                }
+            }
+            continue;
+        }
         if !edits_only {
             lines.push(Line::from(vec![
                 marker,
@@ -5916,48 +6072,71 @@ fn reading_rows(
                 ),
             ]));
         }
-        if let Intent::Edit { files } = &step.intent {
-            for file in files {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", file_heading(file)),
-                    Style::default().bold().patch(selection_style),
-                )));
-                for (anchor, rows) in file_hunks(&file.change) {
-                    if let Some(anchor) = anchor {
-                        lines.push(Line::from(Span::styled(
-                            format!("  @@ {anchor}"),
-                            dim.patch(selection_style),
-                        )));
-                    }
-                    for row in rows {
-                        if diff_rows == max_diff_rows {
-                            lines.push(Line::from(Span::styled(
-                                format!("  … {} more lines", total_diff_rows - max_diff_rows),
-                                dim.italic().patch(selection_style),
-                            )));
-                        }
-                        diff_rows += 1;
-                        if diff_rows > max_diff_rows {
-                            continue;
-                        }
-                        lines.push(diff_row(row, selection_style));
-                    }
-                }
-            }
-        }
     }
     lines
 }
 
-fn file_heading(file: &FileEdit) -> String {
-    match &file.change {
-        FileChange::Add { .. } => format!("+ {} (new file)", file.path),
-        FileChange::Delete => format!("- {} (deleted)", file.path),
-        FileChange::Update {
-            moved_to: Some(to), ..
-        } => format!("~ {} → {to}", file.path),
-        FileChange::Update { .. } => format!("~ {}", file.path),
+/// Shortens `path` against `tilde_root` (`~` or `~/...`), matching link
+/// resolution so clickable file hyperlinks resolve to the same target.
+fn shorten_path<'a>(path: &'a str, tilde_root: Option<&std::path::Path>) -> Cow<'a, str> {
+    let Some(root) = tilde_root else {
+        return Cow::Borrowed(path);
+    };
+    let Ok(rel) = std::path::Path::new(path).strip_prefix(root) else {
+        return Cow::Borrowed(path);
+    };
+    if rel.as_os_str().is_empty() {
+        Cow::Borrowed("~")
+    } else {
+        Cow::Owned(format!("~/{}", rel.display()))
     }
+}
+
+fn file_heading_line(
+    file: &FileEdit,
+    marker: Option<Span<'static>>,
+    tilde_root: Option<&std::path::Path>,
+    selection_style: Style,
+) -> Line<'static> {
+    let path = shorten_path(&file.path, tilde_root).into_owned();
+    let (verb, verb_color, moved_to) = match &file.change {
+        FileChange::Add { .. } => ("Created", Color::Green, None),
+        FileChange::Delete => ("Deleted", Color::Red, None),
+        FileChange::Update { moved_to, .. } => (
+            "Edited",
+            Color::Cyan,
+            moved_to
+                .as_deref()
+                .map(|to| shorten_path(to, tilde_root).into_owned()),
+        ),
+    };
+    let mut spans = Vec::new();
+    if let Some(marker) = marker {
+        spans.push(marker);
+    }
+    spans.push(Span::styled(
+        verb,
+        Style::default()
+            .fg(verb_color)
+            .bold()
+            .patch(selection_style),
+    ));
+    spans.push(Span::styled(" ", selection_style));
+    spans.push(Span::styled(
+        path,
+        Style::default().bold().patch(selection_style),
+    ));
+    if let Some(to) = moved_to {
+        spans.push(Span::styled(
+            " → ",
+            Style::default().fg(Color::DarkGray).patch(selection_style),
+        ));
+        spans.push(Span::styled(
+            to,
+            Style::default().bold().patch(selection_style),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// A file change's hunks as `(anchor, lines)`; a new file is one hunk.
@@ -5972,24 +6151,301 @@ fn file_hunks(change: &FileChange) -> Vec<(Option<&str>, &[DiffLine])> {
     }
 }
 
-fn diff_row(row: &DiffLine, selection_style: Style) -> Line<'static> {
-    let (sign, color) = match row.op {
-        DiffOp::Context => (' ', Color::Gray),
-        DiffOp::Added => ('+', Color::Green),
-        DiffOp::Removed => ('-', Color::Red),
+/// Single display line number for `row`: `old` on removed lines, `new` (or
+/// fallback `old`) on added and context lines.
+const fn display_line_number(row: &DiffLine) -> Option<u32> {
+    match row.op {
+        DiffOp::Removed => row.old,
+        DiffOp::Added | DiffOp::Context => match row.new {
+            Some(n) => Some(n),
+            None => row.old,
+        },
+    }
+}
+
+/// Column width for right-aligned line numbers in `file`, or `None` when
+/// every line is unnumbered.
+fn file_line_number_width(hunks: &[(Option<&str>, &[DiffLine])]) -> Option<usize> {
+    let max_num = hunks
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .filter_map(display_line_number)
+        .max()?;
+    let digits = max_num.to_string().len();
+    Some(digits.max(MIN_DIFF_LINE_NUM_WIDTH))
+}
+
+/// Computes inline emphasized UTF-8 byte ranges for every contiguous
+/// `Removed` + `Added` run inside a hunk.
+fn compute_inline_emphasis(rows: &[DiffLine]) -> Vec<Vec<std::ops::Range<usize>>> {
+    let mut emphasis: Vec<Vec<std::ops::Range<usize>>> = vec![Vec::new(); rows.len()];
+    let mut i = 0usize;
+    while i < rows.len() {
+        if rows[i].op != DiffOp::Removed {
+            i += 1;
+            continue;
+        }
+        let mut rem_end = i;
+        while rem_end < rows.len() && rows[rem_end].op == DiffOp::Removed {
+            rem_end += 1;
+        }
+        let mut add_end = rem_end;
+        while add_end < rows.len() && rows[add_end].op == DiffOp::Added {
+            add_end += 1;
+        }
+        if add_end > rem_end {
+            let mut old_block = String::new();
+            for row in &rows[i..rem_end] {
+                old_block.push_str(&row.text);
+                old_block.push('\n');
+            }
+            let mut new_block = String::new();
+            for row in &rows[rem_end..add_end] {
+                new_block.push_str(&row.text);
+                new_block.push('\n');
+            }
+            let diff = similar::TextDiff::from_lines(&old_block, &new_block);
+            let mut opts = similar::InlineChangeOptions::new();
+            opts.semantic_cleanup(true);
+            for change in diff.iter_all_inline_changes_with_options(opts) {
+                let target = match change.tag() {
+                    similar::ChangeTag::Delete => change.old_index().map(|idx| i + idx),
+                    similar::ChangeTag::Insert => change.new_index().map(|idx| rem_end + idx),
+                    similar::ChangeTag::Equal => None,
+                };
+                let Some(target) = target else {
+                    continue;
+                };
+                if target >= emphasis.len() {
+                    continue;
+                }
+                let mut byte_pos = 0usize;
+                for &(emphasized, slice) in change.values() {
+                    let seg = slice.strip_suffix('\n').unwrap_or(slice);
+                    if emphasized && !seg.is_empty() {
+                        emphasis[target].push(byte_pos..byte_pos + seg.len());
+                    }
+                    byte_pos += seg.len();
+                }
+            }
+            i = add_end;
+        } else {
+            i = rem_end;
+        }
+    }
+    emphasis
+}
+
+/// Applies diff row and inline-emphasis backgrounds across syntax-highlighted
+/// spans without dropping syntax foreground colors or modifiers.
+fn apply_diff_backgrounds(
+    spans: Vec<Span<'static>>,
+    base_bg: Color,
+    emph_bg: Color,
+    emph_ranges: &[std::ops::Range<usize>],
+    selection_style: Style,
+) -> Vec<Span<'static>> {
+    if emph_ranges.is_empty() {
+        return spans
+            .into_iter()
+            .map(|span| Span::styled(span.content, span.style.bg(base_bg).patch(selection_style)))
+            .collect();
+    }
+    let mut out = Vec::with_capacity(spans.len() + emph_ranges.len());
+    let mut cursor = 0usize;
+    for span in spans {
+        let text = span.content.as_ref();
+        let span_start = cursor;
+        let span_end = cursor + text.len();
+        cursor = span_end;
+        let mut pos = span_start;
+        for range in emph_ranges {
+            if range.end <= pos {
+                continue;
+            }
+            if range.start >= span_end {
+                break;
+            }
+            let hit_start = range.start.max(pos);
+            let hit_end = range.end.min(span_end);
+            if hit_start > pos
+                && let Some(piece) = text.get(pos - span_start..hit_start - span_start)
+            {
+                out.push(Span::styled(
+                    piece.to_owned(),
+                    span.style.bg(base_bg).patch(selection_style),
+                ));
+            }
+            if hit_end > hit_start
+                && let Some(piece) = text.get(hit_start - span_start..hit_end - span_start)
+            {
+                out.push(Span::styled(
+                    piece.to_owned(),
+                    span.style.bg(emph_bg).patch(selection_style),
+                ));
+            }
+            pos = hit_end;
+        }
+        if pos < span_end
+            && let Some(piece) = text.get(pos - span_start..span_end - span_start)
+        {
+            out.push(Span::styled(
+                piece.to_owned(),
+                span.style.bg(base_bg).patch(selection_style),
+            ));
+        }
+    }
+    out
+}
+
+/// Renders every framed body row of `file` as `(spans_after_rail, row_bg)`.
+fn render_file_diff_body(
+    file: &FileEdit,
+    highlighting: &super::highlight::Highlighting,
+    selection_style: Style,
+    diff_rows: &mut usize,
+    max_diff_rows: usize,
+    total_diff_rows: usize,
+) -> Vec<(Vec<Span<'static>>, Color)> {
+    let hunks = file_hunks(&file.change);
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+    let num_width = file_line_number_width(&hunks);
+    let mut out = Vec::new();
+    let mut old_hl = highlighting.highlighter_for_path(&file.path);
+    let mut new_hl = old_hl.clone();
+
+    for (anchor, rows) in hunks {
+        if let Some(anchor) = anchor
+            && *diff_rows < max_diff_rows
+        {
+            out.push((
+                vec![Span::styled(
+                    format!(" @@ {anchor}"),
+                    Style::default()
+                        .fg(DIFF_ANCHOR_FG)
+                        .bg(DIFF_CODE_BG)
+                        .patch(selection_style),
+                )],
+                DIFF_CODE_BG,
+            ));
+        }
+        let emphasis = compute_inline_emphasis(rows);
+        for (row_idx, row) in rows.iter().enumerate() {
+            if *diff_rows == max_diff_rows {
+                out.push((
+                    vec![Span::styled(
+                        format!(" … {} more lines", total_diff_rows - max_diff_rows),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .bg(DIFF_CODE_BG)
+                            .italic()
+                            .patch(selection_style),
+                    )],
+                    DIFF_CODE_BG,
+                ));
+            }
+            *diff_rows += 1;
+            if *diff_rows > max_diff_rows {
+                continue;
+            }
+            let code_spans = match row.op {
+                DiffOp::Context => {
+                    if let Some(hl) = old_hl.as_mut() {
+                        let _ = highlighting.diff_line_spans(hl, &row.text);
+                    }
+                    new_hl
+                        .as_mut()
+                        .map(|hl| highlighting.diff_line_spans(hl, &row.text))
+                }
+                DiffOp::Removed => old_hl
+                    .as_mut()
+                    .map(|hl| highlighting.diff_line_spans(hl, &row.text)),
+                DiffOp::Added => new_hl
+                    .as_mut()
+                    .map(|hl| highlighting.diff_line_spans(hl, &row.text)),
+            }
+            .unwrap_or_else(|| {
+                vec![Span::styled(
+                    row.text.clone(),
+                    Style::default().fg(DIFF_CODE_FG),
+                )]
+            });
+            out.push(diff_row_spans(
+                row,
+                num_width,
+                code_spans,
+                &emphasis[row_idx],
+                selection_style,
+            ));
+        }
+    }
+    out
+}
+
+fn diff_row_spans(
+    row: &DiffLine,
+    num_width: Option<usize>,
+    code_spans: Vec<Span<'static>>,
+    emph_ranges: &[std::ops::Range<usize>],
+    selection_style: Style,
+) -> (Vec<Span<'static>>, Color) {
+    let (sign, sign_color, num_color, base_bg, emph_bg) = match row.op {
+        DiffOp::Context => (
+            ' ',
+            Color::DarkGray,
+            DIFF_LINE_NUM_CTX,
+            DIFF_CODE_BG,
+            DIFF_CODE_BG,
+        ),
+        DiffOp::Added => (
+            '+',
+            Color::Green,
+            DIFF_LINE_NUM_ADD,
+            DIFF_ADD_BG,
+            DIFF_ADD_EMPH_BG,
+        ),
+        DiffOp::Removed => (
+            '-',
+            Color::Red,
+            DIFF_LINE_NUM_DEL,
+            DIFF_DEL_BG,
+            DIFF_DEL_EMPH_BG,
+        ),
     };
-    let number =
-        |value: Option<u32>| value.map_or_else(|| "    ".to_string(), |n| format!("{n:>4}"));
-    Line::from(vec![
-        Span::styled(
-            format!("  {} {} ", number(row.old), number(row.new)),
-            Style::default().fg(Color::DarkGray).patch(selection_style),
-        ),
-        Span::styled(
-            format!("{sign} {}", row.text),
-            Style::default().fg(color).patch(selection_style),
-        ),
-    ])
+    let mut spans = Vec::with_capacity(code_spans.len() + 3);
+    if let Some(width) = num_width {
+        let num_text = display_line_number(row)
+            .map_or_else(|| format!(" {:>width$} ", ""), |n| format!(" {n:>width$} "));
+        spans.push(Span::styled(
+            num_text,
+            Style::default()
+                .fg(num_color)
+                .bg(base_bg)
+                .patch(selection_style),
+        ));
+    } else {
+        spans.push(Span::styled(
+            " ",
+            Style::default().bg(base_bg).patch(selection_style),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("{sign} "),
+        Style::default()
+            .fg(sign_color)
+            .bg(base_bg)
+            .patch(selection_style),
+    ));
+    spans.extend(apply_diff_backgrounds(
+        code_spans,
+        base_bg,
+        emph_bg,
+        emph_ranges,
+        selection_style,
+    ));
+    (spans, base_bg)
 }
 
 /// Render full-screen tool detail view.
@@ -7286,6 +7742,7 @@ mod tests {
                     true,
                     chat.assets(),
                     inner,
+                    None,
                 )
                 .lines,
             );
@@ -7382,17 +7839,110 @@ mod tests {
         let rows = call_rows(&display);
         assert_eq!(rows[0], "▾ ⠋ work");
         assert_eq!(rows[1], "Edit 2 files");
-        assert_eq!(rows[2], "  ~ src/a.rs");
-        assert_eq!(rows[3], "  @@ fn main() {");
-        assert_eq!(rows[4], "     2    2       keep");
-        assert_eq!(rows[5], "     3      -     old line");
-        assert_eq!(rows[6], "          3 +     new line");
-        assert_eq!(rows[7], "  + b.txt (new file)");
-        assert_eq!(rows[8], "          1 + one");
+        assert_eq!(rows[2], "Edited src/a.rs");
+        assert_eq!(rows[3], "│  @@ fn main() {");
+        assert_eq!(rows[4], "│    2       keep");
+        assert_eq!(rows[5], "│    3 -     old line");
+        assert_eq!(rows[6], "└    3 +     new line");
+        assert_eq!(rows[7], "Created b.txt");
+        assert_eq!(rows[8], "└    1 + one");
         assert!(
             rows.iter().all(|row| !row.contains("$ apply_patch")),
             "the raw script is not the body of a recognised call"
         );
+    }
+
+    #[test]
+    fn shell_file_edit_renders_created_edited_deleted_with_syntax_and_inline_emphasis() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "fn greet() {\n    let msg = \"old\";\n}\n",
+        )
+        .expect("write");
+
+        // 1. Overwriting an existing Rust file produces Edited + syntax fg + red/green bg + inline emphasis.
+        let edit_script = "cat > lib.rs <<'EOF'\nfn greet() {\n    let msg = \"new\";\n}\nEOF\n";
+        let reading = may_protocol::command_reading::CommandReading::of_in(edit_script, dir.path());
+        let hl = super::super::highlight::Highlighting::default();
+        let lines = super::reading_lines(&reading, Style::default(), &hl, None);
+        assert_eq!(lines.len(), super::reading_line_count(&reading));
+        let text = rendered_text(&lines);
+        assert_eq!(text[0], "Edited lib.rs");
+        assert_eq!(text[1], "│    1   fn greet() {");
+        assert_eq!(text[2], "│    2 -     let msg = \"old\";");
+        assert_eq!(text[3], "│    2 +     let msg = \"new\";");
+        assert_eq!(text[4], "└    3   }");
+
+        // Syntax highlighting applies RGB foregrounds from syntect.
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("fn")
+                    && matches!(span.style.fg, Some(Color::Rgb(..)))),
+            "expected syntect fg on Rust keyword: {:?}",
+            lines[1].spans
+        );
+        // Removed and Added rows carry their dark red/green row backgrounds and inline emphasis on changed tokens.
+        assert_eq!(lines[2].style.bg, Some(super::DIFF_DEL_BG));
+        assert_eq!(lines[3].style.bg, Some(super::DIFF_ADD_BG));
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("old")
+                    && span.style.bg == Some(super::DIFF_DEL_EMPH_BG)),
+            "expected inline red emphasis on 'old': {:?}",
+            lines[2].spans
+        );
+        assert!(
+            lines[3]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("new")
+                    && span.style.bg == Some(super::DIFF_ADD_EMPH_BG)),
+            "expected inline green emphasis on 'new': {:?}",
+            lines[3].spans
+        );
+        // Left rail keeps Reset background while code block extends to the right edge of the column.
+        let area = ratatui::layout::Rect::new(0, 0, 50, u16::try_from(lines.len()).unwrap());
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        let wrapped = super::super::wrap::wrap_lines(&lines, area.width);
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(wrapped.clone()),
+            area,
+            &mut buf,
+        );
+        super::super::wrap::paint_line_backgrounds(&wrapped, 0, area, &mut buf);
+        assert_eq!(buf[(0, 3)].symbol(), "│");
+        assert_eq!(buf[(0, 3)].bg, Color::Reset);
+        assert_eq!(buf[(2, 3)].bg, super::DIFF_ADD_BG);
+        assert_eq!(buf[(49, 3)].bg, super::DIFF_ADD_BG);
+
+        // 2. Multi-step script with file creation + trailing echo renders Created + diff + unknown echo.
+        let brief = dir.path().join("tmp/brief.md");
+        let create_script = format!(
+            "cat > {} <<'EOF'\n# Brief\n你好 こんにちは 안녕\nEOF\necho written\n",
+            brief.display()
+        );
+        let create_reading = may_protocol::command_reading::CommandReading::of(&create_script);
+        let create_lines =
+            super::reading_lines(&create_reading, Style::default(), &hl, Some(dir.path()));
+        let create_text = rendered_text(&create_lines);
+        assert_eq!(create_text[0], "Created ~/tmp/brief.md");
+        assert_eq!(create_lines[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(create_text[1], "│    1 + # Brief");
+        assert_eq!(create_text[2], "└    2 + 你好 こんにちは 안녕");
+        assert_eq!(create_text[3], "; $ echo written");
+
+        // 3. Deletion renders red Deleted <path> with tilde shortening.
+        let rm_script = format!("rm -f {}", brief.display());
+        let rm_reading = may_protocol::command_reading::CommandReading::of(&rm_script);
+        let rm_lines = super::reading_lines(&rm_reading, Style::default(), &hl, Some(dir.path()));
+        let rm_text = rendered_text(&rm_lines);
+        assert_eq!(rm_text, ["Deleted ~/tmp/brief.md"]);
+        assert_eq!(rm_lines[0].spans[0].style.fg, Some(Color::Red));
     }
 
     #[test]
@@ -7560,10 +8110,10 @@ mod tests {
         );
         let rows = call_rows(&finished(read_call(&script)));
         assert!(rows[0].ends_with("work"), "{rows:?}");
-        assert_eq!(rows[1], "  + big.txt (new file)");
+        assert_eq!(rows[1], "Created big.txt");
         let diff = rows.iter().filter(|row| row.contains("+ line")).count();
         assert_eq!(diff, super::DIFF_PREVIEW_LINES);
-        assert_eq!(rows.last().unwrap(), "  … 4 more lines");
+        assert_eq!(rows.last().unwrap(), "└  … 4 more lines");
     }
 
     #[test]
@@ -8196,6 +8746,7 @@ mod tests {
             false,
             chat.assets(),
             80,
+            None,
         )
         .lines;
         let spans = &lines[0].spans;
@@ -8827,6 +9378,7 @@ mod tests {
             false,
             chat.assets(),
             80,
+            None,
         )
         .lines;
         let verify = lines

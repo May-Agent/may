@@ -2,7 +2,7 @@
 
 use askama::Template;
 
-use super::{BuildTool, Intent, ListTool, ReadRange, SearchTool};
+use super::{BuildTool, FileChange, Intent, ListTool, ReadRange, SearchTool};
 
 #[derive(Template)]
 #[template(path = "command_step.txt", escape = "none")]

@@ -87,6 +87,71 @@ impl Highlighting {
         })
     }
 
+    /// A highlighter inferred from `path`'s filename or extension without
+    /// reading from disk; `None` for unknown or plain-text files.
+    pub(super) fn highlighter_for_path(&self, path: &str) -> Option<LineHighlighter> {
+        let p = std::path::Path::new(path);
+        let syntax = p
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| self.syntaxes.find_syntax_by_extension(name))
+            .or_else(|| {
+                let ext = p.extension().and_then(|ext| ext.to_str())?;
+                self.syntaxes.find_syntax_by_extension(ext).or_else(|| {
+                    let mapped = match ext.to_ascii_lowercase().as_str() {
+                        "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" => "js",
+                        "toml" => "ini",
+                        "jsonc" => "json",
+                        "zsh" => "sh",
+                        "mdx" => "md",
+                        _ => return None,
+                    };
+                    self.syntaxes.find_syntax_by_extension(mapped)
+                })
+            })?;
+        if syntax.name == "Plain Text" {
+            return None;
+        }
+        let highlight = HighlightState::new(&self.highlighter, ScopeStack::new());
+        Some(LineHighlighter {
+            highlighter: self.highlighter.clone(),
+            parse: ParseState::new(syntax),
+            highlight,
+        })
+    }
+
+    /// Highlight one line of a diff without a trailing newline, feeding a
+    /// synthetic `'\n'` to `parse_line` so single-line comments close at EOL,
+    /// then stripping the trailing `'\n'` from the returned spans.
+    pub(super) fn diff_line_spans(
+        &self,
+        highlighter: &mut LineHighlighter,
+        line: &str,
+    ) -> Vec<Span<'static>> {
+        let mut with_nl = String::with_capacity(line.len() + 1);
+        with_nl.push_str(line);
+        with_nl.push('\n');
+        let ops = highlighter
+            .parse
+            .parse_line(&with_nl, &self.syntaxes)
+            .expect("bundled syntaxes highlight without missing references");
+        let mut spans: Vec<Span<'static>> = HighlightIterator::new(
+            &mut highlighter.highlight,
+            &ops,
+            &with_nl,
+            &highlighter.highlighter,
+        )
+        .filter_map(|(style, text)| {
+            let trimmed = text.strip_suffix('\n').unwrap_or(text);
+            (!trimmed.is_empty()).then(|| Span::styled(trimmed.to_string(), to_style(style)))
+        })
+        .collect();
+        if spans.is_empty() && !line.is_empty() {
+            spans.push(Span::raw(line.to_string()));
+        }
+        spans
+    }
+
     /// Highlight one source line, keeping parse state in `highlighter` so
     /// quotes, heredocs and open scopes carry across lines.
     pub(super) fn line_spans(

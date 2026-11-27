@@ -170,6 +170,15 @@ trait ChatSink {
         arguments: &str,
         summary: crate::tool_summary::ToolSummary,
     ) -> impl Future<Output = bool> + Send;
+    /// Publishes a located command reading for a call whose start event was
+    /// already emitted while arguments streamed in.
+    fn on_tool_reading(
+        &mut self,
+        _id: &str,
+        _reading: &crate::command_reading::CommandReading,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     fn on_tool_end(
         &mut self,
         id: &str,
@@ -557,6 +566,18 @@ impl ChatSink for HubSink {
                 summary,
             },
         );
+        true
+    }
+
+    async fn on_tool_reading(
+        &mut self,
+        id: &str,
+        reading: &crate::command_reading::CommandReading,
+    ) -> bool {
+        self.publish_agent(crate::client::SessionAgentBody::ToolReading {
+            call_id: id.to_string(),
+            reading: reading.clone(),
+        });
         true
     }
 
@@ -2847,6 +2868,7 @@ fn run_agent_loop_attempts<'a>(
                 hosted_calls: std::collections::HashSet::new(),
                 tool_started_at: std::collections::HashMap::new(),
                 pending_tool_streams: std::collections::HashMap::new(),
+                located_readings: std::collections::HashMap::new(),
                 last_todo_hash: None,
                 tasks_accepted,
                 tasks_edits: std::collections::HashMap::new(),

@@ -6,28 +6,41 @@
 
 use std::path::Path;
 
-use super::shell::Arg;
-use super::{BuildTool, Intent, ListTool, ReadRange, SearchTool, patch};
+use super::shell::{Arg, OutputRedirect};
+use super::{BuildTool, FileChange, FileEdit, Intent, ListTool, ReadRange, SearchTool, patch};
 
 pub(super) fn recognise(
     name: &str,
     args: &[Arg],
     stdin: Option<&str>,
+    stdout: Option<&OutputRedirect>,
     dir: Option<&Path>,
 ) -> Option<Vec<Intent>> {
     if name == "apply_patch" {
-        return match (args, stdin) {
-            ([], Some(text)) => Some(vec![Intent::Edit {
+        return match (args, stdin, stdout) {
+            ([], Some(text), None) => Some(vec![Intent::Edit {
                 files: patch::parse(text, dir)?,
             }]),
             _ => None,
         };
+    }
+    if let Some(output) = stdout {
+        return match name {
+            "cat" => cat_write(args, stdin, output, dir),
+            "echo" => echo_write(args, stdin, output, dir),
+            "printf" => printf_write(args, stdin, output, dir),
+            _ => None,
+        };
+    }
+    if name == "tee" {
+        return tee_write(args, stdin?, dir);
     }
     if stdin.is_some() {
         return None;
     }
     match name {
         "tasks" => tasks(args),
+        "rm" => rm(args),
         "cat" => cat(args),
         "head" => head_or_tail(args, true),
         "tail" => head_or_tail(args, false),
@@ -47,6 +60,226 @@ pub(super) fn recognise(
         "make" => build(args, BuildTool::Make),
         _ => None,
     }
+}
+
+/// Builds a single-file `Intent::Edit` for a stdout redirect write or append.
+fn redirect_write(content: &str, output: &OutputRedirect, dir: Option<&Path>) -> Vec<Intent> {
+    let (path, append) = match output {
+        OutputRedirect::Write(path) => (path.clone(), false),
+        OutputRedirect::Append(path) => (path.clone(), true),
+    };
+    vec![Intent::Edit {
+        files: vec![patch::write_file(path, content, append, dir)],
+    }]
+}
+
+/// `cat > <path> <<'EOF'`, `cat >> <path> <<'EOF'`, `cat > <path> <<< 'text'`.
+fn cat_write(
+    args: &[Arg],
+    stdin: Option<&str>,
+    output: &OutputRedirect,
+    dir: Option<&Path>,
+) -> Option<Vec<Intent>> {
+    if !args.is_empty() {
+        return None;
+    }
+    let text = stdin?;
+    Some(redirect_write(text, output, dir))
+}
+
+/// `tee [-a|--append] <path>... <<'EOF'` or `<<< 'text'`.
+fn tee_write(args: &[Arg], stdin: &str, dir: Option<&Path>) -> Option<Vec<Intent>> {
+    let mut append = false;
+    let mut rest_positional = false;
+    let mut paths = Vec::new();
+    for arg in args {
+        let text = arg.literal()?;
+        if !rest_positional && text == "--" {
+            rest_positional = true;
+        } else if !rest_positional && matches!(text, "-a" | "--append") {
+            append = true;
+        } else if (!rest_positional && text.starts_with('-')) || text.is_empty() {
+            return None;
+        } else {
+            paths.push(text.to_owned());
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    let files = paths
+        .into_iter()
+        .map(|path| patch::write_file(path, stdin, append, dir))
+        .collect();
+    Some(vec![Intent::Edit { files }])
+}
+
+/// `echo [-n] <literal>... > <path>` or `>> <path>`.
+fn echo_write(
+    args: &[Arg],
+    stdin: Option<&str>,
+    output: &OutputRedirect,
+    dir: Option<&Path>,
+) -> Option<Vec<Intent>> {
+    if stdin.is_some() {
+        return None;
+    }
+    let mut no_newline = false;
+    let mut rest = args;
+    while let Some((first, tail)) = rest.split_first() {
+        let Some(text) = first.literal() else {
+            break;
+        };
+        if let Some(flags) = text.strip_prefix('-')
+            && !flags.is_empty()
+            && flags.bytes().all(|b| matches!(b, b'n' | b'e' | b'E'))
+        {
+            // `-e` / `-E` escape interpretation varies by shell options; keep unknown.
+            if flags.contains(['e', 'E']) {
+                return None;
+            }
+            no_newline = true;
+            rest = tail;
+        } else {
+            break;
+        }
+    }
+    let mut content = String::new();
+    for (index, arg) in rest.iter().enumerate() {
+        let text = arg.literal()?;
+        if index > 0 {
+            content.push(' ');
+        }
+        content.push_str(text);
+    }
+    if !no_newline {
+        content.push('\n');
+    }
+    Some(redirect_write(&content, output, dir))
+}
+
+/// `printf <fmt> [<arg>...] > <path>` or `>> <path>` with strictly literal
+/// format and arguments (`%s`, `%%`, `\n`, `\t`, `\r`, `\\`).
+fn printf_write(
+    args: &[Arg],
+    stdin: Option<&str>,
+    output: &OutputRedirect,
+    dir: Option<&Path>,
+) -> Option<Vec<Intent>> {
+    if stdin.is_some() {
+        return None;
+    }
+    let content = render_printf(args)?;
+    Some(redirect_write(&content, output, dir))
+}
+
+/// Evaluates a strictly literal `printf` invocation supporting `%s`, `%%`,
+/// `\n`, `\t`, `\r`, and `\\`. Any other flag, specifier, or escape returns
+/// `None`.
+fn render_printf(args: &[Arg]) -> Option<String> {
+    enum Token {
+        Literal(String),
+        StringSlot,
+    }
+
+    let args = match args.split_first() {
+        Some((first, rest)) if first.literal() == Some("--") => rest,
+        Some((first, _)) if first.literal()?.starts_with('-') => return None,
+        _ => args,
+    };
+    let (format_arg, value_args) = args.split_first()?;
+    let format = format_arg.literal()?;
+    let values: Vec<&str> = value_args
+        .iter()
+        .map(Arg::literal)
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut tokens = Vec::new();
+    let mut literal = String::new();
+    let mut slots = 0usize;
+    let mut chars = format.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next()? {
+                'n' => literal.push('\n'),
+                't' => literal.push('\t'),
+                'r' => literal.push('\r'),
+                '\\' => literal.push('\\'),
+                _ => return None,
+            },
+            '%' => match chars.next()? {
+                '%' => literal.push('%'),
+                's' => {
+                    if !literal.is_empty() {
+                        tokens.push(Token::Literal(std::mem::take(&mut literal)));
+                    }
+                    tokens.push(Token::StringSlot);
+                    slots += 1;
+                }
+                _ => return None,
+            },
+            other => literal.push(other),
+        }
+    }
+    if !literal.is_empty() {
+        tokens.push(Token::Literal(literal));
+    }
+
+    if slots == 0 {
+        if !values.is_empty() {
+            return None;
+        }
+        let mut out = String::new();
+        for token in &tokens {
+            if let Token::Literal(text) = token {
+                out.push_str(text);
+            }
+        }
+        return Some(out);
+    }
+
+    if values.is_empty() || !values.len().is_multiple_of(slots) {
+        return None;
+    }
+    let mut out = String::new();
+    for chunk in values.chunks_exact(slots) {
+        let mut slot_index = 0;
+        for token in &tokens {
+            match token {
+                Token::Literal(text) => out.push_str(text),
+                Token::StringSlot => {
+                    out.push_str(chunk[slot_index]);
+                    slot_index += 1;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `rm [-f|-r|-rf|-fr|-R|-v|--force|--recursive|--verbose|--] <literal_path>...`.
+fn rm(args: &[Arg]) -> Option<Vec<Intent>> {
+    let flags = Flags {
+        short: "frRv",
+        short_value: "",
+        long: &["force", "recursive", "verbose"],
+        long_value: &[],
+        short_pattern: None,
+        long_pattern: None,
+    };
+    let walked = walk(args, &flags)?;
+    let paths = literals(&walked.positionals)?;
+    if paths.is_empty() || paths.iter().any(String::is_empty) {
+        return None;
+    }
+    let files = paths
+        .into_iter()
+        .map(|path| FileEdit {
+            path,
+            change: FileChange::Delete,
+        })
+        .collect();
+    Some(vec![Intent::Edit { files }])
 }
 
 /// `tasks <edit>`: literal words that name an operation which edits the file.

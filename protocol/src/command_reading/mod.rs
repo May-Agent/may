@@ -61,9 +61,10 @@ pub enum Link {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Intent {
-    /// `apply_patch`: the files it changes, from the patch text.
+    /// `apply_patch` or a literal shell file write, append or deletion: the
+    /// files it changes.
     Edit {
-        /// The files the patch adds, deletes, moves and updates.
+        /// The files the command adds, deletes, moves or updates.
         files: Vec<FileEdit>,
     },
     /// `cat`, `head`, `tail`, `sed -n`, `nl`.
@@ -193,20 +194,30 @@ impl CommandReading {
     }
 
     /// Reads `script` as it runs in `dir`: the files an `apply_patch` updates
-    /// are read from there to give each hunk its absolute line numbers.
+    /// are read from there to give each hunk its absolute line numbers, and
+    /// existing files targeted by a shell write or append are diffed against
+    /// their current contents.
     /// Reads files, so it runs off the event loop.
     #[must_use]
     pub fn of_in(script: &str, dir: &Path) -> Self {
         shell::read(script, Some(dir))
     }
 
-    /// Whether a step edits a file in place, so reading the script in the
-    /// directory it runs in adds line numbers.
+    /// Whether a step writes or edits a file whose pre-edit contents live on
+    /// disk, so reading the script in the directory it runs in adds line
+    /// numbers or diffs against the existing file.
     #[must_use]
     pub fn updates_files(&self) -> bool {
         self.steps.iter().any(|step| {
-            matches!(&step.intent, Intent::Edit { files }
-                if files.iter().any(|file| matches!(&file.change, FileChange::Update { hunks, .. } if !hunks.is_empty())))
+            matches!(
+                &step.intent,
+                Intent::Edit { files }
+                    if files.iter().any(|file| match &file.change {
+                        FileChange::Add { .. } => true,
+                        FileChange::Update { hunks, .. } => !hunks.is_empty(),
+                        FileChange::Delete => false,
+                    })
+            )
         })
     }
 

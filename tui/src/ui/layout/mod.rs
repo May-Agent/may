@@ -400,7 +400,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             rows(
                 state.shown_reading().map_or_else(
                     || confirm_body_rows(state.request.script.as_str(), column.width),
-                    |reading| chat::reading_lines(reading, Style::default()).len(),
+                    chat::reading_line_count,
                 ) + 9,
             ),
             pct(70),
@@ -493,6 +493,9 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
                 sheet,
                 state,
                 &app.chat.assets().highlighting,
+                app.session_manager
+                    .current()
+                    .map(|session| session.sandbox_dir.as_path()),
                 app.band_bg,
             );
         }
@@ -2573,6 +2576,7 @@ fn render_permission_confirm(
     area: Rect,
     state: &crate::state::PermissionConfirmState,
     highlighting: &super::highlight::Highlighting,
+    tilde_root: Option<&std::path::Path>,
     bg: Option<Color>,
 ) {
     let mut content = vec![
@@ -2593,7 +2597,12 @@ fn render_permission_confirm(
             "It will:",
             Style::default().fg(Color::White),
         )));
-        content.extend(chat::reading_lines(reading, Style::default()));
+        content.extend(chat::reading_lines(
+            reading,
+            Style::default(),
+            highlighting,
+            tilde_root,
+        ));
     } else {
         content.push(Line::from(Span::styled(
             "Script:",
@@ -3953,6 +3962,7 @@ mod tests {
                     state,
                     &super::super::highlight::Highlighting::default(),
                     None,
+                    None,
                 );
             })
             .unwrap();
@@ -3984,7 +3994,7 @@ mod tests {
             show_script: false,
         };
         let screen = permission_screen(&state).join("\n");
-        assert!(screen.contains("~ src/a.rs"), "{screen}");
+        assert!(screen.contains("Edited src/a.rs"), "{screen}");
         assert!(screen.contains("- old"), "{screen}");
         assert!(screen.contains("+ new"), "{screen}");
         assert!(screen.contains("[S] Raw script"), "{screen}");
