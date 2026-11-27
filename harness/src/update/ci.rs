@@ -11,8 +11,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::UpdateError;
 use super::github::{GitHub, verify_sha256};
+use super::{Progress, UpdateError};
 
 /// The repository whose CI builds are the dev channel.
 pub(super) const REPOSITORY: &str = "May-Agent/may";
@@ -173,25 +173,33 @@ impl GitHub {
     }
 
     /// The artifact's zip, checked against the digest GitHub reports.
-    /// `progress` reports each chunk's running `downloaded`/`total` bytes.
+    /// `progress` reports download byte progress and the verification step.
     pub(super) async fn download(
         &self,
         artifact: &Artifact,
-        progress: &mut (impl FnMut(u64, Option<u64>) + Send),
+        progress: &mut (impl FnMut(Progress) + Send),
     ) -> Result<Vec<u8>, UpdateError> {
         let bytes = self
             .get_bytes(
                 &artifact.archive_download_url,
                 Some(artifact.size_in_bytes),
-                progress,
+                &mut |downloaded, total| {
+                    progress(Progress::Download { downloaded, total });
+                },
             )
             .await?;
         if let Some(expected) = artifact
             .digest
             .as_deref()
             .and_then(|d| d.strip_prefix("sha256:"))
+            .map(str::to_owned)
         {
-            verify_sha256(&bytes, expected)?;
+            progress(Progress::step("Verifying download…"));
+            return blocking::unblock(move || {
+                verify_sha256(&bytes, &expected)?;
+                Ok(Vec::from(bytes))
+            })
+            .await;
         }
         Ok(bytes.into())
     }

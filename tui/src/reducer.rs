@@ -31,9 +31,15 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.held_modifiers.update(key, pressed);
             Ok(None)
         }
+        AppEvent::FocusGained => {
+            app.terminal_focused = true;
+            Ok(None)
+        }
         AppEvent::FocusLost => {
+            app.terminal_focused = false;
             app.held_modifiers.clear();
             app.pointer_modifiers = crossterm::event::KeyModifiers::NONE;
+            app.host_open_modifiers = crossterm::event::KeyModifiers::NONE;
             Ok(None)
         }
         AppEvent::Tick => {

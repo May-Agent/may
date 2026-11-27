@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use super::UpdateError;
 use super::github::{GitHub, verify_sha256};
+use super::{Progress, UpdateError};
 
 /// The repository whose releases are the stable channel.
 const REPOSITORY: &str = super::ci::REPOSITORY;
@@ -168,18 +168,26 @@ impl GitHub {
     }
 
     /// The release's archive, checked against the checksum the release
-    /// publishes beside it. `progress` reports each chunk's running
-    /// `downloaded`/`total` bytes.
+    /// publishes beside it. `progress` reports download byte progress and the
+    /// verification step.
     pub(super) async fn download_release(
         &self,
         latest: &Latest,
-        progress: &mut (impl FnMut(u64, Option<u64>) + Send),
+        progress: &mut (impl FnMut(Progress) + Send),
     ) -> Result<Vec<u8>, UpdateError> {
         let checksum = self.get_public(&latest.checksum_url).await?;
-        let archive = self.get_public_bytes(&latest.archive_url, progress).await?;
-        let checksum = String::from_utf8_lossy(&checksum);
-        verify_sha256(&archive, parse_checksum(&checksum)?)?;
-        Ok(archive.into())
+        let expected = parse_checksum(&String::from_utf8_lossy(&checksum))?.to_owned();
+        let archive = self
+            .get_public_bytes(&latest.archive_url, &mut |downloaded, total| {
+                progress(Progress::Download { downloaded, total });
+            })
+            .await?;
+        progress(Progress::step("Verifying download…"));
+        blocking::unblock(move || {
+            verify_sha256(&archive, &expected)?;
+            Ok(Vec::from(archive))
+        })
+        .await
     }
 }
 
@@ -295,15 +303,21 @@ mod tests {
             checksum_url: format!("{base}/{name}.tar.xz.sha256"),
         };
 
+        let mut steps = Vec::new();
         assert_eq!(
             github
-                .download_release(&latest("may"), &mut |_, _| {})
+                .download_release(&latest("may"), &mut |event| {
+                    if let Progress::Step(step) = event {
+                        steps.push(step);
+                    }
+                })
                 .await
                 .expect("the archive matches its checksum"),
             archive.as_bytes()
         );
+        assert_eq!(steps, ["Verifying download…"]);
         let error = github
-            .download_release(&latest("bad"), &mut |_, _| {})
+            .download_release(&latest("bad"), &mut |_| {})
             .await
             .expect_err("the checksum differs");
         assert!(

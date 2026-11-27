@@ -18,6 +18,7 @@ mod browser;
 mod cli;
 mod exec;
 mod oneshot;
+mod update;
 
 use std::io;
 use std::io::Write as _;
@@ -32,6 +33,7 @@ use crate::browser::run_browser;
 use crate::cli::{CliMode, parse_cli_mode_from_env};
 use crate::exec::run_exec;
 use crate::oneshot::run_oneshot;
+use crate::update::run_update;
 
 use async_channel::TryRecvError;
 use crossterm::{
@@ -359,12 +361,11 @@ async fn async_main() -> anyhow::Result<()> {
         EnableBracketedPaste,
         EnableFocusChange,
         EnableMouseCapture,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        )
+        // Keep REPORT_ALL_KEYS_AS_ESCAPE_CODES off: crossterm does not support
+        // REPORT_ASSOCIATED_TEXT, so enabling it causes Kitty-protocol
+        // terminals to encode IME candidate commits (e.g. pressing `1`) as raw
+        // keycodes and drop the committed UTF-8 text.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1069,9 +1070,11 @@ where
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
+            let hover_modifier_changed = app.refresh_host_open_modifiers();
             // The fireworks redraw every tick, and once more on the tick
             // that ends them so no spark stays on screen.
-            needs_draw = app.processing
+            needs_draw = hover_modifier_changed
+                || app.processing
                 || app.new_year.animating()
                 || app.compaction.is_holding()
                 || last_draw.elapsed() >= std::time::Duration::from_secs(1);
@@ -3389,86 +3392,6 @@ async fn open_gui(port: Option<u16>) -> anyhow::Result<()> {
 }
 
 /// `may daemon [install|uninstall|status|stop]`.
-/// `may update`: replaces this binary on its channel, then restarts a
-/// running daemon onto the new one, gracefully, at once. A daemon that is
-/// not running is not started. The restart is the new binary's own
-/// `daemon restart`: this process is still the old build.
-///
-/// `channel` switches the channel first and keeps the choice in the
-/// configuration, through the daemon when one runs, which applies it live.
-async fn run_update(channel: Option<may_agent::update::Channel>) -> anyhow::Result<()> {
-    use may_agent::update::{Outcome, running_executable, update};
-
-    let paths = may_agent::daemon::DaemonPaths::user()?;
-    let daemon = may_agent::client::DaemonClient::new(paths.socket());
-    let channel = match channel {
-        Some(channel) => {
-            if daemon.health().await.is_ok() {
-                let _: serde_json::Value = daemon
-                    .put(
-                        "/api/config/update-channel",
-                        &serde_json::json!({ "channel": channel }),
-                    )
-                    .await?;
-            } else {
-                let mut config = may_agent::config::MayConfig::load().await?;
-                config.update.channel = Some(channel);
-                config.save().await?;
-            }
-            eprintln!("Following the {channel} channel.");
-            channel
-        }
-        None => may_agent::config::MayConfig::load().await?.update.channel(),
-    };
-    let target = running_executable()?;
-    let mut bar: Option<indicatif::ProgressBar> = None;
-    let outcome = update(channel, &target, |progress| match progress {
-        may_agent::update::Progress::Step(text) => {
-            if let Some(bar) = bar.take() {
-                bar.finish_and_clear();
-            }
-            eprintln!("{text}");
-        }
-        may_agent::update::Progress::Download { downloaded, total } => {
-            let bar = bar.get_or_insert_with(|| {
-                let bar = indicatif::ProgressBar::new(total.unwrap_or(0));
-                bar.set_style(
-                    indicatif::ProgressStyle::with_template(if total.is_some() {
-                        "  {wide_bar} {decimal_bytes}/{decimal_total_bytes}"
-                    } else {
-                        "  {decimal_bytes} downloaded"
-                    })
-                    .expect("a literal template parses"),
-                );
-                bar
-            });
-            if let Some(total) = total {
-                bar.set_length(total);
-            }
-            bar.set_position(downloaded);
-        }
-    })
-    .await?;
-    if let Some(bar) = bar {
-        bar.finish_and_clear();
-    }
-    match outcome {
-        Outcome::UpToDate => eprintln!("May is up to date."),
-        Outcome::Updated { executable, to } => {
-            eprintln!("Updated May to {to}.");
-            if daemon.health().await.is_ok() {
-                eprintln!("Restarting the May daemon…");
-                let status = async_process::Command::new(&executable)
-                    .args(["daemon", "restart"])
-                    .status()
-                    .await?;
-                anyhow::ensure!(status.success(), "the new May could not restart the daemon");
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
     use may_agent::daemon::{DaemonOptions, DaemonPaths, lifecycle};
 
