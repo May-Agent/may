@@ -211,7 +211,8 @@ impl ChatHistory {
                     | MessageRole::WorkspaceResponse
                     | MessageRole::AskUserRequest
                     | MessageRole::AskUserResponse
-                    | MessageRole::Recap => None,
+                    | MessageRole::Recap
+                    | MessageRole::TurnEnd => None,
                 }
             })
             .collect()
@@ -303,7 +304,8 @@ impl ChatHistory {
                 | MessageRole::WorkspaceResponse
                 | MessageRole::AskUserRequest
                 | MessageRole::AskUserResponse
-                | MessageRole::Recap => {}
+                | MessageRole::Recap
+                | MessageRole::TurnEnd => {}
             }
         }
         Ok(out)
@@ -699,6 +701,16 @@ pub fn chat_messages_from_transcript(
                 attachments: attachments.clone(),
                 ..base(id, MessageRole::User, text.clone(), ts.as_deref())
             }),
+            E::TurnEnd {
+                id,
+                timestamp: ts,
+                content,
+            } => messages.push(base(
+                id,
+                MessageRole::TurnEnd,
+                content.clone(),
+                ts.as_deref(),
+            )),
             E::Assistant {
                 id,
                 timestamp: ts,

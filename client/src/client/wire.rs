@@ -717,6 +717,15 @@ pub enum WireTranscriptEntry {
         /// Stored content.
         content: String,
     },
+    /// Why a turn ended, as its stored record.
+    TurnEnd {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content: the serialized turn end record.
+        content: String,
+    },
     /// Hidden per-turn context.
     HiddenContext {
         /// Stored row id.

@@ -87,6 +87,54 @@ pub enum ToolEventRecord {
     },
 }
 
+/// Why a turn ended, persisted as the turn's last row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndKind {
+    /// The turn finished its work: the model's run ended on its own.
+    Completed,
+    /// The user or the turn's owning client stopped the turn.
+    Interrupted,
+    /// A provider or internal error ended the turn before it finished.
+    Failed,
+    /// The daemon ended the turn by exiting, draining it on a shutdown or
+    /// dying with it in flight.
+    DaemonExit,
+    /// A browser takeover paused the turn; it resumes when the takeover ends.
+    Paused,
+}
+
+/// The end of a turn, stored as the turn's last row.
+///
+/// A turn whose rows end without one either predates the record or is still
+/// running — a daemon that finds one behind a stale run writes the
+/// `daemon_exit` row the dead turn never could.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEndRecord {
+    /// Why the turn ended.
+    pub kind: TurnEndKind,
+    /// The error a failed turn ended with, as it was reported to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl TurnEndRecord {
+    /// The record of a turn that ended for `kind` with no detail.
+    #[must_use]
+    pub const fn new(kind: TurnEndKind) -> Self {
+        Self { kind, detail: None }
+    }
+
+    /// The record of a turn a failure ended, carrying the reported error.
+    #[must_use]
+    pub fn failed(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TurnEndKind::Failed,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
 /// Session metadata stored in the chat history header.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -156,6 +204,9 @@ pub enum MessageRole {
     /// Daemon-generated catch-up summary shown to a returning user; never
     /// replays into model context.
     Recap,
+    /// Why a turn ended; the turn's last row. Never replays into model
+    /// context.
+    TurnEnd,
 }
 
 /// How a persisted row updates the session's list summary.
@@ -203,6 +254,7 @@ impl MessageRole {
             Self::AskUserRequest => "ask_user_request",
             Self::AskUserResponse => "ask_user_response",
             Self::Recap => "recap",
+            Self::TurnEnd => "turn_end",
         }
     }
 
@@ -239,6 +291,11 @@ impl MessageRole {
                 update_preview: false,
                 increment_message_count: false,
             },
+            Self::TurnEnd => SessionSummaryUpdate {
+                touch_updated_at: false,
+                update_preview: false,
+                increment_message_count: false,
+            },
         }
     }
 }
@@ -260,6 +317,7 @@ impl core::str::FromStr for MessageRole {
             "ask_user_request" => Ok(Self::AskUserRequest),
             "ask_user_response" => Ok(Self::AskUserResponse),
             "recap" => Ok(Self::Recap),
+            "turn_end" => Ok(Self::TurnEnd),
             _ => Err(s.to_string()),
         }
     }
@@ -333,6 +391,29 @@ impl ChatMessage {
             content: content.into(),
             attachments,
             timestamp: Some(Timestamp::now()),
+            tool_call_id: None,
+            stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
+            translation: None,
+            reading: None,
+            card: None,
+            thinking: None,
+        }
+    }
+
+    /// Create a turn's end record row emitted at `at`.
+    ///
+    /// # Panics
+    /// When the record fails to serialize, which its serde shape cannot.
+    #[must_use]
+    pub fn turn_end(record: &TurnEndRecord, at: Timestamp) -> Self {
+        Self {
+            id: None,
+            role: MessageRole::TurnEnd,
+            content: serde_json::to_string(record).expect("a turn end record serializes"),
+            attachments: Vec::new(),
+            timestamp: Some(at),
             tool_call_id: None,
             stats: None,
             reasoning: Vec::new(),

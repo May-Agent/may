@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use jiff::Timestamp;
 use may_protocol::execution_mode::ExecutionMode;
+use may_protocol::session_messages::{MessageRole, TurnEndKind, TurnEndRecord};
 use may_protocol::session_plan::SessionPlanState;
 use may_protocol::session_runtime::{
     BrowserInteractionState, PendingUserMessage, PersistedAskUserRequest,
@@ -1998,6 +1999,9 @@ impl ChatDb {
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
+    ///
+    /// # Panics
+    /// When a turn end record fails to serialize, which its serde shape cannot.
     pub async fn recover_session_runtimes_after_restart(
         &self,
         previous: super::PreviousDaemon,
@@ -2011,6 +2015,44 @@ impl ChatDb {
             query!(tx, sql.as_str(), now.as_str(), now.as_str())
                 .execute()
                 .await?;
+        }
+        // A turn behind a stale run never wrote its end: it died with the
+        // process. Each gets the `daemon_exit` row its end settlement would
+        // have written, unless the turn already settled one — the end row
+        // commits with the turn's flush, ahead of the run's release, so a
+        // death between the two must not add a second.
+        let stale_sessions = query!(
+            tx,
+            "SELECT session_id AS value FROM session_runtimes WHERE run_id IS NOT NULL OR state = 'running'"
+        )
+        .fetch_all::<super::common::StringValueRow>()
+        .await?;
+        for row in stale_sessions {
+            let last_role = query!(
+                tx,
+                "SELECT role AS value FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                row.value.as_str()
+            )
+            .fetch_optional::<super::common::StringValueRow>()
+            .await?
+            .map(|last| last.value);
+            // A session without rows never had a turn to end; one whose
+            // last row is already a turn end settled before it died.
+            let Some(last_role) = last_role else { continue };
+            if last_role == MessageRole::TurnEnd.as_str() {
+                continue;
+            }
+            let record = TurnEndRecord::new(TurnEndKind::DaemonExit);
+            let content = serde_json::to_string(&record).expect("a turn end record serializes");
+            self.append_message_in_tx(
+                &mut tx,
+                &row.value,
+                MessageRole::TurnEnd,
+                &content,
+                None,
+                crate::MessageMeta::default(),
+            )
+            .await?;
         }
         query!(tx, "DELETE FROM session_background_live")
             .execute()

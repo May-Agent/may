@@ -40,7 +40,7 @@ use super::grapheme;
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
 use super::slash::SlashCommand;
-use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
+use super::ui::chat::{ChatStream, ToolDisplay, TurnEnd, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 use may_config::pasted_text;
 
@@ -667,6 +667,9 @@ struct HistoryTurn {
     last: Option<jiff::Timestamp>,
     /// The turn's latest row is a reply: a run ends with one.
     replied: bool,
+    /// Why the turn ended, from its stored end row; `None` while the turn
+    /// is still running or predates the record.
+    end: Option<may_protocol::session_messages::TurnEndKind>,
 }
 
 impl HistoryTurn {
@@ -2623,19 +2626,53 @@ impl App {
                         self.chat.push_recap(&record.summary, record.next_action);
                     }
                 }
+                MessageRole::TurnEnd => {
+                    if let Ok(record) = serde_json::from_str::<
+                        may_protocol::session_messages::TurnEndRecord,
+                    >(&msg.content)
+                    {
+                        use may_protocol::session_messages::TurnEndKind;
+                        match record.kind {
+                            // The same settlement the live interruption
+                            // performs: calls close and the notice says the
+                            // turn stopped, so a reload shows what the user
+                            // saw.
+                            TurnEndKind::Interrupted => self.chat.interrupt_turn(),
+                            TurnEndKind::DaemonExit => {
+                                self.chat.finish_running_calls();
+                                self.chat
+                                    .push_notice("The daemon stopped before this turn finished.");
+                            }
+                            TurnEndKind::Failed => {
+                                if let Some(detail) = record.detail.as_deref() {
+                                    self.chat.push_error(detail);
+                                }
+                            }
+                            TurnEndKind::Completed | TurnEndKind::Paused => {}
+                        }
+                        turn.end = Some(record.kind);
+                    }
+                }
                 _ => {}
             }
         }
-        if turn.replied {
+        if turn.end.is_some() || turn.replied {
             self.fold_history_turn(&turn);
         }
     }
 
-    /// Fold the finished turn `turn` of a history rebuild, as
-    /// `finish_agent_task` folds a live one when its run ends.
+    /// Settle the finished turn `turn` of a history rebuild, as
+    /// `finish_agent_task` settles a live one when its run ends: a turn
+    /// that ended on its own folds behind its "Worked for" row; one the
+    /// user or the daemon stopped leaves its work visible.
     fn fold_history_turn(&mut self, turn: &HistoryTurn) {
+        use may_protocol::session_messages::TurnEndKind;
         self.chat.finish_running_calls();
-        self.chat.fold_turn_work(turn.seconds());
+        let end = match turn.end {
+            Some(TurnEndKind::Interrupted | TurnEndKind::DaemonExit) => TurnEnd::Interrupted,
+            _ => TurnEnd::Finished,
+        };
+        self.chat.finish_turn_work(end, turn.seconds());
     }
 
     /// Re-reads the current session from the database and rebuilds the chat
@@ -7384,6 +7421,165 @@ mod tests {
         };
         assert_eq!(shown.as_ref(), Some(&reading));
         assert!(reading.recognises_any());
+    }
+
+    /// Rows of one finished turn: a prompt, a completed call and a reply,
+    /// ended by `record`.
+    fn finished_turn_rows(
+        record: &may_protocol::session_messages::TurnEndRecord,
+    ) -> Vec<may_protocol::session_messages::ChatMessage> {
+        use may_protocol::session_messages::{ChatMessage, ToolEventRecord};
+        let tool_row = |event: ToolEventRecord, call: &str| {
+            let mut row = ChatMessage::user(serde_json::to_string(&event).expect("tool row"));
+            row.role = MessageRole::Tool;
+            row.tool_call_id = Some(call.to_string());
+            row
+        };
+        let mut rows = vec![ChatMessage::user("hi")];
+        // Two calls: a lone item never folds behind a row of its own.
+        for call in ["c1", "c2"] {
+            rows.push(tool_row(
+                ToolEventRecord::Start {
+                    id: call.to_string(),
+                    name: "terminal".to_string(),
+                    arguments: serde_json::json!({ "description": "look", "script": "ls" })
+                        .to_string(),
+                    reading: None,
+                },
+                call,
+            ));
+            rows.push(tool_row(
+                ToolEventRecord::End {
+                    id: call.to_string(),
+                    name: "terminal".to_string(),
+                    result: aither_core::llm::ToolResult::text("done"),
+                    refused: false,
+                },
+                call,
+            ));
+        }
+        rows.push(ChatMessage::assistant("all done", jiff::Timestamp::now()));
+        rows.push(ChatMessage::turn_end(record, jiff::Timestamp::now()));
+        rows
+    }
+
+    /// An interrupted turn keeps its steps expanded behind a reload, the
+    /// interrupt notice where the live stop put it.
+    #[tokio::test]
+    async fn a_reloaded_interrupted_turn_keeps_its_work_expanded() {
+        use may_protocol::session_messages::{TurnEndKind, TurnEndRecord};
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows = finished_turn_rows(&TurnEndRecord::new(TurnEndKind::Interrupted));
+        app.render_history(&rows).await;
+        assert!(
+            !app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+            "an interrupted turn never folds: {:?}",
+            app.chat.elements()
+        );
+        assert!(
+            app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::ToolCall { .. })),
+            "its steps stay visible"
+        );
+        assert!(
+            app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::Notice { message }
+                    if message == "Interrupted — the turn stopped before finishing.")),
+            "the interrupt notice is rebuilt: {:?}",
+            app.chat.elements()
+        );
+    }
+
+    /// A turn the daemon ended keeps its steps expanded with its own
+    /// notice; it did not finish either.
+    #[tokio::test]
+    async fn a_reloaded_daemon_exit_turn_keeps_its_work_expanded() {
+        use may_protocol::session_messages::{TurnEndKind, TurnEndRecord};
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows = finished_turn_rows(&TurnEndRecord::new(TurnEndKind::DaemonExit));
+        app.render_history(&rows).await;
+        assert!(
+            !app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+            "a daemon-cut turn never folds"
+        );
+        assert!(
+            app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::Notice { message }
+                    if message == "The daemon stopped before this turn finished.")),
+            "the daemon notice is rebuilt: {:?}",
+            app.chat.elements()
+        );
+    }
+
+    /// A completed turn folds behind its "Worked for" row, exactly as a
+    /// turn without an end row does.
+    #[tokio::test]
+    async fn a_reloaded_completed_turn_folds() {
+        use may_protocol::session_messages::{TurnEndKind, TurnEndRecord};
+        let dir = tempfile::tempdir().expect("dir");
+        for rows in [
+            finished_turn_rows(&TurnEndRecord::new(TurnEndKind::Completed)),
+            finished_turn_rows(&TurnEndRecord::new(TurnEndKind::Paused)),
+        ] {
+            let (mut app, _id) = app_with_session(dir.path()).await;
+            app.render_history(&rows).await;
+            assert!(
+                app.chat
+                    .elements()
+                    .iter()
+                    .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+                "the turn folds: {:?}",
+                app.chat.elements()
+            );
+            assert!(
+                !app.chat
+                    .elements()
+                    .iter()
+                    .any(|element| matches!(element, ChatElement::Notice { .. })),
+                "no notice pretends a stop"
+            );
+        }
+    }
+
+    /// A failed turn folds its work but the error it ended with stays
+    /// visible, as the live error does.
+    #[tokio::test]
+    async fn a_reloaded_failed_turn_folds_and_shows_its_error() {
+        use may_protocol::session_messages::TurnEndRecord;
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows = finished_turn_rows(&TurnEndRecord::failed("rate limit reached"));
+        app.render_history(&rows).await;
+        assert!(
+            app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+            "the failed turn folds"
+        );
+        assert!(
+            app.chat
+                .elements()
+                .iter()
+                .any(|element| matches!(element, ChatElement::Error { message }
+                    if message == "rate limit reached")),
+            "the error it ended with is rebuilt: {:?}",
+            app.chat.elements()
+        );
     }
 
     #[tokio::test]
