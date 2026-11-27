@@ -12,7 +12,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, StyledGrapheme, Text};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -68,11 +68,39 @@ impl Widget for WrappedParagraph<'_> {
             block.render(area, buf);
             inner
         });
-        let mut rows = Text::from(wrap_lines(&self.text.lines, inner.width)).style(self.text.style);
+        let wrapped = wrap_lines(&self.text.lines, inner.width);
+        let mut rows = Text::from(wrapped.clone()).style(self.text.style);
         rows.alignment = self.text.alignment;
         Paragraph::new(rows)
             .scroll((self.scroll, 0))
             .render(inner, buf);
+        paint_line_backgrounds(&wrapped, usize::from(self.scroll), inner, buf);
+    }
+}
+
+/// Fills trailing empty cells of each rendered row with the row's
+/// `Line::style` background (`ratatui`'s `Paragraph` only styles cells that
+/// hold graphemes, leaving trailing cells past `line.width()` untouched).
+pub fn paint_line_backgrounds(wrapped: &[Line<'_>], scroll: usize, area: Rect, buf: &mut Buffer) {
+    for (dy, line) in wrapped
+        .iter()
+        .skip(scroll)
+        .take(usize::from(area.height))
+        .enumerate()
+    {
+        let Some(bg) = line.style.bg else {
+            continue;
+        };
+        if bg == Color::Reset {
+            continue;
+        }
+        let y = area.y + u16::try_from(dy).unwrap_or(u16::MAX);
+        let drawn = u16::try_from(line.width())
+            .unwrap_or(area.width)
+            .min(area.width);
+        for x in area.x + drawn..area.x + area.width {
+            buf[(x, y)].set_bg(bg);
+        }
     }
 }
 

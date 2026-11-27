@@ -224,7 +224,7 @@ impl Entry {
         assets: &super::chat::ChatAssets,
         tilde_root: Option<&std::path::Path>,
     ) -> Self {
-        let laid = element_lines(elem, state, images_supported, assets, width);
+        let laid = element_lines(elem, state, images_supported, assets, width, tilde_root);
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;
         for line in &laid.lines {

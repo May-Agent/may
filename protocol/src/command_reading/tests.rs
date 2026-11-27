@@ -41,7 +41,7 @@ fn a_patch_piped_from_cat_reads_as_one_edit() {
     let reading = CommandReading::of(script);
     assert_eq!(reading.steps.len(), 1);
     assert!(matches!(&reading.steps[0].intent, Intent::Edit { files } if files.len() == 1));
-    assert_eq!(reading.steps[0].line, "Edit gone.txt");
+    assert_eq!(reading.steps[0].line, "Delete gone.txt");
 }
 
 #[test]
@@ -300,4 +300,353 @@ fn a_tasks_listing_an_unknown_subcommand_or_a_computed_word_is_unknown() {
             "{script} stays an ordinary command"
         );
     }
+}
+
+#[test]
+fn cat_heredoc_and_herestring_writes_recognise_new_and_existing_files() {
+    let script = "cat > notes.md <<'EOF'\n# Title\nbody\nEOF\n";
+    let reading = CommandReading::of(script);
+    assert_eq!(reading.steps.len(), 1);
+    assert_eq!(reading.steps[0].line, "Create notes.md");
+    assert!(reading.updates_files());
+    let Intent::Edit { files } = &reading.steps[0].intent else {
+        panic!("edit expected: {:?}", reading.steps[0].intent);
+    };
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "notes.md");
+    assert_eq!(
+        files[0].change,
+        FileChange::Add {
+            lines: vec![
+                DiffLine {
+                    op: DiffOp::Added,
+                    text: "# Title".into(),
+                    old: None,
+                    new: Some(1),
+                },
+                DiffLine {
+                    op: DiffOp::Added,
+                    text: "body".into(),
+                    old: None,
+                    new: Some(2),
+                },
+            ],
+        }
+    );
+
+    // Reversed redirect order (`cat <<'EOF' > path`) and here-string (`<<<`).
+    let reversed = CommandReading::of("cat <<'EOF' > out.txt\nalpha\nEOF\n");
+    assert_eq!(reversed.steps[0].line, "Create out.txt");
+    let herestring = CommandReading::of("cat > single.txt <<< 'hello world'");
+    assert_eq!(herestring.steps[0].line, "Create single.txt");
+    let Intent::Edit { files } = &herestring.steps[0].intent else {
+        panic!("edit expected");
+    };
+    assert_eq!(
+        files[0].change,
+        FileChange::Add {
+            lines: vec![DiffLine {
+                op: DiffOp::Added,
+                text: "hello world".into(),
+                old: None,
+                new: Some(1),
+            }],
+        }
+    );
+
+    // Overwriting an existing file in `dir` produces real unified diff hunks.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("notes.md"),
+        "# Title\nold body\nkeep 1\nkeep 2\nkeep 3\nkeep 4\n",
+    )
+    .expect("write existing");
+    let overwrite =
+        "cat > notes.md <<'EOF'\n# Title\nnew body\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nEOF\n";
+    let located = CommandReading::of_in(overwrite, dir.path());
+    assert_eq!(located.steps[0].line, "Edit notes.md");
+    let Intent::Edit { files } = &located.steps[0].intent else {
+        panic!("edit expected");
+    };
+    let FileChange::Update { moved_to, hunks } = &files[0].change else {
+        panic!("update expected, got {:?}", files[0].change);
+    };
+    assert_eq!(moved_to, &None);
+    assert_eq!(hunks.len(), 1);
+    assert_eq!(
+        hunks[0].lines,
+        vec![
+            DiffLine {
+                op: DiffOp::Context,
+                text: "# Title".into(),
+                old: Some(1),
+                new: Some(1),
+            },
+            DiffLine {
+                op: DiffOp::Removed,
+                text: "old body".into(),
+                old: Some(2),
+                new: None,
+            },
+            DiffLine {
+                op: DiffOp::Added,
+                text: "new body".into(),
+                old: None,
+                new: Some(2),
+            },
+            DiffLine {
+                op: DiffOp::Context,
+                text: "keep 1".into(),
+                old: Some(3),
+                new: Some(3),
+            },
+            DiffLine {
+                op: DiffOp::Context,
+                text: "keep 2".into(),
+                old: Some(4),
+                new: Some(4),
+            },
+            DiffLine {
+                op: DiffOp::Context,
+                text: "keep 3".into(),
+                old: Some(5),
+                new: Some(5),
+            },
+        ]
+    );
+}
+
+#[test]
+fn cat_append_and_tee_writes_diff_existing_files_and_support_multiple_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("log.txt"), "line 1\nline 2\n").expect("write");
+
+    let append_reading = CommandReading::of_in("cat >> log.txt <<'EOF'\nline 3\nEOF\n", dir.path());
+    assert_eq!(append_reading.steps[0].line, "Edit log.txt");
+    let Intent::Edit { files } = &append_reading.steps[0].intent else {
+        panic!("edit expected");
+    };
+    let FileChange::Update { hunks, .. } = &files[0].change else {
+        panic!("update expected");
+    };
+    assert_eq!(
+        hunks[0].lines,
+        vec![
+            DiffLine {
+                op: DiffOp::Context,
+                text: "line 1".into(),
+                old: Some(1),
+                new: Some(1),
+            },
+            DiffLine {
+                op: DiffOp::Context,
+                text: "line 2".into(),
+                old: Some(2),
+                new: Some(2),
+            },
+            DiffLine {
+                op: DiffOp::Added,
+                text: "line 3".into(),
+                old: None,
+                new: Some(3),
+            },
+        ]
+    );
+
+    // `cat >>` with here-string.
+    let append_hs = CommandReading::of_in("cat >> log.txt <<< 'line 3'", dir.path());
+    assert_eq!(append_hs.steps[0].intent, append_reading.steps[0].intent);
+
+    // `tee` and `tee -a` (including multiple literal paths and `>/dev/null`).
+    let tee_new = CommandReading::of("tee a.txt b.txt <<'EOF' >/dev/null\nhello\nEOF\n");
+    assert_eq!(tee_new.steps[0].line, "Edit 2 files");
+    let Intent::Edit { files } = &tee_new.steps[0].intent else {
+        panic!("edit expected");
+    };
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].path, "a.txt");
+    assert_eq!(files[1].path, "b.txt");
+    assert!(matches!(files[0].change, FileChange::Add { .. }));
+
+    let tee_append = CommandReading::of_in("tee -a log.txt <<'EOF'\nline 3\nEOF\n", dir.path());
+    assert_eq!(tee_append.steps[0].intent, append_reading.steps[0].intent);
+
+    let tee_pipe = CommandReading::of("cat <<'EOF' | tee piped.txt\nfrom pipe\nEOF\n");
+    assert_eq!(tee_pipe.steps[0].line, "Create piped.txt");
+}
+
+#[test]
+fn printf_echo_and_rm_are_recognised_when_strictly_literal() {
+    let p1 = CommandReading::of("printf 'alpha\\nbeta\\n' > out.txt");
+    assert_eq!(p1.steps[0].line, "Create out.txt");
+    let Intent::Edit { files } = &p1.steps[0].intent else {
+        panic!("edit expected");
+    };
+    assert_eq!(
+        files[0].change,
+        FileChange::Add {
+            lines: vec![
+                DiffLine {
+                    op: DiffOp::Added,
+                    text: "alpha".into(),
+                    old: None,
+                    new: Some(1),
+                },
+                DiffLine {
+                    op: DiffOp::Added,
+                    text: "beta".into(),
+                    old: None,
+                    new: Some(2),
+                },
+            ],
+        }
+    );
+
+    let p2 = CommandReading::of("printf '%s\\n' 'one' 'two' >> out.txt");
+    assert_eq!(p2.steps[0].line, "Create out.txt");
+    let Intent::Edit { files } = &p2.steps[0].intent else {
+        panic!("edit expected");
+    };
+    assert_eq!(
+        files[0].change,
+        FileChange::Add {
+            lines: vec![
+                DiffLine {
+                    op: DiffOp::Added,
+                    text: "one".into(),
+                    old: None,
+                    new: Some(1),
+                },
+                DiffLine {
+                    op: DiffOp::Added,
+                    text: "two".into(),
+                    old: None,
+                    new: Some(2),
+                },
+            ],
+        }
+    );
+
+    let e1 = CommandReading::of("echo 'hello world' > greeting.txt");
+    assert_eq!(e1.steps[0].line, "Create greeting.txt");
+    let e2 = CommandReading::of("echo -n 'plain' >> greeting.txt");
+    assert_eq!(e2.steps[0].line, "Create greeting.txt");
+
+    let r1 = CommandReading::of("rm -f stale.txt");
+    assert_eq!(r1.steps[0].line, "Delete stale.txt");
+    assert_eq!(
+        r1.steps[0].intent,
+        Intent::Edit {
+            files: vec![FileEdit {
+                path: "stale.txt".into(),
+                change: FileChange::Delete,
+            }],
+        }
+    );
+    assert!(!r1.updates_files());
+
+    let r2 = CommandReading::of("rm -rf a.txt b.txt");
+    assert_eq!(r2.steps[0].line, "Edit 2 files");
+    let Intent::Edit { files } = &r2.steps[0].intent else {
+        panic!("edit expected");
+    };
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|f| f.change == FileChange::Delete));
+}
+
+#[test]
+fn multi_step_file_creation_with_trailing_echo_keeps_both_steps() {
+    let script = "cat > /tmp/brief.md <<'EOF'\n# Brief\nStep one\nEOF\necho written\n";
+    let reading = CommandReading::of(script);
+    assert_eq!(reading.steps.len(), 2);
+    assert_eq!(reading.steps[0].link, Link::Start);
+    assert_eq!(reading.steps[0].line, "Create /tmp/brief.md");
+    assert!(matches!(
+        &reading.steps[0].intent,
+        Intent::Edit { files } if files.len() == 1 && files[0].path == "/tmp/brief.md"
+    ));
+    assert_eq!(reading.steps[1].link, Link::Then);
+    assert_eq!(reading.steps[1].intent, unknown("echo written"));
+}
+
+#[test]
+fn dynamic_shell_writes_and_deletes_stay_unknown() {
+    for script in [
+        "cat > \"$OUT\" <<EOF\n$VAR\nEOF\n",
+        "cat > out.txt <<EOF\n$VAR\nEOF\n",
+        "cat > \"$OUT\" <<'EOF'\nhi\nEOF\n",
+        "tee \"$OUT\" <<'EOF'\nhi\nEOF\n",
+        "echo \"$VAR\" > out.txt",
+        "echo -e 'a\\nb' > out.txt",
+        "printf '%d\\n' 42 > out.txt",
+        "printf -v var '%s' hi > out.txt",
+        "printf '%s\\n' \"$VAR\" > out.txt",
+        "rm src/*.tmp",
+        "rm \"$TARGET\"",
+        "rm -i file.txt",
+        "cat > a.txt > b.txt <<'EOF'\nhi\nEOF\n",
+    ] {
+        let steps = intents(script);
+        assert!(
+            steps.iter().all(|i| matches!(i, Intent::Unknown { .. })),
+            "{script} read as {steps:?}"
+        );
+    }
+}
+
+#[test]
+fn cjk_file_creation_and_edit_preserve_chinese_japanese_and_korean() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let before = "中文标题\n日本語の行\n한국어 줄\n";
+    std::fs::write(dir.path().join("i18n.txt"), before).expect("write");
+
+    let create = "cat > fresh.txt <<'EOF'\n你好世界\nこんにちは世界\n안녕하세요 세계\nEOF\n";
+    let created = CommandReading::of(create);
+    let Intent::Edit { files } = &created.steps[0].intent else {
+        panic!("edit expected");
+    };
+    let FileChange::Add { lines } = &files[0].change else {
+        panic!("add expected");
+    };
+    let texts: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+    assert_eq!(texts, ["你好世界", "こんにちは世界", "안녕하세요 세계"]);
+
+    let update = "cat > i18n.txt <<'EOF'\n中文标题\n日本語を更新\n한국어 줄\nEOF\n";
+    let edited = CommandReading::of_in(update, dir.path());
+    assert_eq!(edited.steps[0].line, "Edit i18n.txt");
+    let Intent::Edit { files } = &edited.steps[0].intent else {
+        panic!("edit expected");
+    };
+    let FileChange::Update { hunks, .. } = &files[0].change else {
+        panic!("update expected");
+    };
+    assert_eq!(
+        hunks[0].lines,
+        vec![
+            DiffLine {
+                op: DiffOp::Context,
+                text: "中文标题".into(),
+                old: Some(1),
+                new: Some(1),
+            },
+            DiffLine {
+                op: DiffOp::Removed,
+                text: "日本語の行".into(),
+                old: Some(2),
+                new: None,
+            },
+            DiffLine {
+                op: DiffOp::Added,
+                text: "日本語を更新".into(),
+                old: None,
+                new: Some(2),
+            },
+            DiffLine {
+                op: DiffOp::Context,
+                text: "한국어 줄".into(),
+                old: Some(3),
+                new: Some(3),
+            },
+        ]
+    );
 }
