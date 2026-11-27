@@ -7,9 +7,9 @@ pub mod browser;
 pub mod image;
 pub mod lifecycle;
 pub mod profile;
-pub mod stage;
 
 pub use may_container_image::image_ref;
+pub use may_tool_dist::stage;
 
 use std::path::{Path, PathBuf};
 

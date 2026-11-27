@@ -2,10 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use may_agent::container::stage::stage_workspace_context;
+use may_tool_dist::stage::stage_workspace_context;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    futures_lite::future::block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
         [command, arch, context] if command == "stage" => stage(arch, Path::new(context)).await,
@@ -38,8 +41,8 @@ async fn build_tasks() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 /// Stages the generated workspace context entries for a Linux architecture:
 /// the baseline tools under `<context>/tools/<cache key>/bin`, the managed
-/// Linux `heel` binary at `<context>/heel` and the `tasks` command at
-/// `<context>/tasks`.
+/// Linux `heel` binary at `<context>/heel`, the `tasks` command at
+/// `<context>/tasks` and the Python shim at `<context>/python_shim`.
 async fn stage(arch: &str, context: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let scratch = tempfile::tempdir()?;
     let tasks = build_tasks().await?;
