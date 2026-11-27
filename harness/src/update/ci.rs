@@ -20,7 +20,7 @@ pub(super) const REPOSITORY: &str = "May-Agent/may";
 /// The branch whose builds are the dev channel.
 const BRANCH: &str = "main";
 
-/// The tarball CI packs the debug `may` into (`.github/actions/test`).
+/// The tarball CI packs the debug `may` into (`.github/actions/build-tests`).
 const TARBALL: &str = "may-debug.tar.gz";
 
 /// The executable inside the tarball.
@@ -33,7 +33,7 @@ const RUNS_SCANNED: u32 = 30;
 /// Upper bound of the unpacked executable, far above a debug `may`.
 const EXECUTABLE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
-/// A platform CI builds a debug `may` for (`.github/actions/test`).
+/// A platform CI builds a debug `may` for (`.github/actions/build-tests`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiPlatform {
     /// macOS on Apple silicon.

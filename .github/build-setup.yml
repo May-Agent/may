@@ -1,3 +1,9 @@
+- name: Setup stow
+  if: ${{ !(runner.os == 'Windows' && runner.arch == 'ARM64') }}
+  uses: water-rs/stow@main
+  with:
+    shared-key: release-dist
+    local-crates-io-max-bytes: '1610612736'
 - name: Install bun
   uses: ./.github/actions/install-bun
 - name: Install nasm

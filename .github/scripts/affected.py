@@ -16,16 +16,15 @@ the `scope` job forwards:
   `--workspace` for `workspace`, empty for empty.
 - `linux-package-args` — `package-args` minus the members the Linux legs
   never compile (`LINUX_EXCLUDED`; none today).
-- `cargo-flags` / `linux-cargo-flags` — the full target selection for
-  backwards compatibility (`-p` flags plus `--all-targets` when the e2e gates
-  run, `--lib --bins` when they do not).
-- `unit-test` — `true` when any crate outside the root e2e archive needs unit
-  tests.
-- `unit-cargo-flags` / `linux-unit-cargo-flags` — the target selection for
-  the parallel unit-test jobs: when `e2e` is on, drops `root_pkg` (which
-  `build-e2e` builds and archives with `--all-targets`) and keeps
-  `--all-targets` on the remaining affected crates; when `e2e` is off, keeps
-  every affected crate with `--lib --bins`.
+- `cargo-flags` / `linux-cargo-flags` — the full test target selection
+  consumed by `build-tests-*` (`-p` flags plus `--all-targets` when the e2e
+  gates run, `--lib --bins` when they do not).
+- `unit-test` — `true` when any crate outside the root package needs unit
+  tests (or any crate when `e2e` is off).
+- `unit-cargo-flags` / `linux-unit-cargo-flags` — non-empty when unit tests
+  have work on that platform: when `e2e` is on, drops `root_pkg` (whose tests
+  run in the E2E shards) and keeps `--all-targets` on the remaining affected
+  crates; when `e2e` is off, keeps every affected crate with `--lib --bins`.
 - `ui-clippy` — `true` when the `--features ui` clippy leg has work: a
   workspace scope, a `web-ui/` change, or an in-scope member carrying the
   `ui` feature that embeds the frontend bundle.
@@ -338,12 +337,11 @@ def compute(report, *, root_pkg, ui_crates, rev_deps=None, linux_excluded=LINUX_
     cargo_flags = f"{package_args(test_names)} {target_kinds}".strip()
     linux_cargo_flags = f"{package_args(test_names - linux_excluded)} {target_kinds}".strip()
 
-    # The parallel unit-test job runs every affected crate outside the e2e
-    # archive: when `e2e` runs, `build-e2e` builds and archives `root_pkg`
-    # (`--all-targets`), so `unit_names` drops `root_pkg` and keeps
-    # `--all-targets` for the remaining crates (preserving e.g. `may-patch`'s
-    # integration tests). When `e2e` is off, `unit_names` keeps every affected
-    # crate with `--lib --bins`.
+    # `build-tests-*` builds `cargo-flags` once per OS and archives it when
+    # `e2e` is on; `test-*-unit` runs `-E 'not package(may-agent)'` from that
+    # archive only when `unit-cargo-flags` / `linux-unit-cargo-flags` is
+    # non-empty. When `e2e` is off, `unit_names` keeps every affected crate
+    # with `--lib --bins` (which `build-tests-*` runs inline).
     unit_names = (set(affected) - {root_pkg}) if e2e else set(affected)
     linux_unit_names = unit_names - linux_excluded
     unit_cargo_flags = f"{package_args(unit_names)} {target_kinds}".strip() if unit_names else ""
