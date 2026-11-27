@@ -1013,9 +1013,9 @@ impl MayAgent {
             config.limits.shell()
         };
         let host_command_notices = HostCommandNotices::default();
-        let edit_bypass_notices = config
-            .hashline
-            .then(|| EditBypassNotices::with_sandbox_dir(&config.sandbox_dir));
+        let edit_bypass_notices = config.hashline.then(|| {
+            EditBypassNotices::with_sandbox_dir(&config.sandbox_dir).with_grants(grants.clone())
+        });
         let assembly = ShellAssembly {
             tools: tools.clone(),
             container: match &config.environment {

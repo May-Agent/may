@@ -1054,3 +1054,73 @@ async fn hashline_edit_bypass_isolates_notices_by_agent_path() {
         [] as [hashline_bypass::EditBypassUsage; 0]
     );
 }
+
+#[tokio::test]
+async fn hashline_edit_bypass_still_flags_sandboxes_and_granted_repos_under_system_tmp() {
+    let tmp_root = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
+    let sandbox = tmp_root.path().join("sandbox");
+    let granted_repo = tmp_root.path().join("repo");
+    let unrelated = tmp_root.path().join("unrelated.log");
+    std::fs::create_dir_all(sandbox.join("tmp")).expect("mkdir sandbox/tmp");
+    std::fs::create_dir_all(granted_repo.join("src")).expect("mkdir repo/src");
+    std::fs::write(sandbox.join("existing.py"), "x = 1\n").expect("write sandbox/existing.py");
+    std::fs::write(sandbox.join("tmp/scratch.txt"), "old\n").expect("write sandbox scratch");
+    std::fs::write(granted_repo.join("src/app.py"), "y = 1\n").expect("write repo/src/app.py");
+    std::fs::write(&unrelated, "old\n").expect("write unrelated /tmp file");
+
+    let grants = aither_sandbox::Grants::new();
+    grants.add_writable(&granted_repo);
+    let notices = EditBypassNotices::with_sandbox_dir(&sandbox).with_grants(grants);
+    let policy = HashlineEditBypassPolicy::new(notices.clone());
+    let start = ScriptDir::Host(sandbox.clone());
+
+    let run = |script: String| {
+        let policy = policy.clone();
+        let notices = notices.clone();
+        let start = start.clone();
+        async move {
+            let parsed = ShellScript::parse(&script);
+            let check = check_with(
+                aither_sandbox::LaunchLease::fresh().id(),
+                &script,
+                Some(parsed.as_ref()),
+                ScriptOrigin::Foreground,
+                &start,
+            );
+            assert_eq!(policy.check(&check, &()).await, ScriptDecision::Pass);
+            notices.take_all()
+        }
+    };
+
+    // Relative and absolute writes to non-scratch files inside a `/tmp` sandbox must alert.
+    for script in [
+        "cat <<'EOF' > existing.py\nx = 2\nEOF".to_string(),
+        format!(
+            "cat <<'EOF' > {}\nx = 3\nEOF",
+            sandbox.join("existing.py").display()
+        ),
+        format!(
+            "cd {} && python3 - <<'EOF'\nfrom pathlib import Path\nPath('src/app.py').write_text('y = 2\\n')\nEOF",
+            granted_repo.display()
+        ),
+    ] {
+        let recorded = run(script.clone()).await;
+        assert!(
+            !recorded.is_empty(),
+            "expected bypass alert for `{script}` under /tmp, got none"
+        );
+    }
+
+    // Explicit sandbox scratch and unrelated `/tmp` files remain allowed.
+    for script in [
+        "echo ok > tmp/scratch.txt".to_string(),
+        format!("echo ok > {}", sandbox.join("tmp/scratch.txt").display()),
+        format!("echo ok > {}", unrelated.display()),
+    ] {
+        let recorded = run(script.clone()).await;
+        assert!(
+            recorded.is_empty(),
+            "expected no alert for scratch path `{script}`, got: {recorded:?}"
+        );
+    }
+}

@@ -11,7 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aither_agent::AgentPath;
-use aither_sandbox::{Interpreter, ScriptCheck, ScriptDecision, ScriptOrigin, ScriptPolicy};
+use aither_sandbox::{
+    Grants, Interpreter, ScriptCheck, ScriptDecision, ScriptOrigin, ScriptPolicy,
+};
 use may_protocol::command_reading::{ShellAction, ShellActionKind, inspect_shell_actions};
 
 use crate::write_lease::{
@@ -49,6 +51,7 @@ impl EditBypassUsage {
 pub struct EditBypassNotices {
     pending: Arc<Mutex<HashMap<AgentPath, Vec<EditBypassUsage>>>>,
     sandbox_dir: Option<Arc<PathBuf>>,
+    grants: Option<Grants>,
 }
 
 impl EditBypassNotices {
@@ -59,8 +62,17 @@ impl EditBypassNotices {
     pub fn with_sandbox_dir(sandbox_dir: &Path) -> Self {
         Self {
             pending: Arc::new(Mutex::new(HashMap::new())),
-            sandbox_dir: Some(Arc::new(normalize_path(sandbox_dir))),
+            sandbox_dir: Some(Arc::new(canonical_tmp_path(sandbox_dir))),
+            grants: None,
         }
+    }
+
+    /// Attaches live session [`Grants`] so approved writable directories — even
+    /// when located under `/tmp` — are never misclassified as system temp scratch.
+    #[must_use]
+    pub fn with_grants(mut self, grants: Grants) -> Self {
+        self.grants = Some(grants);
+        self
     }
 
     /// Records `usage` for the main agent if not already queued.
@@ -135,6 +147,18 @@ impl EditBypassNotices {
     fn sandbox_dir(&self) -> Option<&Path> {
         self.sandbox_dir.as_deref().map(PathBuf::as_path)
     }
+
+    const fn grants(&self) -> Option<&Grants> {
+        self.grants.as_ref()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PathScope<'a> {
+    start: Option<&'a Path>,
+    cwd: Option<&'a Path>,
+    sandbox_dir: Option<&'a Path>,
+    grants: Option<&'a Grants>,
 }
 
 /// Observes scripts in hashline mode that bypass `edit` to modify existing
@@ -158,12 +182,18 @@ impl HashlineEditBypassPolicy {
         }
         let start = script.start.host();
         let sandbox_dir = self.notices.sandbox_dir();
+        let grants = self.notices.grants();
         if script.interpreter == Interpreter::Python {
+            let scope = PathScope {
+                start,
+                cwd: start,
+                sandbox_dir,
+                grants,
+            };
             return check_scripted_mutation(
                 "python",
                 &python_file_write_targets(script.script),
-                start,
-                sandbox_dir,
+                scope,
             )
             .await;
         }
@@ -171,8 +201,13 @@ impl HashlineEditBypassPolicy {
         if let Some(actions) = inspect_shell_actions(script.script) {
             for action in &actions {
                 let effective_cwd = start.map(|base| apply_cd_steps(base, &action.cd_steps));
-                self.inspect_action(action, effective_cwd.as_deref(), sandbox_dir, &mut found)
-                    .await;
+                let scope = PathScope {
+                    start,
+                    cwd: effective_cwd.as_deref(),
+                    sandbox_dir,
+                    grants,
+                };
+                self.inspect_action(action, scope, &mut found).await;
             }
         }
         // Also scan `ShellScript` commands to catch wrappers like `xargs` or `find -exec`
@@ -193,13 +228,12 @@ impl HashlineEditBypassPolicy {
     async fn inspect_action(
         &self,
         action: &ShellAction,
-        cwd: Option<&Path>,
-        sandbox_dir: Option<&Path>,
+        scope: PathScope<'_>,
         out: &mut Vec<EditBypassUsage>,
     ) {
         match &action.kind {
             ShellActionKind::OutputRedirect { target } => {
-                if target_is_existing_non_scratch(target, cwd, sandbox_dir).await {
+                if target_is_existing_non_scratch(target, scope).await {
                     push_unique(out, EditBypassUsage::new("shell redirection", Some(target)));
                 }
             }
@@ -212,9 +246,7 @@ impl HashlineEditBypassPolicy {
                 if let Some((mechanism, targets)) =
                     inspect_stdin_interpreter(eff_program, eff_args, stdin)
                 {
-                    for usage in
-                        check_scripted_mutation(&mechanism, &targets, cwd, sandbox_dir).await
-                    {
+                    for usage in check_scripted_mutation(&mechanism, &targets, scope).await {
                         push_unique(out, usage);
                     }
                 }
@@ -228,9 +260,7 @@ impl HashlineEditBypassPolicy {
                 if let Some((mechanism, targets)) =
                     inspect_inline_interpreter(eff_program, eff_args)
                 {
-                    for usage in
-                        check_scripted_mutation(&mechanism, &targets, cwd, sandbox_dir).await
-                    {
+                    for usage in check_scripted_mutation(&mechanism, &targets, scope).await {
                         push_unique(out, usage);
                     }
                     return;
@@ -238,15 +268,16 @@ impl HashlineEditBypassPolicy {
                 match eff_program {
                     "tee" => {
                         for target in tee_targets(eff_args) {
-                            if target_is_existing_non_scratch(target, cwd, sandbox_dir).await {
+                            if target_is_existing_non_scratch(target, scope).await {
                                 push_unique(out, EditBypassUsage::new("tee", Some(target)));
                             }
                         }
                     }
                     "cp" | "mv" => {
-                        for target in cp_or_mv_overwritten_targets(eff_program, eff_args, cwd).await
+                        for target in
+                            cp_or_mv_overwritten_targets(eff_program, eff_args, scope.cwd).await
                         {
-                            if target_is_existing_non_scratch(&target, cwd, sandbox_dir).await {
+                            if target_is_existing_non_scratch(&target, scope).await {
                                 push_unique(
                                     out,
                                     EditBypassUsage::new(eff_program, Some(target.as_str())),
@@ -257,7 +288,7 @@ impl HashlineEditBypassPolicy {
                     "dd" => {
                         for arg in eff_args {
                             if let Some(target) = arg.strip_prefix("of=")
-                                && target_is_existing_non_scratch(target, cwd, sandbox_dir).await
+                                && target_is_existing_non_scratch(target, scope).await
                             {
                                 push_unique(out, EditBypassUsage::new("dd", Some(target)));
                             }
@@ -265,7 +296,7 @@ impl HashlineEditBypassPolicy {
                     }
                     "truncate" => {
                         for target in truncate_targets(eff_args) {
-                            if target_is_existing_non_scratch(target, cwd, sandbox_dir).await {
+                            if target_is_existing_non_scratch(target, scope).await {
                                 push_unique(out, EditBypassUsage::new("truncate", Some(target)));
                             }
                         }
@@ -587,8 +618,7 @@ fn has_script_file_arg(args: &[String]) -> bool {
 async fn check_scripted_mutation(
     mechanism: &str,
     targets: &[Option<String>],
-    cwd: Option<&Path>,
-    sandbox_dir: Option<&Path>,
+    scope: PathScope<'_>,
 ) -> Vec<EditBypassUsage> {
     if targets.is_empty() {
         return Vec::new();
@@ -596,10 +626,10 @@ async fn check_scripted_mutation(
     let mut found = Vec::new();
     for target in targets {
         if let Some(raw) = target {
-            if is_scratch_or_allowed_path(raw, cwd, sandbox_dir) {
+            if is_scratch_or_allowed_path(raw, scope) {
                 continue;
             }
-            if let Some(host_cwd) = cwd {
+            if let Some(host_cwd) = scope.cwd {
                 if path_exists_as_file(&resolve_path(host_cwd, raw)).await {
                     push_unique(&mut found, EditBypassUsage::new(mechanism, Some(raw)));
                 }
@@ -608,7 +638,10 @@ async fn check_scripted_mutation(
             }
         } else {
             // Unknown/dynamic target: allow only when cwd itself is clearly scratch.
-            if cwd.is_some_and(|dir| is_scratch_directory(dir, sandbox_dir)) {
+            if scope
+                .cwd
+                .is_some_and(|dir| is_scratch_directory(dir, scope))
+            {
                 continue;
             }
             push_unique(&mut found, EditBypassUsage::new(mechanism, None));
@@ -747,15 +780,11 @@ async fn cp_or_mv_overwritten_targets(
     vec![dest.to_string()]
 }
 
-async fn target_is_existing_non_scratch(
-    raw: &str,
-    cwd: Option<&Path>,
-    sandbox_dir: Option<&Path>,
-) -> bool {
-    if is_scratch_or_allowed_path(raw, cwd, sandbox_dir) {
+async fn target_is_existing_non_scratch(raw: &str, scope: PathScope<'_>) -> bool {
+    if is_scratch_or_allowed_path(raw, scope) {
         return false;
     }
-    let Some(host_cwd) = cwd else {
+    let Some(host_cwd) = scope.cwd else {
         return false;
     };
     path_exists_as_file(&resolve_path(host_cwd, raw)).await
@@ -767,7 +796,26 @@ async fn path_exists_as_file(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file())
 }
 
-fn is_scratch_or_allowed_path(raw: &str, cwd: Option<&Path>, sandbox_dir: Option<&Path>) -> bool {
+fn canonical_tmp_path(path: &Path) -> PathBuf {
+    let normalized = normalize_path(path);
+    if let Ok(rest) = normalized.strip_prefix("/private/tmp") {
+        return Path::new("/tmp").join(rest);
+    }
+    if let Ok(rest) = normalized.strip_prefix("/private/var/tmp") {
+        return Path::new("/var/tmp").join(rest);
+    }
+    normalized
+}
+
+fn is_system_temp_root(canon: &Path) -> bool {
+    canon == Path::new("/tmp") || canon == Path::new("/var/tmp")
+}
+
+fn is_under_system_temp(canon: &Path) -> bool {
+    canon.starts_with("/tmp") || canon.starts_with("/var/tmp")
+}
+
+fn is_scratch_or_allowed_path(raw: &str, scope: PathScope<'_>) -> bool {
     let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() {
         return true;
@@ -775,12 +823,6 @@ fn is_scratch_or_allowed_path(raw: &str, cwd: Option<&Path>, sandbox_dir: Option
     // Special devices and temp/tasks variables.
     if trimmed == "/dev/null"
         || trimmed.starts_with("/dev/")
-        || trimmed == "/tmp"
-        || trimmed.starts_with("/tmp/")
-        || trimmed == "/var/tmp"
-        || trimmed.starts_with("/var/tmp/")
-        || trimmed == "/private/tmp"
-        || trimmed.starts_with("/private/tmp/")
         || trimmed == "$MAY_TASKS"
         || trimmed == "${MAY_TASKS}"
         || trimmed.starts_with("$TMPDIR/")
@@ -807,35 +849,50 @@ fn is_scratch_or_allowed_path(raw: &str, cwd: Option<&Path>, sandbox_dir: Option
     {
         return true;
     }
-    // Resolved path inside `/tmp`, `/var/tmp`, `/private/tmp`, or `<sandbox_dir>/{tmp,...}`.
+    // Check resolved path against session sandbox scratch, active workspace roots,
+    // and only then system temporary directories.
     let resolved = if path.is_absolute() {
         normalize_path(path)
-    } else if let Some(host_cwd) = cwd {
+    } else if let Some(host_cwd) = scope.cwd {
         resolve_path(host_cwd, trimmed)
     } else {
         return false;
     };
-    is_scratch_directory(&resolved, sandbox_dir)
+    is_scratch_directory(&resolved, scope)
 }
 
-fn is_scratch_directory(resolved: &Path, sandbox_dir: Option<&Path>) -> bool {
-    if resolved.starts_with("/dev/")
-        || resolved.starts_with("/tmp/")
-        || resolved == Path::new("/tmp")
-        || resolved.starts_with("/var/tmp/")
-        || resolved.starts_with("/private/tmp/")
-    {
+fn is_scratch_directory(resolved: &Path, scope: PathScope<'_>) -> bool {
+    let canon = canonical_tmp_path(resolved);
+    if canon.starts_with("/dev") {
         return true;
     }
-    if let Some(sandbox) = sandbox_dir {
-        for prefix in SCRATCH_PREFIXES {
-            let scratch = sandbox.join(prefix);
-            if resolved == scratch || resolved.starts_with(&scratch) {
-                return true;
-            }
+    // Evaluate `sandbox_dir` before any `/tmp` heuristic: on Linux (or when
+    // `HOME` is inside `/tmp`), the session sandbox itself lives under `/tmp`
+    // and only its explicit scratch subdirectories count as scratch.
+    if let Some(sandbox) = scope.sandbox_dir
+        && canon.starts_with(sandbox)
+    {
+        return SCRATCH_PREFIXES
+            .iter()
+            .any(|prefix| canon.starts_with(sandbox.join(prefix)));
+    }
+    // Approved writable directories (and the shell's starting workspace root)
+    // may also reside under `/tmp`; edits inside them are never scratch.
+    if let Some(grants) = scope.grants
+        && grants.snapshot().writable.iter().any(|dir| {
+            let dir_canon = canonical_tmp_path(dir);
+            !is_system_temp_root(&dir_canon) && canon.starts_with(&dir_canon)
+        })
+    {
+        return false;
+    }
+    if let Some(root) = scope.start {
+        let root_canon = canonical_tmp_path(root);
+        if !is_system_temp_root(&root_canon) && canon.starts_with(&root_canon) {
+            return false;
         }
     }
-    false
+    is_under_system_temp(&canon)
 }
 
 /// Shared Python file-mutation detector used by both [`HashlineEditBypassPolicy`]
