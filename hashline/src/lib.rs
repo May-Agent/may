@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Engine behind the `search` and `edit` hashline executables.
 //!
 //! Hashline is a hash-anchored line protocol: file text the tools serve is
@@ -189,5 +190,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(&dir, "a.txt"), "+plus\n-minus\n  indent\n\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editing_workspace_root_succeeds_under_readonly_parent_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let outer = tempfile::tempdir().unwrap();
+        let workspace = outer.path().join("repo");
+        std::fs::create_dir(&workspace).unwrap();
+        let file = workspace.join("sample.py");
+        std::fs::write(&file, "alpha = 1\nbeta = 2\n").unwrap();
+        let tag = file_tag("alpha = 1\nbeta = 2\n");
+
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = apply_patch(
+            &workspace,
+            &format!("[sample.py#{tag}]\nPUT 2:\n+beta = 42\n"),
+            &AstResolver,
+        );
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        res.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha = 1\nbeta = 42\n"
+        );
     }
 }

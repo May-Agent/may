@@ -499,10 +499,15 @@ fn write_atomic(
         path: target.to_path_buf(),
         detail: "has no parent directory".to_string(),
     })?;
-    std::fs::create_dir_all(parent).map_err(|source_err| Error::Io {
-        path: parent.to_path_buf(),
-        source: source_err,
-    })?;
+    // Skip `create_dir_all` when `parent` already exists: under Linux Landlock,
+    // `mkdir(parent)` checks `MAKE_DIR` on `parent`'s parent before returning
+    // `EEXIST`, failing with `EACCES` at the root of an approved workspace.
+    if !parent.is_dir() {
+        std::fs::create_dir_all(parent).map_err(|source_err| Error::Io {
+            path: parent.to_path_buf(),
+            source: source_err,
+        })?;
+    }
     let tmp = parent.join(format!(
         ".{}.hashline-tmp",
         target
