@@ -14,8 +14,9 @@ use jiff::Timestamp;
 
 use may_agent::agent::{AgentWorker, TuiEvent};
 use may_agent::client::HoldReason;
-use may_agent::session::RunOutcome;
-use may_agent::tui::runtime::{AssistantReply, ResponseCommit, RuntimeDeps, TitleGenContext};
+use may_agent::tui::runtime::{
+    AssistantReply, ResponseCommit, RuntimeDeps, TitleGenContext, TurnEnd,
+};
 use may_agent::tui::{App, PendingMessage};
 
 use super::cli::OneShotArgs;
@@ -471,11 +472,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                             &mut agent_handle,
                             &mut pending_title_gen,
                             &assistant_response,
-                            if run_failed {
-                                RunOutcome::Failed
-                            } else {
-                                RunOutcome::Completed
-                            },
+                            TurnEnd::Finished,
                         )
                         .await;
                     if run_failed {
@@ -506,7 +503,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &mut None,
                         &mut pending_title_gen,
                         &assistant_response,
-                        RunOutcome::Completed,
+                        TurnEnd::Finished,
                     )
                     .await;
                 output.end_text_line()?;
@@ -588,7 +585,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &mut None,
                         &mut pending_title_gen,
                         &assistant_response,
-                        RunOutcome::Cancelled,
+                        TurnEnd::Finished,
                     )
                     .await;
                 anyhow::bail!(message);
@@ -601,7 +598,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         &mut None,
                         &mut pending_title_gen,
                         &assistant_response,
-                        RunOutcome::Failed,
+                        TurnEnd::Finished,
                     )
                     .await;
                 anyhow::bail!(error);

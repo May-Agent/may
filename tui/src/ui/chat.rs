@@ -508,6 +508,15 @@ impl ReplyTranslation {
     }
 }
 
+/// How a turn's displayed work is settled when its stream ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The turn's stream settled without a user interruption.
+    Finished,
+    /// The user interrupted the turn.
+    Interrupted,
+}
+
 /// An element in the chat stream.
 #[derive(Debug, Clone)]
 pub enum ChatElement {
@@ -1222,9 +1231,25 @@ impl ChatStream {
         }
     }
 
-    /// Mark every call still marked running as interrupted — the run ended
-    /// without reporting their completion, so holding their bodies open
-    /// would be wrong. They collapse once the recent window lapses.
+    /// Settle the displayed work of a finished turn. Finished turns fold it
+    /// behind their "Worked for" row; an interrupted turn leaves it visible.
+    pub fn finish_turn_work(&mut self, end: TurnEnd, seconds: u64) {
+        if end == TurnEnd::Finished {
+            self.fold_turn_work(seconds);
+        }
+    }
+
+    /// End the visible turn the user interrupted: close its live parts, mark
+    /// its running calls interrupted, and describe the stop in a notice.
+    pub fn interrupt_turn(&mut self) {
+        self.collapse_thinking();
+        self.finish_running_calls();
+        self.push_notice("Interrupted — the turn stopped before finishing.");
+    }
+
+    /// Mark every call still marked running as refused — the run ended
+    /// without letting it finish, so holding its body open would be wrong.
+    /// It collapses once the recent window lapses.
     pub fn finish_running_calls(&mut self) {
         for index in 0..self.elements.len() {
             let Some(ChatElement::ToolCall { display, .. }) = self.elements.get_mut(index) else {
@@ -1237,7 +1262,7 @@ impl ChatStream {
                 ToolDisplay::Terminal { status, .. }
                 | ToolDisplay::Action { status, .. }
                 | ToolDisplay::Builtin { status, .. } => {
-                    *status = ToolStatus::Failed("interrupted".to_string());
+                    *status = ToolStatus::Refused("interrupted".to_string());
                 }
             }
             self.touch(index);
@@ -6012,6 +6037,7 @@ pub fn render_tool_fullscreen(
 }
 #[cfg(test)]
 mod tests {
+    use super::TurnEnd;
     use super::{Card, RowChangeKind, RowView, SubagentState, card_lines};
     use super::{
         ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
@@ -6891,7 +6917,7 @@ mod tests {
         chat.push_text("answer");
         chat.end_text();
         chat.push_user("你好 こんにちは 안녕하세요", Vec::new(), 2);
-        chat.push_text("\n\n[Interrupted]");
+        chat.push_text("partial answer");
         chat.end_text();
 
         assert!(chat.withdraw_last_prompt("never sent").is_none());
@@ -8214,7 +8240,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_running_calls_marks_orphans_interrupted() {
+    fn finish_running_calls_marks_orphans_refused() {
         let mut chat = ChatStream::new();
         chat.push_tool(
             "call-1".to_string(),
@@ -8230,7 +8256,7 @@ mod tests {
         let Some(ChatElement::ToolCall { display, .. }) = chat.elements.last() else {
             panic!("the call stays in the stream");
         };
-        assert!(matches!(display.status(), ToolStatus::Failed(_)));
+        assert!(matches!(display.status(), ToolStatus::Refused(_)));
     }
 
     /// The rows of a tasks.md document feed the todo block — the same path
@@ -8364,6 +8390,79 @@ mod tests {
         rows
     }
 
+    /// Finishing a turn folds its work; interrupting it leaves the same
+    /// steps visible outside a "Worked for" row.
+    #[test]
+    fn finish_turn_work_folds_finished_turns_only() {
+        let mut finished = ChatStream::new();
+        finished.push_user("hi", Vec::new(), 0);
+        work_turn(&mut finished, "done");
+        finished.finish_turn_work(TurnEnd::Finished, 3);
+        assert_eq!(worked_rows(&finished), vec![(3, 2)]);
+
+        let mut interrupted = ChatStream::new();
+        interrupted.push_user("hi", Vec::new(), 0);
+        work_turn(&mut interrupted, "stop");
+        interrupted.finish_turn_work(TurnEnd::Interrupted, 3);
+        assert_eq!(worked_rows(&interrupted), Vec::new());
+        assert!(matches!(
+            interrupted.elements.get(1),
+            Some(ChatElement::Thinking { .. })
+        ));
+        assert!(matches!(
+            interrupted.elements.get(2),
+            Some(ChatElement::ToolCall { .. })
+        ));
+    }
+
+    /// Interrupting a turn closes live work and reports the stop as a notice,
+    /// not as assistant text.
+    #[test]
+    fn interrupt_turn_stops_running_work_and_writes_a_notice() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        chat.push_tool(
+            "running".to_string(),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: "sleep 60".to_string(),
+                mode: SandboxMode::Sandboxed,
+                location: None,
+                interpreter: Interpreter::Shell,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+                reading: None,
+                card: None,
+            },
+        );
+        chat.push_text("partial");
+        chat.interrupt_turn();
+
+        assert!(matches!(
+            chat.elements.get(1),
+            Some(ChatElement::ToolCall {
+                display: ToolDisplay::Terminal {
+                    status: ToolStatus::Refused(reason),
+                    ..
+                },
+                ..
+            }) if reason == "interrupted"
+        ));
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::Notice { message })
+                if message == "Interrupted — the turn stopped before finishing."
+        ));
+        assert!(
+            !chat
+                .elements
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. }))
+        );
+    }
+
     /// Turns that end without a reply of their own (interrupted, resumed
     /// by a background command, ended on a question) fold into one row
     /// that the next result follows.
@@ -8401,16 +8500,16 @@ mod tests {
         }
     }
 
-    /// An interrupted run ends on its marker; the earlier resultless
-    /// turn folds with the interrupted turn's work ahead of it.
+    /// A reply after an earlier resultless turn folds both turns' work into
+    /// one row ahead of it.
     #[test]
-    fn interrupted_turn_after_resultless_turn_shares_one_row() {
+    fn a_reply_after_a_resultless_turn_shares_one_row() {
         let mut chat = ChatStream::new();
         chat.push_user("hi", Vec::new(), 0);
         work_turn(&mut chat, "a");
         chat.fold_turn_work(1821);
         work_turn(&mut chat, "b");
-        chat.push_text("\n\n[Interrupted]");
+        chat.push_text("partial answer");
         chat.end_text();
         chat.fold_turn_work(250);
         assert_eq!(worked_rows(&chat), vec![(2071, 4)]);
