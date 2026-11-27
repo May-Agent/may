@@ -101,7 +101,9 @@ fn discover_sync(workdir: &Path) -> AgentsIndex {
         index.root_truncated = root.truncated;
     }
 
-    let walker = ignore::WalkBuilder::new(workdir)
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let found = std::sync::Mutex::new(Vec::<PathBuf>::new());
+    ignore::WalkBuilder::new(workdir)
         // Dot-directories like `.github` still count.
         .hidden(false)
         // Honor ignore rules even outside a git repository.
@@ -110,9 +112,7 @@ fn discover_sync(workdir: &Path) -> AgentsIndex {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        // Deterministic order keeps the rendered block stable across
-        // agent rebuilds.
-        .sort_by_file_name(std::cmp::Ord::cmp)
+        .threads(threads)
         .filter_entry(|entry| {
             if entry.depth() == 0 {
                 return true;
@@ -129,34 +129,51 @@ fn discover_sync(workdir: &Path) -> AgentsIndex {
             }
             true
         })
-        .build();
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(%error, "skipped a path during AGENTS.md discovery");
-                continue;
-            }
-        };
-        if !entry.file_type().is_some_and(|kind| kind.is_file())
-            || entry.file_name() != OsStr::new(AGENTS_FILE_NAME)
-        {
-            continue;
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(workdir)
-            .unwrap_or_else(|_| entry.path());
-        // The root file is loaded in full, not listed.
-        if relative == Path::new(AGENTS_FILE_NAME) {
-            continue;
-        }
-        if index.nested.len() < NESTED_LIST_CAP {
-            index.nested.push(relative.to_string_lossy().into_owned());
-        } else {
-            index.extra_nested += 1;
-        }
+        .build_parallel()
+        .run(|| {
+            let found = &found;
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        tracing::warn!(%error, "skipped a path during AGENTS.md discovery");
+                        return ignore::WalkState::Continue;
+                    }
+                };
+                if !entry.file_type().is_some_and(|kind| kind.is_file())
+                    || entry.file_name() != OsStr::new(AGENTS_FILE_NAME)
+                {
+                    return ignore::WalkState::Continue;
+                }
+                let relative = entry
+                    .path()
+                    .strip_prefix(workdir)
+                    .unwrap_or_else(|_| entry.path());
+                // The root file is loaded in full, not listed.
+                if relative == Path::new(AGENTS_FILE_NAME) {
+                    return ignore::WalkState::Continue;
+                }
+                found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(relative.to_path_buf());
+                ignore::WalkState::Continue
+            })
+        });
+    let mut nested = found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Deterministic component-wise order matches depth-first filename order
+    // so the rendered block stays stable across agent rebuilds.
+    nested.sort_by(|left, right| left.components().cmp(right.components()));
+    if nested.len() > NESTED_LIST_CAP {
+        index.extra_nested = nested.len() - NESTED_LIST_CAP;
+        nested.truncate(NESTED_LIST_CAP);
     }
+    index.nested = nested
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
     index
 }
 
@@ -393,5 +410,36 @@ mod tests {
         let index = discover(dir.path()).await;
 
         assert_eq!(index.nested, vec!["crates/foo/AGENTS.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn parallel_discover_returns_deterministic_sorted_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "AGENTS.md", "root");
+        for rel in [
+            "z/AGENTS.md",
+            "a/b/AGENTS.md",
+            "a/AGENTS.md",
+            "a-b/AGENTS.md",
+            "中文/AGENTS.md",
+            "日本語/AGENTS.md",
+            "한국어/AGENTS.md",
+        ] {
+            write(dir.path(), rel, rel);
+        }
+
+        let index = discover(dir.path()).await;
+        assert_eq!(
+            index.nested,
+            vec![
+                "a/AGENTS.md",
+                "a/b/AGENTS.md",
+                "a-b/AGENTS.md",
+                "z/AGENTS.md",
+                "中文/AGENTS.md",
+                "日本語/AGENTS.md",
+                "한국어/AGENTS.md",
+            ]
+        );
     }
 }

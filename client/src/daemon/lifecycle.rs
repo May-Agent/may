@@ -293,8 +293,21 @@ async fn run(command: &str, args: &[&str]) -> Result<(), LifecycleError> {
     run_output(command, args).await.map(drop)
 }
 
-async fn uid() -> Result<String, LifecycleError> {
-    Ok(run_output("id", &["-u"]).await?.trim().to_string())
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the non-unix variant signature"
+)]
+fn uid() -> Result<String, LifecycleError> {
+    Ok(rustix::process::getuid().as_raw().to_string())
+}
+
+#[cfg(not(unix))]
+fn uid() -> Result<String, LifecycleError> {
+    Err(LifecycleError::ServiceManager {
+        command: "id -u".to_string(),
+        detail: "unsupported platform".to_string(),
+    })
 }
 
 /// Longest `launchctl bootout` is given to take the service out of launchd.
@@ -366,7 +379,7 @@ pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
             environment: &environment(paths)?,
         }
         .render()?;
-        let domain = format!("gui/{}", uid().await?);
+        let domain = format!("gui/{}", uid()?);
         if async_fs::metadata(&path).await.is_ok() {
             boot_out(&domain, SERVICE_LABEL, &path).await?;
         }
@@ -398,7 +411,7 @@ pub async fn uninstall() -> Result<Option<PathBuf>, LifecycleError> {
         if async_fs::metadata(&path).await.is_err() {
             return Ok(None);
         }
-        let domain = format!("gui/{}", uid().await?);
+        let domain = format!("gui/{}", uid()?);
         boot_out(&domain, SERVICE_LABEL, &path).await?;
         async_fs::remove_file(&path).await?;
         Ok(Some(path))
@@ -416,7 +429,7 @@ pub async fn uninstall() -> Result<Option<PathBuf>, LifecycleError> {
 
 async fn restart_service() -> Result<(), LifecycleError> {
     if cfg!(target_os = "macos") {
-        let target = format!("gui/{}/{SERVICE_LABEL}", uid().await?);
+        let target = format!("gui/{}/{SERVICE_LABEL}", uid()?);
         run("launchctl", &["kickstart", "-k", &target]).await
     } else {
         run("systemctl", &["--user", "restart", SYSTEMD_UNIT]).await
@@ -643,7 +656,7 @@ fn on_demand_plist(
 /// the login session (and reaches its keychain) whichever session the client
 /// is in. The plist lives under the May home, so nothing starts at login.
 async fn start_job(paths: &DaemonPaths) -> Result<Started, LifecycleError> {
-    let domain = format!("gui/{}", uid().await?);
+    let domain = format!("gui/{}", uid()?);
     require_gui_domain(run("launchctl", &["print", &domain]).await.is_ok())?;
     let log = paths.log();
     if let Some(parent) = log.parent() {

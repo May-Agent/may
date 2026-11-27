@@ -366,4 +366,36 @@ mod tests {
             "auto-archiving drops the session's parked agent"
         );
     }
+
+    #[tokio::test]
+    async fn a_session_with_a_draft_plan_is_omitted_from_archive_candidates() {
+        let (_dir, db) = db_with_profile().await;
+        add(&db, "draft").await;
+        add(&db, "approved").await;
+        db.set_session_plan_state("draft", may_protocol::session_plan::SessionPlanState::Draft)
+            .await
+            .expect("draft plan");
+        db.set_session_plan_state(
+            "approved",
+            may_protocol::session_plan::SessionPlanState::Approved,
+        )
+        .await
+        .expect("approved plan");
+
+        let candidates: Vec<String> = db
+            .sessions_needing_archive(&past_window().to_string())
+            .await
+            .expect("candidates")
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(candidates, ["approved"]);
+
+        let archived = archive_idle(&db, past_window(), &BTreeSet::new())
+            .await
+            .expect("sweep");
+        assert_eq!(archived, ["approved"]);
+        assert!(!is_archived(&db, "draft").await);
+        assert!(is_archived(&db, "approved").await);
+    }
 }

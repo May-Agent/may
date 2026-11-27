@@ -147,22 +147,79 @@ impl SessionStore {
         id: &str,
         profile_id: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.reconcile_container_mount_points_inner(id, profile_id, true)
+            .await
+    }
+
+    /// Reconcile a container session's mount points assuming its profile's
+    /// skills directory has already been seeded for this startup pass.
+    pub(crate) async fn reconcile_container_mount_points_preseeded(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.reconcile_container_mount_points_inner(id, profile_id, false)
+            .await
+    }
+
+    async fn reconcile_container_mount_points_inner(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+        seed_profile: bool,
+    ) -> Result<(), StoreError> {
         let paths = self.session_paths(id, profile_id);
-        if async_fs::metadata(paths.root()).await.is_err() {
+        let global_skills = self.home_paths.skills_dir();
+        let profile_skills = profile_id.map(|pid| self.home_paths.profile_home(pid).skills_dir());
+        let session_id = id.to_string();
+        unblock(move || {
+            Self::reconcile_container_mount_points_sync(
+                &session_id,
+                &paths,
+                &global_skills,
+                profile_skills.as_deref(),
+                seed_profile,
+            )
+        })
+        .await
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "batched synchronous mount-point reconciliation runs inside blocking::unblock"
+    )]
+    fn reconcile_container_mount_points_sync(
+        id: &str,
+        paths: &SessionPaths,
+        global_skills: &Path,
+        profile_skills: Option<&Path>,
+        seed_profile: bool,
+    ) -> Result<(), StoreError> {
+        if std::fs::metadata(paths.root()).is_err() {
             return Ok(());
         }
         tracing::debug!(session_id = %id, path = %paths.root().display(), "Reconciling container mount points for session");
 
-        async_fs::create_dir_all(paths.tmp_dir()).await?;
-        async_fs::create_dir_all(paths.data_dir()).await?;
-        async_fs::create_dir_all(paths.files_dir()).await?;
-        async_fs::create_dir_all(paths.images_dir()).await?;
-        async_fs::create_dir_all(paths.outputs_dir()).await?;
-        async_fs::create_dir_all(paths.artifacts_dir()).await?;
-        Self::ensure_mount_point_dir(paths.root(), "skills").await?;
-        Self::ensure_mount_point_dir(paths.root(), ".may/memories").await?;
-        self.seed_session_scoped_resources(&paths, profile_id)
-            .await?;
+        std::fs::create_dir_all(paths.tmp_dir())?;
+        std::fs::create_dir_all(paths.data_dir())?;
+        std::fs::create_dir_all(paths.files_dir())?;
+        std::fs::create_dir_all(paths.images_dir())?;
+        std::fs::create_dir_all(paths.outputs_dir())?;
+        std::fs::create_dir_all(paths.artifacts_dir())?;
+        Self::ensure_mount_point_dir_sync(paths.root(), "skills")?;
+        Self::ensure_mount_point_dir_sync(paths.root(), ".may/memories")?;
+        let skills_source = match profile_skills {
+            Some(profile_dir) => {
+                if seed_profile && std::fs::metadata(global_skills).is_ok() {
+                    copy_dir_contents_recursive(global_skills, profile_dir)?;
+                }
+                profile_dir
+            }
+            None => global_skills,
+        };
+        if std::fs::metadata(skills_source).is_ok() {
+            copy_dir_contents_recursive(skills_source, &paths.skills_dir())?;
+        }
         Ok(())
     }
 
@@ -221,12 +278,22 @@ impl SessionStore {
     }
 
     async fn ensure_mount_point_dir(parent: &Path, name: &str) -> Result<(), StoreError> {
+        let parent = parent.to_path_buf();
+        let name = name.to_string();
+        unblock(move || Self::ensure_mount_point_dir_sync(&parent, &name)).await
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous mount-point directory helper runs inside blocking::unblock"
+    )]
+    fn ensure_mount_point_dir_sync(parent: &Path, name: &str) -> Result<(), StoreError> {
         let target = parent.join(name);
-        match async_fs::symlink_metadata(&target).await {
+        match std::fs::symlink_metadata(&target) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     tracing::debug!(path = %target.display(), "Removing stale symlink mount point");
-                    async_fs::remove_file(&target).await?;
+                    std::fs::remove_file(&target)?;
                 } else if meta.is_dir() {
                     return Ok(());
                 } else {
@@ -240,7 +307,7 @@ impl SessionStore {
             Err(error) => return Err(StoreError::Io(error)),
         }
 
-        async_fs::create_dir_all(&target).await?;
+        std::fs::create_dir_all(&target)?;
         Ok(())
     }
 

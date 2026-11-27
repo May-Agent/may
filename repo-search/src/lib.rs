@@ -58,10 +58,24 @@ impl From<ConnectError> for RepoSearchError {
     }
 }
 
-#[derive(Debug)]
 struct Prepared {
-    program: PathBuf,
+    socket: PathBuf,
     hello: Hello,
+    launcher: async_lock::Mutex<PlatformLauncher>,
+    ensured: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("socket", &self.socket)
+            .field("hello", &self.hello)
+            .field(
+                "ensured",
+                &self.ensured.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -112,8 +126,19 @@ impl RepoSearch {
                     )
                     .await?;
                 let program = path.path().to_path_buf();
-                let hello = Hello::new(BuildId::of_file(&program)?);
-                Ok::<_, RepoSearchError>(Prepared { program, hello })
+                let (hello, launcher, socket) = blocking::unblock(move || {
+                    let hello = Hello::new(BuildId::of_file(&program)?);
+                    let launcher = PlatformLauncher::user(program)?;
+                    let socket = launcher.socket().to_path_buf();
+                    Ok::<_, std::io::Error>((hello, launcher, socket))
+                })
+                .await?;
+                Ok::<_, RepoSearchError>(Prepared {
+                    socket,
+                    hello,
+                    launcher: async_lock::Mutex::new(launcher),
+                    ensured: std::sync::atomic::AtomicBool::new(false),
+                })
             })
             .await
     }
@@ -133,9 +158,49 @@ impl RepoSearch {
         if *retired {
             return Err(RepoSearchError::Retired);
         }
-        let mut launcher = PlatformLauncher::user(prepared.program.clone())?;
+        // On macOS both launchd agents are socket-activated: once `prepare`
+        // has verified/installed them for this process's pinned binary,
+        // subsequent calls connect directly without re-running `flock` or
+        // plist checks, falling back to the launcher only on a recoverable
+        // connect error.
+        #[cfg(target_os = "macos")]
+        if prepared.ensured.load(std::sync::atomic::Ordering::Acquire) {
+            match Client::connect(&prepared.socket, &prepared.hello).await {
+                Ok(client) => {
+                    drop(retired);
+                    return Ok(client);
+                }
+                Err(error) => {
+                    let mut launcher = prepared.launcher.lock().await;
+                    if !launcher.recoverable(&error) {
+                        return Err(RepoSearchError::Client(error));
+                    }
+                    let report = launcher.prepare().await;
+                    let client =
+                        launcher::connect(&mut *launcher, &prepared.hello, report, log_note)
+                            .await?;
+                    drop(launcher);
+                    drop(retired);
+                    return Ok(client);
+                }
+            }
+        }
+        let mut launcher = prepared.launcher.lock().await;
+        #[cfg(target_os = "macos")]
+        if prepared.ensured.load(std::sync::atomic::Ordering::Acquire) {
+            drop(launcher);
+            if let Ok(client) = Client::connect(&prepared.socket, &prepared.hello).await {
+                drop(retired);
+                return Ok(client);
+            }
+            launcher = prepared.launcher.lock().await;
+        }
         let report = launcher.prepare().await;
-        let client = launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?;
+        let client = launcher::connect(&mut *launcher, &prepared.hello, report, log_note).await?;
+        prepared
+            .ensured
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(launcher);
         // Held until here: the launch above is what installs agents.
         drop(retired);
         Ok(client)

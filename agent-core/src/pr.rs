@@ -338,17 +338,7 @@ impl PrStore {
             };
         }
         // The repository the cwd sits in, when it has one unambiguous workspace.
-        let cwd_key = crate::repo_search::worktree_root(&self.context.cwd)
-            .and_then(|worktree| {
-                crate::repo_clone::CloneSource::of(
-                    &worktree,
-                    &self.context.workspace_config,
-                    &crate::config::MayConfig::default(),
-                )
-                .ok()
-                .flatten()
-            })
-            .map(|source| source.key());
+        let cwd_key = self.cwd_clone_key().await;
         if let Some(key) = cwd_key.as_deref() {
             let matching: Vec<_> = clones.iter().filter(|c| c.repo_key == key).collect();
             match matching.as_slice() {
@@ -414,7 +404,9 @@ impl PrStore {
         // No clones yet: clone the cwd's repo on demand, resolving its
         // trust first (a persisted decision wins; the rest resolves from
         // the viewer's GitHub access).
-        let worktree = crate::repo_search::worktree_root(&self.context.cwd)
+        let cwd = self.context.cwd.clone();
+        let worktree = blocking::unblock(move || crate::repo_search::worktree_root(&cwd))
+            .await
             .ok_or_else(|| PrError::Resolve("not inside a repository".to_string()))?;
         let config_path =
             crate::session::SessionPaths::new(self.context.session_root.clone()).workspace_config();
@@ -433,8 +425,10 @@ impl PrStore {
         }
         // The resolution may have persisted a level: read the config afresh
         // so a GitHub level picks the remote clone.
-        let config = crate::workspace::WorkspaceConfig::load(&config_path)
-            .map_err(|e| PrError::Resolve(format!("workspace config: {e}")))?;
+        let config =
+            blocking::unblock(move || crate::workspace::WorkspaceConfig::load(&config_path))
+                .await
+                .map_err(|e| PrError::Resolve(format!("workspace config: {e}")))?;
         let dir = repos
             .ensure_clone_of(&worktree, &config, &self.context.scratch_root)
             .await?
@@ -442,6 +436,25 @@ impl PrStore {
                 PrError::Resolve("trust binds no clone for this repository".to_string())
             })?;
         Self::registered(repos, dir).await
+    }
+
+    async fn cwd_clone_key(&self) -> Option<String> {
+        let cwd = self.context.cwd.clone();
+        let workspace_config = self.context.workspace_config.clone();
+        blocking::unblock(move || {
+            crate::repo_search::worktree_root(&cwd)
+                .and_then(|worktree| {
+                    crate::repo_clone::CloneSource::of(
+                        &worktree,
+                        &workspace_config,
+                        &crate::config::MayConfig::default(),
+                    )
+                    .ok()
+                    .flatten()
+                })
+                .map(|source| source.key())
+        })
+        .await
     }
 
     /// Resolve the workspace for an existing PR `#number`, consulting
@@ -473,18 +486,7 @@ impl PrStore {
         }
         let candidate_key = if let Some(name) = repo {
             Some(name.to_string())
-        } else if let Some(key) = crate::repo_search::worktree_root(&self.context.cwd)
-            .and_then(|w| {
-                crate::repo_clone::CloneSource::of(
-                    &w,
-                    &self.context.workspace_config,
-                    &crate::config::MayConfig::default(),
-                )
-                .ok()
-                .flatten()
-            })
-            .map(|s| s.key())
-        {
+        } else if let Some(key) = self.cwd_clone_key().await {
             Some(key)
         } else if let Some(binding) = self.session_binding().await? {
             Some(binding.clone_key())
@@ -527,33 +529,42 @@ impl PrStore {
             {
                 return Ok(record.repo_key.clone());
             }
-            if let Some(project) = self.context.workspace_config.projects.iter().find(|p| {
-                p.github_repository()
-                    .is_some_and(|r| format!("{}/{}", r.owner(), r.repo()) == name)
-                    || p.path.as_ref().is_some_and(|w| {
-                        crate::issue::repository_identity(Path::new(w))
-                            .is_ok_and(|id| p.has_identity(&id) && name == w)
-                    })
-            }) {
-                if let Some(gh) = project.github_repository() {
-                    return Ok(format!(
-                        "https://github.com/{}/{}.git",
-                        gh.owner(),
-                        gh.repo()
-                    ));
+            let name_owned = name.to_string();
+            let workspace_config = self.context.workspace_config.clone();
+            let resolved_by_fs = blocking::unblock(move || {
+                if let Some(project) = workspace_config.projects.iter().find(|p| {
+                    p.github_repository()
+                        .is_some_and(|r| format!("{}/{}", r.owner(), r.repo()) == name_owned)
+                        || p.path.as_ref().is_some_and(|w| {
+                            crate::issue::repository_identity(Path::new(w))
+                                .is_ok_and(|id| p.has_identity(&id) && name_owned == *w)
+                        })
+                }) {
+                    if let Some(gh) = project.github_repository() {
+                        return Some(format!(
+                            "https://github.com/{}/{}.git",
+                            gh.owner(),
+                            gh.repo()
+                        ));
+                    }
+                    if let Some(path) = &project.path
+                        && let Ok(identity) = crate::issue::repository_identity(Path::new(path))
+                    {
+                        return Some(identity.display().to_string());
+                    }
                 }
-                if let Some(path) = &project.path
-                    && let Ok(identity) = crate::issue::repository_identity(Path::new(path))
-                {
-                    return Ok(identity.display().to_string());
+                if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
+                    Path::new(&name_owned),
+                    &workspace_config,
+                    &crate::config::MayConfig::default(),
+                ) {
+                    return Some(source.key());
                 }
-            }
-            if let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
-                Path::new(name),
-                &self.context.workspace_config,
-                &crate::config::MayConfig::default(),
-            ) {
-                return Ok(source.key());
+                None
+            })
+            .await;
+            if let Some(key) = resolved_by_fs {
+                return Ok(key);
             }
             if let Ok(resolved) = self.resolve(Some(name)).await {
                 return Ok(resolved.record.repo_key);
@@ -573,14 +584,8 @@ impl PrStore {
             }
             return Err(PrError::Resolve(format!("no session clone named {name}")));
         }
-        if let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd)
-            && let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
-                &worktree,
-                &self.context.workspace_config,
-                &crate::config::MayConfig::default(),
-            )
-        {
-            return Ok(source.key());
+        if let Some(key) = self.cwd_clone_key().await {
+            return Ok(key);
         }
         if let Some(binding) = self.session_binding().await? {
             return Ok(binding.clone_key());
@@ -1077,14 +1082,8 @@ impl PrStore {
     pub async fn list(&self, repo: Option<&str>, filter: PrFilter) -> Result<String, PrError> {
         let key = if let Some(name) = repo {
             Some(self.resolve_repo_key(Some(name)).await?)
-        } else if let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd)
-            && let Ok(Some(source)) = crate::repo_clone::CloneSource::of(
-                &worktree,
-                &self.context.workspace_config,
-                &crate::config::MayConfig::default(),
-            )
-        {
-            Some(source.key())
+        } else if let Some(key) = self.cwd_clone_key().await {
+            Some(key)
         } else if let Some(binding) = self.session_binding().await? {
             Some(binding.clone_key())
         } else {

@@ -137,6 +137,16 @@ fn level_of(project: &ProjectConfig) -> TrustLevel {
     }
 }
 
+/// Returns whether `config` contains any `[[projects]]` entry whose persisted
+/// trust level does not publish to a remote forge (`local` or `local-branch`).
+#[must_use]
+pub fn has_non_forge_project_in(config: &WorkspaceConfig) -> bool {
+    config
+        .projects
+        .iter()
+        .any(|project| !level_of(project).publishes_to_forge())
+}
+
 /// Returns whether `config_path` contains any `[[projects]]` entry whose
 /// persisted trust level does not publish to a remote forge (`local` or
 /// `local-branch`), avoiding git subprocess resolution when none exist.
@@ -145,10 +155,7 @@ fn level_of(project: &ProjectConfig) -> TrustLevel {
 /// Fails when `config_path` exists but cannot be read or parsed.
 pub fn has_non_forge_project(config_path: &Path) -> Result<bool, WorkspaceConfigError> {
     let config = WorkspaceConfig::load(config_path)?;
-    Ok(config
-        .projects
-        .iter()
-        .any(|project| !level_of(project).publishes_to_forge()))
+    Ok(has_non_forge_project_in(&config))
 }
 
 /// The authenticated user's access to a forge repository, asked while

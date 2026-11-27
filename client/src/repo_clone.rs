@@ -534,6 +534,17 @@ impl SessionRepos {
         }
     }
 
+    async fn clone_source_of(
+        &self,
+        checkout: &Path,
+        config: &crate::workspace::WorkspaceConfig,
+    ) -> Result<Option<CloneSource>, RepoCloneError> {
+        let checkout = checkout.to_path_buf();
+        let config = config.clone();
+        let may_config = std::sync::Arc::clone(&self.may_config);
+        blocking::unblock(move || CloneSource::of(&checkout, &config, may_config.as_ref())).await
+    }
+
     /// Derive a fresh independent workspace for `checkout` when `create_new` is
     /// true or existing workspaces already carry local changes/commits, live PRs,
     /// or are behind the refreshed daemon checkout; otherwise reuse an untouched
@@ -549,7 +560,7 @@ impl SessionRepos {
         staging: &Path,
         create_new: bool,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        let Some(source) = CloneSource::of(checkout, config, self.may_config.as_ref())? else {
+        let Some(source) = self.clone_source_of(checkout, config).await? else {
             return Ok(None);
         };
         if !create_new && let Some(reusable) = self.reusable_untouched_clone(&source).await? {
@@ -737,7 +748,7 @@ impl SessionRepos {
         checkout: &Path,
         config: &crate::workspace::WorkspaceConfig,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        match CloneSource::of(checkout, config, self.may_config.as_ref())? {
+        match self.clone_source_of(checkout, config).await? {
             Some(source) => self.clone_for(&source.key()).await,
             None => Ok(None),
         }
@@ -758,19 +769,17 @@ impl SessionRepos {
         config: &crate::workspace::WorkspaceConfig,
         staging: &Path,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        Ok(Some(
-            match CloneSource::of(checkout, config, self.may_config.as_ref())? {
-                None => return Ok(None),
-                Some(CloneSource::Remote { url, repo }) => {
-                    self.ensure_remote_clone(&url, &repo.cache_key(), staging)
-                        .await?
-                }
-                Some(CloneSource::Local { identity }) => {
-                    self.ensure_local_clone(checkout, &identity, staging)
-                        .await?
-                }
-            },
-        ))
+        Ok(Some(match self.clone_source_of(checkout, config).await? {
+            None => return Ok(None),
+            Some(CloneSource::Remote { url, repo }) => {
+                self.ensure_remote_clone(&url, &repo.cache_key(), staging)
+                    .await?
+            }
+            Some(CloneSource::Local { identity }) => {
+                self.ensure_local_clone(checkout, &identity, staging)
+                    .await?
+            }
+        }))
     }
 
     /// Ensure the session's clone of the repository `binding` names exists

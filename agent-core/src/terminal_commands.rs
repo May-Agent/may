@@ -201,6 +201,14 @@ pub struct SharedServices {
     fusion: Arc<arc_swap::ArcSwapOption<crate::fusion::FusionService>>,
     /// Optional daemon-hosted May Bot approval router for supervised sessions.
     bot_approvals: Arc<arc_swap::ArcSwapOption<crate::bot::BotApprovalRouter>>,
+    /// Cached host identity (`scutil`/`tailscale`) keyed by configured tailscale
+    /// binary so agent builds reuse it instead of spawning probes per session.
+    local_env: Arc<
+        arc_swap::ArcSwapOption<(
+            Option<String>,
+            crate::harness::publish_review::LocalEnvironment,
+        )>,
+    >,
 }
 
 impl SharedServices {
@@ -219,6 +227,7 @@ impl SharedServices {
             swarm: Arc::new(arc_swap::ArcSwapOption::empty()),
             fusion: Arc::new(arc_swap::ArcSwapOption::empty()),
             bot_approvals: Arc::new(arc_swap::ArcSwapOption::empty()),
+            local_env: Arc::new(arc_swap::ArcSwapOption::empty()),
         }
     }
 
@@ -264,6 +273,26 @@ impl SharedServices {
     #[must_use]
     pub fn bot_approvals(&self) -> Option<crate::bot::BotApprovalRouter> {
         self.bot_approvals.load_full().map(|arc| (*arc).clone())
+    }
+
+    /// Returns the host's [`LocalEnvironment`](crate::harness::publish_review::LocalEnvironment),
+    /// detecting it once per configured `tailscale_binary`.
+    pub async fn local_environment(
+        &self,
+        tailscale_binary: Option<&str>,
+    ) -> crate::harness::publish_review::LocalEnvironment {
+        if let Some(cached) = self.local_env.load_full()
+            && cached.0.as_deref() == tailscale_binary
+        {
+            return cached.1.clone();
+        }
+        let detected =
+            crate::harness::publish_review::LocalEnvironment::detect(tailscale_binary).await;
+        self.local_env.store(Some(Arc::new((
+            tailscale_binary.map(str::to_owned),
+            detected.clone(),
+        ))));
+        detected
     }
 }
 
@@ -366,8 +395,10 @@ where
         .live_config
         .as_ref()
         .map(|cfg| cfg.load().remote_access.tailscale_binary.clone());
-    let local_env =
-        crate::harness::publish_review::LocalEnvironment::detect(tailscale_bin.as_deref()).await;
+    let local_env = config
+        .services
+        .local_environment(tailscale_bin.as_deref())
+        .await;
     let may_config = config.live_config.as_ref().map_or_else(
         || Arc::new(crate::config::MayConfig::default()),
         |live| live.load_full(),

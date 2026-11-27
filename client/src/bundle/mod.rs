@@ -83,8 +83,21 @@ impl Bundle {
         Ok(())
     }
 
-    /// Recursively extract an embedded directory, always overwriting existing files.
+    /// Recursively extract an embedded directory in a single blocking pass,
+    /// overwriting any file whose on-disk contents differ from the bundle.
     async fn extract_dir_overwrite(
+        src: &'static Dir<'static>,
+        dest: &Path,
+    ) -> Result<(), BundleError> {
+        let dest = dest.to_path_buf();
+        blocking::unblock(move || Self::extract_dir_overwrite_sync(src, &dest)).await
+    }
+
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous bundle extraction runs inside blocking::unblock"
+    )]
+    fn extract_dir_overwrite_sync(
         src: &'static Dir<'static>,
         dest: &Path,
     ) -> Result<(), BundleError> {
@@ -92,10 +105,18 @@ impl Bundle {
         while let Some(dir) = pending.pop() {
             for file in dir.files() {
                 let file_path = dest.join(file.path());
-                if let Some(parent) = file_path.parent() {
-                    async_fs::create_dir_all(parent).await?;
+                let expected = file.contents();
+                if let Ok(meta) = std::fs::symlink_metadata(&file_path)
+                    && meta.file_type().is_file()
+                    && meta.len() == expected.len() as u64
+                    && std::fs::read(&file_path).ok().as_deref() == Some(expected)
+                {
+                    continue;
                 }
-                async_fs::write(&file_path, file.contents()).await?;
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&file_path, expected)?;
             }
             pending.extend(dir.dirs());
         }
