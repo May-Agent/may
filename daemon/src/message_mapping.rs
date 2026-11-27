@@ -48,7 +48,8 @@ pub fn map_db_messages(
             | MessageRole::AskUserRequest
             | MessageRole::AskUserResponse
             | MessageRole::HiddenContext
-            | MessageRole::Recap => {}
+            | MessageRole::Recap
+            | MessageRole::TurnEnd => {}
             MessageRole::User => {
                 flush_trailing_tools_in_turn(
                     &mut out,

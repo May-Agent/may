@@ -95,6 +95,11 @@ pub enum TranscriptEntry {
         timestamp: Option<String>,
         content: String,
     },
+    TurnEnd {
+        id: String,
+        timestamp: Option<String>,
+        content: String,
+    },
     System {
         id: String,
         timestamp: Option<String>,
@@ -112,6 +117,7 @@ impl TranscriptEntry {
             | Self::InteractionResponse { id, .. }
             | Self::HiddenContext { id, .. }
             | Self::Recap { id, .. }
+            | Self::TurnEnd { id, .. }
             | Self::System { id, .. } => id,
         }
     }
@@ -205,6 +211,11 @@ pub fn build_entries(rows: &[ChatMessage]) -> Vec<TranscriptEntry> {
                 text: row.content.clone(),
             }),
             MessageRole::Recap => entries.push(TranscriptEntry::Recap {
+                id,
+                timestamp: ts,
+                content: row.content.clone(),
+            }),
+            MessageRole::TurnEnd => entries.push(TranscriptEntry::TurnEnd {
                 id,
                 timestamp: ts,
                 content: row.content.clone(),

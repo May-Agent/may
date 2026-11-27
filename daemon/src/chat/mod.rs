@@ -59,7 +59,7 @@ use crate::session::{
     AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, FinishError,
     MayHomePaths, MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment,
     RunOutcome, SessionId, SessionPaths, SessionRunGuard, SessionRuntimeState, SessionStore,
-    TerminalRuntimeState,
+    TerminalRuntimeState, TurnEndKind, TurnEndRecord,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::ui_event_bus::UiEventTopics;
@@ -767,6 +767,18 @@ const fn cancellation_reason_of<E>(cancel: &Result<CancelReason, E>) -> &'static
 
 fn cancels_agent_work(reason: &str) -> bool {
     reason == USER_CANCELLED || reason == CLIENT_DISCONNECTED
+}
+
+/// The end record a cancelled turn is flushed with: a stop the user or
+/// their client caused is an interruption; anything else — the daemon
+/// draining its turns for a restart, its cancellation channel dying — is
+/// the daemon ending the turn.
+fn end_kind_of_cancellation(reason: &str) -> TurnEndKind {
+    if cancels_agent_work(reason) {
+        TurnEndKind::Interrupted
+    } else {
+        TurnEndKind::DaemonExit
+    }
 }
 
 /// Race the wait for the network to return against run cancellation:
@@ -2549,6 +2561,17 @@ async fn finish_cancelled_preparation(
         withdraw_unanswered_turn(state, req, sink, turn_boundary, turn_consumed_alerts).await?;
         return Err(AgentLoopError::Cancelled(reason));
     }
+    // The turn ends having produced nothing. When it carries the user's
+    // message — a resume turn has no rows of its own — its end is still
+    // recorded, so a rebuilt history does not read it as still running.
+    if !kind.is_resume() {
+        let record = TurnEndRecord::new(end_kind_of_cancellation(reason));
+        let message = ChatMessage::turn_end(&record, jiff::Timestamp::now());
+        let _ = state
+            .db()
+            .append_chat_messages_as_run(guard.fence(), &[message])
+            .await;
+    }
     if let Some(entry_id) = req.pending_entry_id {
         let _ = state
             .db()
@@ -2956,6 +2979,10 @@ fn run_agent_loop_attempts<'a>(
                     );
                 }
 
+                turn_persister.push_turn_end(
+                    &TurnEndRecord::new(TurnEndKind::Paused),
+                    jiff::Timestamp::now(),
+                );
                 // Flush the entire turn atomically
                 let _ = flush_turn_persister_resilient(
                     state,
@@ -3129,6 +3156,20 @@ fn run_agent_loop_attempts<'a>(
                                 .await;
                         }
                     }
+                    // The failed attempt's partial output is discarded;
+                    // the turn's rows end with why it ended.
+                    turn_persister.drop_pending();
+                    turn_persister.push_turn_end(
+                        &TurnEndRecord::failed(err_msg.clone()),
+                        jiff::Timestamp::now(),
+                    );
+                    let _ = flush_turn_persister_resilient(
+                        state,
+                        session_id.as_str(),
+                        &mut turn_persister,
+                        Some(&mut agent),
+                    )
+                    .await;
                     return Err(err.into());
                 }
             }
@@ -3173,6 +3214,10 @@ fn run_agent_loop_attempts<'a>(
                     turn_persister
                         .push_assistant(segment_text.clone(), segment_emitted_at(segment_at));
                 }
+                turn_persister.push_turn_end(
+                    &TurnEndRecord::new(end_kind_of_cancellation(reason)),
+                    jiff::Timestamp::now(),
+                );
                 // Flush the entire turn atomically before returning
                 let _ = flush_turn_persister_resilient(
                     state,
@@ -3197,6 +3242,15 @@ fn run_agent_loop_attempts<'a>(
                 let err = "Model returned an empty assistant response";
                 record_request_log(state, ledger.interrupted(Instant::now(), err)).await;
                 let _ = sink.on_error(ApiErrorCode::InternalError, err, false).await;
+                turn_persister.drop_pending();
+                turn_persister.push_turn_end(&TurnEndRecord::failed(err), jiff::Timestamp::now());
+                let _ = flush_turn_persister_resilient(
+                    state,
+                    session_id.as_str(),
+                    &mut turn_persister,
+                    Some(&mut agent),
+                )
+                .await;
                 return Err(AgentLoopError::EmptyAssistantResponse);
             }
             if !has_assistant_text && has_tool_activity {
@@ -3206,6 +3260,10 @@ fn run_agent_loop_attempts<'a>(
                 );
             }
 
+            turn_persister.push_turn_end(
+                &TurnEndRecord::new(TurnEndKind::Completed),
+                jiff::Timestamp::now(),
+            );
             // Flush the entire turn atomically
             let deferred_turn = flush_turn_persister_resilient(
                 state,
@@ -8312,6 +8370,107 @@ mod tests {
             .filter(|m| matches!(m.role, super::MessageRole::User))
             .map(|m| m.content.clone())
             .collect()
+    }
+
+    /// The rows a turn ended with finish with why it ended, so a rebuilt
+    /// history can tell it apart from one still running.
+    #[tokio::test]
+    async fn a_completed_turn_stores_its_end_record() {
+        use may_protocol::session_messages::{TurnEndKind, TurnEndRecord};
+        let provider = stub_provider(vec![sse_text("hi there")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let result = run_prompt_turn(&state, &mut sink).await;
+        assert!(result.is_ok(), "the turn completes: {result:?}");
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        let last = history.messages().last().expect("the turn wrote rows");
+        assert_eq!(last.role, super::MessageRole::TurnEnd);
+        let record: TurnEndRecord = serde_json::from_str(&last.content).expect("end record");
+        assert_eq!(record.kind, TurnEndKind::Completed);
+    }
+
+    /// A turn the user stopped mid-stream ends with the interrupted record.
+    #[tokio::test]
+    async fn a_stopped_turn_stores_the_interrupted_end_record() {
+        use may_protocol::session_messages::{TurnEndKind, TurnEndRecord};
+        let partial = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "half an ans"}}]
+            })
+            .to_string(),
+        );
+        let (state, _sink, result, _dir) = stop_stalled_turn(partial).await;
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        let last = history.messages().last().expect("the turn wrote rows");
+        assert_eq!(last.role, super::MessageRole::TurnEnd);
+        let record: TurnEndRecord = serde_json::from_str(&last.content).expect("end record");
+        assert_eq!(record.kind, TurnEndKind::Interrupted);
+    }
+
+    /// A turn cut off with its daemon ends with the daemon-exit record the
+    /// next start writes — unless it already settled one.
+    #[tokio::test]
+    async fn a_daemon_restart_ends_a_stale_turns_rows() {
+        use may_protocol::session_messages::{TurnEndKind, TurnEndRecord};
+        let provider = stub_provider(vec![sse_text("hi there")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let result = run_prompt_turn(&state, &mut sink).await;
+        assert!(result.is_ok(), "the turn completes: {result:?}");
+        let db = state.db().clone();
+        // A completed turn settled its end row already: recovery adds none.
+        db.recover_session_runtimes_after_restart(crate::db::PreviousDaemon::Stopped)
+            .await
+            .expect("recovery");
+        let history = crate::session::load_history_from_db(&db, "session")
+            .await
+            .expect("history");
+        let ends = history
+            .messages()
+            .iter()
+            .filter(|m| m.role == super::MessageRole::TurnEnd)
+            .count();
+        assert_eq!(ends, 1, "no second end row behind a settled turn");
+
+        // A turn in flight when the daemon dies leaves no end row; recovery
+        // writes the daemon-exit one. Its staleness is what a dead process
+        // leaves: a run still owned in storage.
+        db.append_message(
+            "session",
+            super::MessageRole::Assistant,
+            "cut off mid-turn",
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("a row of the dead turn");
+        // What a dead process leaves in storage: a run still owned, its
+        // guard gone with it.
+        std::mem::forget(
+            state
+                .runtime_service
+                .runs()
+                .acquire("session")
+                .await
+                .expect("acquire run"),
+        );
+        db.recover_session_runtimes_after_restart(crate::db::PreviousDaemon::Stopped)
+            .await
+            .expect("recovery");
+        let history = crate::session::load_history_from_db(&db, "session")
+            .await
+            .expect("history");
+        let last = history.messages().last().expect("rows");
+        assert_eq!(last.role, super::MessageRole::TurnEnd);
+        let record: TurnEndRecord = serde_json::from_str(&last.content).expect("end record");
+        assert_eq!(record.kind, TurnEndKind::DaemonExit);
     }
 
     /// A stop before any tool call or response text withdraws the turn:
