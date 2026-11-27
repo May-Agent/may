@@ -1,0 +1,1 @@
+Your command ran {% for item in items %}{% if !loop.first %}, {% endif %}`{{ item.name }}` (prefer {{ item.replacement }}){% endfor %}. The command was allowed to run; prefer the managed tool next time.

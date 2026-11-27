@@ -66,6 +66,7 @@ mod tests {
             place: JobPlace::Host,
             timeout,
             pty: false,
+            file_monitor: false,
         }
     }
 

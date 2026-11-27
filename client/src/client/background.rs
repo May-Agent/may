@@ -288,6 +288,10 @@ pub struct WireJob {
     /// Whether this job runs in a PTY (driven through `tui`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pty: bool,
+    /// Whether this job is an internal file-following monitor watcher
+    /// (`MonitorSource::File`) rather than a command run by the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_monitor: bool,
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -317,6 +321,7 @@ impl From<&JobInfo> for WireJob {
                 .timeout
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
             pty: job.pty,
+            file_monitor: job.file_monitor,
         }
     }
 }
@@ -335,6 +340,7 @@ impl From<WireJob> for JobInfo {
             place: job.place.into(),
             timeout: job.timeout_ms.map(Duration::from_millis),
             pty: job.pty,
+            file_monitor: job.file_monitor,
         }
     }
 }
@@ -740,6 +746,29 @@ impl SessionBackgroundSnapshot {
                 .any(|job| job.status == WireJobStatus::Running)
     }
 
+    /// Whether the session has active non-monitor background work that should
+    /// keep a non-interactive oneshot run waiting: a wake in flight, a running
+    /// subagent, or a running job that is not an internal file monitor.
+    #[must_use]
+    pub fn will_resume_non_monitor(&self) -> bool {
+        self.resuming
+            || !self.subagents.is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|job| job.status == WireJobStatus::Running && !job.file_monitor)
+    }
+
+    /// PIDs of running internal file-following monitor jobs (`MonitorSource::File`).
+    #[must_use]
+    pub fn running_file_monitor_pids(&self) -> Vec<u32> {
+        self.jobs
+            .iter()
+            .filter(|job| job.status == WireJobStatus::Running && job.file_monitor)
+            .map(|job| job.pid)
+            .collect()
+    }
+
     /// The jobs and runs as the registries' own types.
     #[must_use]
     pub fn into_parts(self) -> (Vec<JobInfo>, Vec<SubagentRunSnapshot>) {
@@ -771,9 +800,11 @@ mod tests {
             place: WirePlace::Host,
             timeout_ms: None,
             pty: false,
+            file_monitor: false,
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
+        assert!(!snapshot.will_resume_non_monitor());
         snapshot.jobs.push(job(WireJobStatus::Completed {
             exit_code: 0,
             delivery: WireDelivery::Taken,
@@ -781,9 +812,22 @@ mod tests {
         assert!(!snapshot.will_resume(), "a finished job resumes nothing");
         snapshot.jobs.push(job(WireJobStatus::Running));
         assert!(snapshot.will_resume());
+        assert!(snapshot.will_resume_non_monitor());
+        snapshot.jobs.clear();
+        let mut file_mon = job(WireJobStatus::Running);
+        file_mon.pid = 42;
+        file_mon.file_monitor = true;
+        snapshot.jobs.push(file_mon);
+        assert!(snapshot.will_resume());
+        assert!(
+            !snapshot.will_resume_non_monitor(),
+            "lingering file monitors alone do not keep oneshot waiting"
+        );
+        assert_eq!(snapshot.running_file_monitor_pids(), vec![42]);
         snapshot.jobs.clear();
         snapshot.resuming = true;
         assert!(snapshot.will_resume());
+        assert!(snapshot.will_resume_non_monitor());
     }
 
     #[test]
@@ -805,6 +849,7 @@ mod tests {
             place: JobPlace::Host,
             timeout: Some(Duration::from_secs(60)),
             pty: false,
+            file_monitor: false,
         };
         let wire: WireJob =
             serde_json::from_str(&serde_json::to_string(&WireJob::from(&job)).expect("serializes"))
@@ -813,8 +858,48 @@ mod tests {
         assert_eq!(back.pid, 7);
         assert_eq!(back.status, job.status);
         assert_eq!(back.timeout, job.timeout);
+        assert!(!back.file_monitor);
         let age = back.started_at.elapsed().as_secs();
         assert!((5..7).contains(&age), "age {age}");
+    }
+
+    #[test]
+    fn file_monitor_jobs_do_not_count_as_non_monitor_resumes() {
+        let mut monitor_job = JobInfo {
+            pid: 9,
+            execution_key: "m".to_string(),
+            script: "tail -Fn0 /tmp/build.log".to_string(),
+            interpreter: Interpreter::Shell,
+            mode: SandboxMode::Sandboxed,
+            started_at: Instant::now(),
+            status: JobStatus::Running,
+            output_path: None,
+            place: JobPlace::Host,
+            timeout: Some(Duration::from_secs(60)),
+            pty: false,
+            file_monitor: true,
+        };
+        let snapshot = SessionBackgroundSnapshot {
+            session_id: "s".to_string(),
+            jobs: vec![WireJob::from(&monitor_job)],
+            subagents: Vec::new(),
+            pipelines: Vec::new(),
+            resuming: false,
+        };
+        assert!(snapshot.will_resume());
+        assert!(!snapshot.will_resume_non_monitor());
+        assert_eq!(snapshot.running_file_monitor_pids(), vec![9]);
+
+        monitor_job.file_monitor = false;
+        let workload = SessionBackgroundSnapshot {
+            session_id: "s".to_string(),
+            jobs: vec![WireJob::from(&monitor_job)],
+            subagents: Vec::new(),
+            pipelines: Vec::new(),
+            resuming: false,
+        };
+        assert!(workload.will_resume_non_monitor());
+        assert_eq!(workload.running_file_monitor_pids(), [] as [u32; 0]);
     }
 
     #[test]

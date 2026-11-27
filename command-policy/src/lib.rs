@@ -4,9 +4,11 @@
 //! Every script of a shell built with a [`PolicySet`] is put to them before it
 //! runs: one that kills processes by name or pattern, or is not valid shell
 //! and so cannot be checked for that; a foreground `sleep`; a script that
-//! only repeats a read of files unchanged since; an `apply_patch` hunk that
-//! only changes whitespace where it carries no meaning; and, in the managed
-//! bash, the host `grep`, `awk` and `find`. Each refusal names what to do instead. None of them approves a script that
+//! only repeats a read of files unchanged since; and an `apply_patch` hunk that
+//! only changes whitespace where it carries no meaning. In the managed bash,
+//! scripts that invoke host `grep`, `awk` or `find` still run and record a
+//! [`HostCommandUsage`] notice so the agent receives a one-shot system alert
+//! naming the preferred tool. None of them approves a script that
 //! leaves the sandbox: each [passes](ScriptDecision::Pass) one it has no
 //! objection to.
 
@@ -283,6 +285,64 @@ mod write_lease;
 
 pub use write_lease::{WorkspaceWriteLease, WorkspaceWriteLeaseGuard, WorkspaceWriteLeasePolicy};
 
+/// A host command (`grep`, `awk`, or `find`) observed in a managed-bash script,
+/// together with the preferred replacement tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostCommandUsage {
+    /// The host command invoked by the script's own shell.
+    pub name: &'static str,
+    /// The preferred replacement tool(s) to remind the model about.
+    pub replacement: &'static str,
+}
+
+/// Pending host-command notices observed by [`ManagedShellCommands`], drained
+/// by the agent's alert source on the next model request. Every clone shares
+/// the queue.
+#[derive(Debug, Clone, Default)]
+pub struct HostCommandNotices(Arc<Mutex<Vec<HostCommandUsage>>>);
+
+impl HostCommandNotices {
+    /// Records `usage` if it is not already queued for the next alert.
+    ///
+    /// # Panics
+    /// Panics when the queue's lock is poisoned.
+    pub fn record(&self, usage: HostCommandUsage) {
+        let mut queue = self
+            .0
+            .lock()
+            .expect("the host command notice queue is never held across a panic");
+        if !queue.contains(&usage) {
+            queue.push(usage);
+        }
+    }
+
+    /// Drains all queued notices for a one-shot alert delivery.
+    ///
+    /// # Panics
+    /// Panics when the queue's lock is poisoned.
+    #[must_use]
+    pub fn take_all(&self) -> Vec<HostCommandUsage> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .expect("the host command notice queue is never held across a panic"),
+        )
+    }
+
+    /// Peeks at all queued notices without consuming them.
+    ///
+    /// # Panics
+    /// Panics when the queue's lock is poisoned.
+    #[must_use]
+    pub fn peek_all(&self) -> Vec<HostCommandUsage> {
+        self.0
+            .lock()
+            .expect("the host command notice queue is never held across a panic")
+            .clone()
+    }
+}
+
 /// What May's policies for the shell of one agent are chosen by.
 #[derive(Debug, Default)]
 pub struct PolicySet {
@@ -290,6 +350,9 @@ pub struct PolicySet {
     pub managed_bash: bool,
     /// The record the agent's turn boundary reads.
     pub refused: RefusedReads,
+    /// Pending `grep`/`awk`/`find` usage notices delivered as one-shot system
+    /// alerts on the next request instead of refusing the script.
+    pub host_command_notices: HostCommandNotices,
     /// Per-agent epochs invalidating unchanged-read records when a context
     /// compacts, clears, or restores a checkpoint.
     pub read_epochs: FileReadEpochs,
@@ -359,7 +422,7 @@ impl PolicySet {
             builder
         };
         if self.managed_bash {
-            builder.policy(ManagedShellCommands)
+            builder.policy(ManagedShellCommands::new(self.host_command_notices))
         } else {
             builder
         }
@@ -1138,29 +1201,41 @@ impl ScriptPolicy for WhitespacePatch {
     }
 }
 
-#[derive(Template)]
-#[template(path = "refused_host_command.txt")]
-struct HostCommandRefused<'a> {
-    name: &'a str,
-    replacement: &'a str,
-}
-
-/// Host programs a script's own shell does not run, each with what to use
-/// instead.
-const HOST_COMMANDS: [(&str, &str); 3] = [
-    ("grep", "`rg`"),
-    ("awk", "`python3` or `jq`"),
-    ("find", "`fd`"),
+/// Host programs a script's own shell should replace with managed alternatives.
+const HOST_COMMANDS: [HostCommandUsage; 3] = [
+    HostCommandUsage {
+        name: "grep",
+        replacement: "`rg`",
+    },
+    HostCommandUsage {
+        name: "awk",
+        replacement: "`python3` or `jq`",
+    },
+    HostCommandUsage {
+        name: "find",
+        replacement: "`fd`",
+    },
 ];
 
-/// Refuses a script whose own shell runs `grep`, `awk` or `find`.
+/// Observes a script whose own shell runs `grep`, `awk` or `find`, allowing the
+/// script to run while queueing a one-shot reminder notice for the agent.
 ///
 /// The rule binds the script's own shell, the way shell functions would: a
 /// command it runs by name, through `time` or `eval` included. A program
 /// named by path, run through a wrapper such as `env`, `xargs` or
-/// `command`, or by another shell (`sh -c`, a script file) is the host's.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ManagedShellCommands;
+/// `command`, or by another shell (`sh -c`, a script file) is not flagged.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedShellCommands {
+    notices: HostCommandNotices,
+}
+
+impl ManagedShellCommands {
+    /// Policy instance that records observed host-command usages into `notices`.
+    #[must_use]
+    pub const fn new(notices: HostCommandNotices) -> Self {
+        Self { notices }
+    }
+}
 
 /// Whether `script`'s own shell runs `command` by its name.
 fn run_by_own_shell(script: &ShellScript, command: &ShellCommand) -> bool {
@@ -1178,19 +1253,19 @@ fn run_by_own_shell(script: &ShellScript, command: &ShellCommand) -> bool {
     }
 }
 
-/// The refusal of the first command `script`'s own shell runs that the
-/// managed bash does not provide.
-fn host_command(script: &ShellScript) -> Option<ScriptDecision> {
-    script.commands().iter().find_map(|command| {
-        let name = command.argv().first()?.as_str();
+/// Records every `grep`, `awk`, or `find` command `script`'s own shell invokes.
+fn record_host_commands(script: &ShellScript, notices: &HostCommandNotices) {
+    for command in script.commands() {
+        let Some(name) = command.argv().first().map(String::as_str) else {
+            continue;
+        };
         if !run_by_own_shell(script, command) {
-            return None;
+            continue;
         }
-        HOST_COMMANDS
-            .iter()
-            .find(|(blocked, _)| *blocked == name)
-            .map(|&(name, replacement)| refuse(&HostCommandRefused { name, replacement }))
-    })
+        if let Some(usage) = HOST_COMMANDS.iter().find(|entry| entry.name == name) {
+            notices.record(*usage);
+        }
+    }
 }
 
 impl ScriptPolicy for ManagedShellCommands {
@@ -1201,11 +1276,10 @@ impl ScriptPolicy for ManagedShellCommands {
         script: &ScriptCheck<'_>,
         (): &(),
     ) -> impl Future<Output = ScriptDecision> + Send {
-        std::future::ready(
-            parsed(script)
-                .and_then(host_command)
-                .unwrap_or(ScriptDecision::Pass),
-        )
+        if let Some(shell) = parsed(script) {
+            record_host_commands(shell, &self.notices);
+        }
+        std::future::ready(ScriptDecision::Pass)
     }
 }
 

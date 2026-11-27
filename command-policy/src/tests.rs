@@ -342,7 +342,7 @@ async fn repeating_the_same_read_is_refused() {
 }
 
 #[tokio::test]
-async fn the_scripts_own_shell_runs_no_host_grep_awk_or_find() {
+async fn the_scripts_own_shell_allows_host_grep_awk_or_find_and_records_notices() {
     for (script, name) in [
         ("grep x file", "grep"),
         ("cat file | awk '{ print $1 }'", "awk"),
@@ -351,12 +351,21 @@ async fn the_scripts_own_shell_runs_no_host_grep_awk_or_find() {
         ("eval 'grep x file'", "grep"),
         ("'grep' x file", "grep"),
     ] {
-        let decision = decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await;
-        let text = refusal(&decision).unwrap_or_else(|| panic!("`{script}` is refused"));
-        assert!(
-            text.contains(&format!("`{name}` is not available in scripts")),
-            "{text}"
+        let notices = HostCommandNotices::default();
+        let policy = ManagedShellCommands::new(notices.clone());
+        let decision = decide(&policy, &(), script, ScriptOrigin::Foreground).await;
+        assert_eq!(
+            decision,
+            ScriptDecision::Pass,
+            "`{script}` runs instead of hard-failing"
         );
+        let recorded = notices.take_all();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "`{script}` records one host-command notice"
+        );
+        assert_eq!(recorded[0].name, name);
     }
     for script in [
         "rg x file",
@@ -367,10 +376,16 @@ async fn the_scripts_own_shell_runs_no_host_grep_awk_or_find() {
         "sh -c 'grep x file'",
         "echo grep",
     ] {
+        let notices = HostCommandNotices::default();
+        let policy = ManagedShellCommands::new(notices.clone());
         assert_eq!(
-            decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await,
+            decide(&policy, &(), script, ScriptOrigin::Foreground).await,
             ScriptDecision::Pass,
-            "`{script}` runs the host's program"
+            "`{script}` runs without a notice"
+        );
+        assert!(
+            notices.take_all().is_empty(),
+            "`{script}` should not record a host-command notice"
         );
     }
 }
@@ -383,8 +398,11 @@ async fn the_session_find_subcommand_runs_in_the_managed_bash() {
         "session \"find deploy\" --count | rg alpha",
         "echo $(session \"find canary\" --session-id alpha)",
     ] {
-        let decision = decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await;
+        let notices = HostCommandNotices::default();
+        let policy = ManagedShellCommands::new(notices.clone());
+        let decision = decide(&policy, &(), script, ScriptOrigin::Foreground).await;
         assert_eq!(decision, ScriptDecision::Pass, "`{script}` runs");
+        assert_eq!(notices.take_all(), [] as [HostCommandUsage; 0]);
     }
 }
 
@@ -399,11 +417,14 @@ async fn sed_in_every_form_is_left_to_the_managed_sed() {
         "rg -n x | sed '/x/d'",
         "sed -i 's/a/b/' file",
     ] {
+        let notices = HostCommandNotices::default();
+        let policy = ManagedShellCommands::new(notices.clone());
         assert_eq!(
-            decide(&ManagedShellCommands, &(), script, ScriptOrigin::Foreground).await,
+            decide(&policy, &(), script, ScriptOrigin::Foreground).await,
             ScriptDecision::Pass,
             "`{script}` reaches the managed sed, which refuses what writes"
         );
+        assert_eq!(notices.take_all(), [] as [HostCommandUsage; 0]);
     }
 }
 

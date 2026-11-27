@@ -54,15 +54,18 @@ impl HostSession {
     pub async fn prepare(
         working_dir: &Path,
         tools: &PreparedTools<PathBuf>,
+        workspace_roots: &[PathBuf],
     ) -> Result<Self, SessionEnvironmentError> {
         write_git_shim(tools).await?;
         python_shim::install(&tools.shim_dir()).await?;
         let env_values = environment(working_dir, tools).await?;
         let working_dir = working_dir.to_path_buf();
         let tools = tools.clone();
+        let workspace_roots = workspace_roots.to_vec();
         blocking::unblock(move || {
             let mut grants = tool_grants(&tools)?;
             grants.extend(path_directory_grants(&env_values)?);
+            grants.extend(runtime_toolchain_grants(&working_dir, &workspace_roots)?);
             let write_denylist = write_denylist(&working_dir, &tools);
             Ok(Self {
                 grants,
@@ -202,9 +205,166 @@ fn tool_grants(tools: &PreparedTools<PathBuf>) -> heel::Result<Vec<Grant>> {
         .collect()
 }
 
+/// Toolchain executables on `PATH` whose canonical symlink target may live in
+/// a separate version-manager or alternatives tree (such as `uv`, `pyenv`,
+/// `mise`, Homebrew, or `/etc/alternatives`).
+const PATH_TOOLCHAIN_BINS: &[&str] = &[
+    "python", "python3", "pytest", "cc", "c++", "gcc", "g++", "clang", "ld", "node", "bun",
+    "cargo", "rustc", "uv",
+];
+
+/// The runtime prefix root containing an executable: `<prefix>` when the binary
+/// sits inside `<prefix>/bin`, else its immediate parent directory.
+fn runtime_root_for_executable(canonical_exe: &Path) -> Option<PathBuf> {
+    let parent = canonical_exe.parent()?;
+    if parent.file_name().is_some_and(|name| name == "bin")
+        && let Some(grandparent) = parent.parent()
+        && grandparent != Path::new("/")
+        && grandparent != Path::new("/usr")
+        && grandparent != Path::new("/usr/local")
+    {
+        return Some(grandparent.to_path_buf());
+    }
+    Some(parent.to_path_buf())
+}
+
+/// Parses `home = <path>` from a Python virtual environment's `pyvenv.cfg`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous pyvenv.cfg inspection runs inside blocking::unblock in HostSession::prepare"
+)]
+fn pyvenv_home_dir(venv_dir: &Path) -> Option<PathBuf> {
+    let cfg = std::fs::read_to_string(venv_dir.join("pyvenv.cfg")).ok()?;
+    for line in cfg.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("home") {
+            let dir = PathBuf::from(value.trim());
+            if dir.is_absolute() && dir.is_dir() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Inserts a read/execute grant for `dir` when it exists and has not already
+/// been added to `seen`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous canonicalization runs inside blocking::unblock in HostSession::prepare"
+)]
+fn push_read_exec_grant(
+    dir: &Path,
+    seen: &mut HashSet<PathBuf>,
+    grants: &mut Vec<Grant>,
+) -> heel::Result<()> {
+    if !dir.is_absolute() || !dir.is_dir() {
+        return Ok(());
+    }
+    let resolved = resolved(dir)?;
+    if seen.insert(resolved.as_path().to_path_buf()) {
+        grants.push(Grant::new(resolved, Access::READ | Access::EXEC));
+    }
+    Ok(())
+}
+
+/// Collects read/execute grants for a Python virtual environment: the venv
+/// itself, any canonical symlink targets of its `bin/python*` interpreters,
+/// and the runtime root named by `pyvenv.cfg`'s `home` entry.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous venv inspection runs inside blocking::unblock in HostSession::prepare"
+)]
+fn collect_venv_grants(
+    venv_dir: &Path,
+    seen: &mut HashSet<PathBuf>,
+    grants: &mut Vec<Grant>,
+) -> heel::Result<()> {
+    if !venv_dir.is_dir() {
+        return Ok(());
+    }
+    push_read_exec_grant(venv_dir, seen, grants)?;
+    for bin_name in ["python", "python3"] {
+        let candidate = venv_dir.join("bin").join(bin_name);
+        if let Ok(canonical) = std::fs::canonicalize(&candidate)
+            && let Some(root) = runtime_root_for_executable(&canonical)
+        {
+            push_read_exec_grant(&root, seen, grants)?;
+        }
+    }
+    if let Some(home_dir) = pyvenv_home_dir(venv_dir) {
+        let canonical = std::fs::canonicalize(&home_dir).unwrap_or(home_dir);
+        let root = if canonical.file_name().is_some_and(|name| name == "bin")
+            && let Some(parent) = canonical.parent()
+            && parent != Path::new("/")
+            && parent != Path::new("/usr")
+            && parent != Path::new("/usr/local")
+        {
+            parent.to_path_buf()
+        } else {
+            canonical
+        };
+        push_read_exec_grant(&root, seen, grants)?;
+    }
+    Ok(())
+}
+
+/// Read/execute grants for host read-only runtime directories (`~/.local/share/uv`,
+/// `~/.pyenv`, `$VIRTUAL_ENV`) and canonical targets of existing workspace
+/// virtual environments (`.venv` / `venv`). Never grants write access; heel's
+/// credential denylist still applies on top.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous runtime discovery runs inside blocking::unblock in HostSession::prepare"
+)]
+fn runtime_toolchain_grants(
+    working_dir: &Path,
+    workspace_roots: &[PathBuf],
+) -> heel::Result<Vec<Grant>> {
+    let mut seen = HashSet::new();
+    let mut grants = Vec::new();
+    let home = std::env::home_dir();
+
+    if let Some(data_local) = dirs::data_local_dir() {
+        push_read_exec_grant(&data_local.join("uv"), &mut seen, &mut grants)?;
+    }
+    if let Some(home) = &home {
+        push_read_exec_grant(
+            &home.join(".local").join("share").join("uv"),
+            &mut seen,
+            &mut grants,
+        )?;
+        push_read_exec_grant(&home.join(".pyenv"), &mut seen, &mut grants)?;
+    }
+    if let Some(uv_pythons) = std::env::var_os("UV_PYTHON_INSTALL_DIR").map(PathBuf::from) {
+        push_read_exec_grant(&uv_pythons, &mut seen, &mut grants)?;
+    }
+    if let Some(pyenv_root) = std::env::var_os("PYENV_ROOT").map(PathBuf::from) {
+        push_read_exec_grant(&pyenv_root, &mut seen, &mut grants)?;
+    }
+    if let Some(virtual_env) = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from) {
+        collect_venv_grants(&virtual_env, &mut seen, &mut grants)?;
+    }
+
+    for root in std::iter::once(working_dir).chain(workspace_roots.iter().map(PathBuf::as_path)) {
+        for venv_name in [".venv", "venv"] {
+            collect_venv_grants(&root.join(venv_name), &mut seen, &mut grants)?;
+        }
+    }
+
+    Ok(grants)
+}
+
 /// The grants that let a command run what the session's `PATH` lists: each
-/// existing absolute directory of the `PATH` in `environment`, read and
-/// execute, never write.
+/// existing absolute directory of the `PATH` in `environment`, plus canonical
+/// symlink targets of toolchain executables and parent `pyvenv.cfg` homes
+/// inside those directories — read and execute, never write.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "synchronous PATH symlink resolution runs inside blocking::unblock in HostSession::prepare"
+)]
 fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<Vec<Grant>> {
     let Some((_, path)) = environment.iter().find(|(name, _)| name == "PATH") else {
         return Ok(Vec::new());
@@ -215,9 +375,21 @@ fn path_directory_grants(environment: &[(String, String)]) -> heel::Result<Vec<G
         if !directory.is_absolute() || !directory.is_dir() {
             continue;
         }
-        let resolved = resolved(&directory)?;
-        if seen.insert(resolved.as_path().to_path_buf()) {
-            grants.push(Grant::new(resolved, Access::READ | Access::EXEC));
+        push_read_exec_grant(&directory, &mut seen, &mut grants)?;
+        if directory.file_name().is_some_and(|name| name == "bin")
+            && let Some(parent) = directory.parent()
+            && parent.join("pyvenv.cfg").is_file()
+        {
+            collect_venv_grants(parent, &mut seen, &mut grants)?;
+        }
+        for bin_name in PATH_TOOLCHAIN_BINS {
+            let candidate = directory.join(bin_name);
+            if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink())
+                && let Ok(canonical) = std::fs::canonicalize(&candidate)
+                && let Some(root) = runtime_root_for_executable(&canonical)
+            {
+                push_read_exec_grant(&root, &mut seen, &mut grants)?;
+            }
         }
     }
     Ok(grants)
@@ -540,6 +712,97 @@ mod tests {
             resolved.lines().next().unwrap_or_default(),
             pinned.to_str().unwrap(),
             "{trace}"
+        );
+    }
+
+    #[test]
+    fn venv_symlink_and_pyvenv_home_receive_read_exec_grants_only() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let venv = workspace.join(".venv");
+        let runtime_a = tmp.path().join("uv-python/cpython-3.10");
+        let runtime_b = tmp.path().join("pyenv-python/3.10");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        std::fs::create_dir_all(runtime_a.join("bin")).unwrap();
+        std::fs::create_dir_all(runtime_b.join("bin")).unwrap();
+        let exe = runtime_a.join("bin/python3.10");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        symlink(&exe, venv.join("bin/python3")).unwrap();
+        std::fs::write(
+            venv.join("pyvenv.cfg"),
+            format!(
+                "home = {}\ninclude-system-site-packages = false\n",
+                runtime_b.join("bin").display()
+            ),
+        )
+        .unwrap();
+
+        let grants = super::runtime_toolchain_grants(tmp.path(), std::slice::from_ref(&workspace))
+            .expect("grants collect");
+        let canon = |p: &std::path::Path| {
+            dunce::simplified(&std::fs::canonicalize(p).unwrap()).to_path_buf()
+        };
+        let has_read_exec_only = |target: &std::path::Path| {
+            let expected = canon(target);
+            grants.iter().any(|grant| {
+                grant.path() == expected.as_path()
+                    && grant.access() == (heel::Access::READ | heel::Access::EXEC)
+            })
+        };
+        assert!(
+            has_read_exec_only(&venv),
+            "venv dir should be granted READ|EXEC"
+        );
+        assert!(
+            has_read_exec_only(&runtime_a),
+            "symlink runtime root should be granted READ|EXEC"
+        );
+        assert!(
+            has_read_exec_only(&runtime_b),
+            "pyvenv.cfg home root should be granted READ|EXEC"
+        );
+    }
+
+    #[test]
+    fn path_directory_grants_follows_toolchain_symlinks_and_parent_pyvenv() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("custom-venv/bin");
+        let tool_root = tmp.path().join("alt-gcc");
+        let py_root = tmp.path().join("uv-py");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(tool_root.join("bin")).unwrap();
+        std::fs::create_dir_all(py_root.join("bin")).unwrap();
+        std::fs::write(tool_root.join("bin/gcc-14"), "#!/bin/sh\n").unwrap();
+        symlink(tool_root.join("bin/gcc-14"), bin_dir.join("cc")).unwrap();
+        std::fs::write(
+            tmp.path().join("custom-venv/pyvenv.cfg"),
+            format!("home = {}\n", py_root.join("bin").display()),
+        )
+        .unwrap();
+
+        let env = vec![("PATH".to_string(), bin_dir.display().to_string())];
+        let grants = super::path_directory_grants(&env).expect("path grants");
+        let canon = |p: &std::path::Path| {
+            dunce::simplified(&std::fs::canonicalize(p).unwrap()).to_path_buf()
+        };
+        let has_read_exec_only = |target: &std::path::Path| {
+            let expected = canon(target);
+            grants.iter().any(|grant| {
+                grant.path() == expected.as_path()
+                    && grant.access() == (heel::Access::READ | heel::Access::EXEC)
+            })
+        };
+        assert!(
+            has_read_exec_only(&tool_root),
+            "cc symlink target root granted READ|EXEC"
+        );
+        assert!(
+            has_read_exec_only(&py_root),
+            "parent pyvenv.cfg home root granted READ|EXEC"
         );
     }
 }

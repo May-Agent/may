@@ -460,6 +460,9 @@ const COMMANDS_CONTENT: LiveContent = LiveContent::new("The command table", "com
 /// servers or the model change mid-session.
 const ENVIRONMENT_CONTENT: LiveContent = LiveContent::new("The environment", "environment_diff");
 
+/// The work instructions, announced when `memory_off` or mode changes mid-session.
+const WORK_CONTENT: LiveContent = LiveContent::new("The work instructions", "work_diff");
+
 /// The permissions block (secrets and network policy), announced when it
 /// changes mid-session.
 const PERMISSIONS_CONTENT: LiveContent = LiveContent::new("The permissions", "permissions_diff");
@@ -490,6 +493,7 @@ const LIVE_INSTRUCTIONS: &[(&LiveContent, InstructionSlot)] = &[
     (&ENVIRONMENT_CONTENT, tag::ENVIRONMENT),
     (&CAPABILITIES_CONTENT, tag::CAPABILITIES),
     (&COMMANDS_CONTENT, tag::COMMANDS),
+    (&WORK_CONTENT, tag::WORK),
     (&PERMISSIONS_CONTENT, tag::PERMISSIONS),
     (&TIME_CONTENT, tag::TIME),
     (&LANGUAGES_CONTENT, tag::LANGUAGES),
@@ -656,12 +660,14 @@ pub fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> Strin
 
 #[derive(Template)]
 #[template(path = "prompt/identity.md", escape = "none")]
-struct IdentityTemplate;
+struct IdentityTemplate {
+    non_interactive: bool,
+}
 
-/// The identity section: who the agent is, the operating mode, and the rule
-/// that questions go through `ask_user`.
-pub fn build_identity() -> String {
-    IdentityTemplate
+/// The identity section: who the agent is, the operating mode, and whether
+/// interactive user prompts are available.
+pub fn build_identity(non_interactive: bool) -> String {
+    IdentityTemplate { non_interactive }
         .render()
         .unwrap_or_else(|error| panic!("failed to render identity: {error}"))
 }
@@ -1013,16 +1019,25 @@ pub async fn build_capabilities(
 struct WorkTemplate<'a> {
     issue_backend_name: &'a str,
     works_in_clone: bool,
+    memory_enabled: bool,
+    non_interactive: bool,
 }
 
-/// The work section: issues, PRs, `tasks.md`, artifacts and memory. The
-/// issue repository is the session's, so the session section names it.
-/// `works_in_clone` is whether the session has a repository clone, the only
+/// The work section: issues, PRs, `tasks.md`, artifacts and (when enabled)
+/// memory. The issue repository is the session's, so the session section names
+/// it. `works_in_clone` is whether the session has a repository clone, the only
 /// place code lands through `pr`.
-pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo, works_in_clone: bool) -> String {
+pub fn build_work(
+    issue_backend: &crate::issue::IssueBackendInfo,
+    works_in_clone: bool,
+    memory_enabled: bool,
+    non_interactive: bool,
+) -> String {
     WorkTemplate {
         issue_backend_name: issue_backend.name,
         works_in_clone,
+        memory_enabled,
+        non_interactive,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render work: {error}"))
@@ -1051,19 +1066,22 @@ impl NetworkRestriction {
 #[template(path = "prompt/permissions.md", escape = "none")]
 struct PermissionsTemplate<'a> {
     home: HomeEnvironment,
+    non_interactive: bool,
     secret_names: Vec<&'a str>,
     network: Option<NetworkRestriction>,
 }
 
-/// The permissions and safety section: what the agent may write, escalation,
-/// untrusted text and stored secrets.
+/// The permissions and safety section: what the agent may write, escalation
+/// (when interactive), untrusted text and stored secrets.
 pub fn build_permissions(
     environment: &AgentEnvironment,
+    non_interactive: bool,
     secret_names: Vec<&str>,
     network_policy: Option<&CompiledNetworkPolicy>,
 ) -> String {
     PermissionsTemplate {
         home: HomeEnvironment::of(environment),
+        non_interactive,
         secret_names,
         network: network_policy.and_then(NetworkRestriction::of),
     }
