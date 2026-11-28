@@ -1,6 +1,6 @@
 ---
 name: debug
-description: Read before using the `debug` command to launch, attach to, or connect to Debug Adapter Protocol (DAP) debuggers across Rust, C/C++, Go, Python, and container or loopback DAP stubs.
+description: "MUST read before debugging crashes, segfaults, wrong runtime state, or stepping through code (instead of running raw `gdb`, `lldb`, `dlv`, or `pdb`). Uses the `debug` command to drive structured Debug Adapter Protocol (DAP) sessions across Rust, C/C++, Go, Python, and container or loopback stubs."
 requires-command: debug
 ---
 

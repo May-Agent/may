@@ -9,16 +9,16 @@ use serde::Deserialize;
 /// Run a subagent: an autonomous agent with a context window of its own that
 /// returns only its final result.
 ///
-/// `subagent <name> --prompt-file <path>` runs the subagent `<name>` names;
-/// run `subagent` alone to list the names that resolve. Its definition fixes
-/// its role prompt, its model and what it may write: every subagent reads the
-/// whole workspace and writes its own working directory, and one whose
-/// definition allows it also writes the worktrees you grant. Three names are
-/// reserved: `fork` continues your own context, `resume` continues a
-/// finished subagent, and `external` runs a connected agent.
+/// `subagent <name> "<brief>"` (or `--prompt "<brief>"`, or `--prompt-file <path>`)
+/// runs the subagent `<name>` names; run `subagent` alone to list the names that
+/// resolve. Its definition fixes its role prompt, its model and what it may
+/// write: every subagent reads the whole workspace and writes its own working
+/// directory, and one whose definition allows it also writes the worktrees you
+/// grant. Three names are reserved: `fork` continues your own context, `resume`
+/// continues a finished subagent, and `external` runs a connected agent.
 ///
-/// The brief is always read from a file: write it to a file first, then pass
-/// its path. Inline prompt text is not a file path and is rejected.
+/// Pass the brief inline for concise single-turn calls, or `--prompt-file <path>`
+/// for long multi-line briefs; the two are mutually exclusive.
 ///
 /// `subagent approve --id <request>` and `subagent deny --id <request>`
 /// answer a permission request one of your subagents put to you; `deny`
@@ -29,10 +29,15 @@ pub struct SubagentArgs {
     /// The subagent to run, or `fork`, `resume`, `external`, `approve` or
     /// `deny`.
     pub name: String,
-    /// Path to a file holding the brief, or for `resume` the follow-up. The
-    /// file must exist and be non-empty.
+    /// Inline brief, or for `resume` the follow-up. Mutually exclusive with
+    /// `--prompt-file`; use `--prompt-file` for long multi-line briefs.
     #[serde(default)]
-    pub prompt_file: String,
+    #[schemars(extend("x-positional" = true))]
+    pub prompt: Option<String>,
+    /// Path to a file holding the brief, or for `resume` the follow-up.
+    /// Mutually exclusive with `prompt`.
+    #[serde(default)]
+    pub prompt_file: Option<String>,
     /// `resume` only: the id from a finished subagent's result, a single
     /// word. Ids expire with the provider's prompt cache. `approve` and
     /// `deny` take it too: the id the subagent's request reported.
@@ -209,8 +214,8 @@ impl SubagentArgs {
             if !grant.is_empty() || self.agent.is_some() {
                 anyhow::bail!("`subagent {name}` answers a request: it takes only `--id`");
             }
-            if !self.prompt_file.is_empty() {
-                anyhow::bail!("`subagent {name}` takes no `--prompt-file`");
+            if self.prompt.is_some() || self.prompt_file.is_some() {
+                anyhow::bail!("`subagent {name}` takes no prompt or `--prompt-file`");
             }
             let Some(id) = self.id.as_deref() else {
                 anyhow::bail!(
@@ -230,6 +235,14 @@ impl SubagentArgs {
         }
         if self.reason.is_some() {
             anyhow::bail!("only `subagent deny` takes a `--reason`");
+        }
+        if self.prompt.is_some() && self.prompt_file.is_some() {
+            anyhow::bail!("pass either an inline prompt (`--prompt`) or `--prompt-file`, not both");
+        }
+        if self.prompt.is_none() && self.prompt_file.is_none() {
+            anyhow::bail!(
+                "missing brief: pass an inline prompt (or `--prompt <text>`) or `--prompt-file <path>`"
+            );
         }
         Ok(match name {
             "resume" => {
@@ -344,5 +357,31 @@ mod tests {
         bad.model = Some("gpt-5".into());
         let error = bad.call().unwrap_err().to_string();
         assert!(error.contains("`models`"), "{error}");
+    }
+
+    #[test]
+    fn inline_prompt_and_prompt_file_are_mutually_exclusive() {
+        let inline: SubagentArgs =
+            serde_json::from_value(serde_json::json!({"name": "explore", "prompt": "trace foo"}))
+                .expect("inline prompt parses");
+        assert!(matches!(
+            inline.call(),
+            Ok(Call::Named {
+                name: "explore",
+                ..
+            })
+        ));
+
+        let both: SubagentArgs = serde_json::from_value(serde_json::json!({
+            "name": "explore",
+            "prompt": "trace foo",
+            "prompt_file": "brief.md"
+        }))
+        .expect("both parse");
+        assert!(both.call().is_err(), "inline and file exclude each other");
+
+        let neither: SubagentArgs =
+            serde_json::from_value(serde_json::json!({"name": "explore"})).expect("neither parses");
+        assert!(neither.call().is_err(), "missing brief is refused");
     }
 }

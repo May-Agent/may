@@ -254,8 +254,42 @@ fn global_rules_are_reread_each_sync() {
 
 fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -> String {
     let dir = tempdir().expect("temp dir should be created");
-    tokio_test::block_on(build_capabilities(commands, &[], parameters, dir.path()))
-        .expect("capabilities render")
+    tokio_test::block_on(build_capabilities(
+        commands,
+        &[],
+        parameters,
+        dir.path(),
+        false,
+    ))
+    .expect("capabilities render")
+}
+
+#[test]
+fn offline_mode_omits_web_research_subagent_unless_hosted_search_is_enabled() {
+    let dir = tempdir().expect("temp dir should be created");
+    let offline_prompt = tokio_test::block_on(build_capabilities(
+        &[],
+        &[],
+        &Parameters::default(),
+        dir.path(),
+        true,
+    ))
+    .expect("offline capabilities render");
+    assert!(
+        !offline_prompt.contains("- research:"),
+        "offline without hosted search should omit research subagent:\n{offline_prompt}"
+    );
+    assert!(offline_prompt.contains("- explore:"), "{offline_prompt}");
+
+    let online_prompt = tokio_test::block_on(build_capabilities(
+        &[],
+        &[],
+        &Parameters::default(),
+        dir.path(),
+        false,
+    ))
+    .expect("online capabilities render");
+    assert!(online_prompt.contains("- research:"), "{online_prompt}");
 }
 
 #[test]
@@ -274,6 +308,7 @@ fn the_computer_skill_is_listed_only_where_computer_is_registered() {
             &[],
             &Parameters::default(),
             dir.path(),
+            false,
         ))
         .expect("capabilities render")
     };
@@ -406,10 +441,9 @@ fn the_system_layout_places_the_command_table_after_capabilities() {
 #[test]
 fn capabilities_list_subagents_in_their_current_form() {
     let prompt = render_capabilities(&[], &Parameters::default());
-    assert!(
-        prompt.contains("`subagent <name> --prompt-file <path>`"),
-        "{prompt}"
-    );
+    assert!(prompt.contains("`subagent <name> \"<brief>\"`"), "{prompt}");
+    assert!(prompt.contains("`--prompt-file <path>`"), "{prompt}");
+    assert!(prompt.contains("`explore \"<brief>\"`"), "{prompt}");
     assert!(prompt.contains("- explore: "), "{prompt}");
     assert!(prompt.contains("- fork: "), "{prompt}");
     assert!(!prompt.contains("--subagent"), "{prompt}");
@@ -592,13 +626,15 @@ fn the_efficiency_section_prefers_automated_fixes_to_hand_edits() {
 fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
     let prompt = build_efficiency(false);
     assert!(
-        prompt.contains(
-            "When answering means reading across many files and only the conclusion matters"
-        ),
+        prompt.contains("Delegate broad codebase exploration to `explore \"<brief>\"`"),
         "{prompt}"
     );
     assert!(
         prompt.contains("`explore --prompt-file <path>`"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("keeping noisy search output out of your main context"),
         "{prompt}"
     );
 }
@@ -621,6 +657,7 @@ fn the_capabilities_section_carries_each_core_commands_usage() {
         &core,
         &Parameters::default(),
         dir.path(),
+        false,
     ))
     .expect("capabilities render");
     for command in &core {
@@ -798,15 +835,16 @@ fn subagent_instructions_report_to_the_parent_and_never_the_user() {
         .expect("image tools")
         .catalog();
     let prepared_tools = super::build_prepared_tools(&catalog, false).expect("prepared tools");
-    let blocks = super::build_subagent_instructions(
-        &AgentEnvironment::Local,
-        Vec::new(),
-        false,
-        Some(prepared_tools),
-        vec!["API_KEY"],
-        None,
-        &Parameters::default(),
-    );
+    let blocks = super::build_subagent_instructions(super::SubagentInstructionsInput {
+        environment: &AgentEnvironment::Local,
+        non_interactive: false,
+        remote_hosts: Vec::new(),
+        hashline: false,
+        prepared_tools: Some(prepared_tools),
+        secret_names: vec!["API_KEY"],
+        network_policy: None,
+        request_parameters: &Parameters::default(),
+    });
     let text = blocks.join("\n");
     assert!(
         text.contains("`send_message`")
@@ -840,6 +878,27 @@ fn subagent_instructions_report_to_the_parent_and_never_the_user() {
     // Non-hashline subagent instructions must not inject hashline patch ops.
     assert!(!text.contains("PUT N#HH.=M#KK:"), "{text}");
     assert!(!text.contains("CUT N#HH.=M#KK"), "{text}");
+
+    let non_interactive_blocks =
+        super::build_subagent_instructions(super::SubagentInstructionsInput {
+            environment: &AgentEnvironment::Local,
+            non_interactive: true,
+            remote_hosts: Vec::new(),
+            hashline: false,
+            prepared_tools: None,
+            secret_names: Vec::new(),
+            network_policy: None,
+            request_parameters: &Parameters::default(),
+        });
+    let non_interactive_text = non_interactive_blocks.join("\n");
+    assert!(
+        non_interactive_text.contains("`unsafe` mode is unavailable"),
+        "{non_interactive_text}"
+    );
+    assert!(
+        !non_interactive_text.contains("the agent that launched you approves"),
+        "non-interactive subagent must not be instructed to request unsafe:\n{non_interactive_text}"
+    );
 }
 
 #[test]
@@ -855,15 +914,16 @@ fn hashline_prepared_tools_inject_complete_syntax_for_main_and_subagents() {
         .catalog();
     let hashline_tools =
         super::build_prepared_tools(&hashline_catalog, true).expect("hashline prepared tools");
-    let subagent_blocks = super::build_subagent_instructions(
-        &AgentEnvironment::Local,
-        Vec::new(),
-        true,
-        Some(hashline_tools.clone()),
-        Vec::new(),
-        None,
-        &Parameters::default(),
-    );
+    let subagent_blocks = super::build_subagent_instructions(super::SubagentInstructionsInput {
+        environment: &AgentEnvironment::Local,
+        non_interactive: false,
+        remote_hosts: Vec::new(),
+        hashline: true,
+        prepared_tools: Some(hashline_tools.clone()),
+        secret_names: Vec::new(),
+        network_policy: None,
+        request_parameters: &Parameters::default(),
+    });
     let subagent_text = subagent_blocks.join("\n");
 
     for expected in [
@@ -958,6 +1018,7 @@ fn orchestrator_mode_renders_delta_without_duplicating_efficiency() {
     }
     // Only the delta over `<efficiency>` — never repeats `explore` or `--tier fast` lint routing.
     assert!(!block.contains("explore --prompt-file"), "{block}");
+    assert!(!block.contains("explore \""), "{block}");
     assert!(!block.contains("--tier fast"), "{block}");
 }
 

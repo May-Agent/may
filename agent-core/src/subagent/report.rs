@@ -103,6 +103,15 @@ pub struct SubagentBrief<'a> {
     pub brief: &'a str,
 }
 
+/// Extra instruction injected for the `explore` subagent only when the target
+/// repository already has a ready `repo-search` index.
+#[derive(Template)]
+#[template(path = "subagent/explore_indexed.txt", escape = "none")]
+pub struct ExploreIndexed<'a> {
+    /// The command name (`search`, or `rag` in hashline mode).
+    pub search_cmd: &'a str,
+}
+
 /// The request a run parked for its caller's decision, returned as the
 /// launching call's result while the run continues.
 #[derive(Template)]

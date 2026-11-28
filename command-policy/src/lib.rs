@@ -1273,7 +1273,7 @@ impl ScriptPolicy for WhitespacePatch {
 }
 
 /// Host programs a script's own shell should replace with managed alternatives.
-const HOST_COMMANDS: [HostCommandUsage; 3] = [
+const HOST_COMMANDS: [HostCommandUsage; 6] = [
     HostCommandUsage {
         name: "grep",
         replacement: "`rg`",
@@ -1286,11 +1286,23 @@ const HOST_COMMANDS: [HostCommandUsage; 3] = [
         name: "find",
         replacement: "`fd`",
     },
+    HostCommandUsage {
+        name: "gdb",
+        replacement: "`debug` (read `skills/debug/SKILL.md` first)",
+    },
+    HostCommandUsage {
+        name: "lldb",
+        replacement: "`debug` (read `skills/debug/SKILL.md` first)",
+    },
+    HostCommandUsage {
+        name: "dlv",
+        replacement: "`debug` (read `skills/debug/SKILL.md` first)",
+    },
 ];
 
 /// Host programs in hashline mode, where `grep` should steer toward `search rg`
 /// so results carry `N#HH` anchors for `edit`.
-const HASHLINE_HOST_COMMANDS: [HostCommandUsage; 3] = [
+const HASHLINE_HOST_COMMANDS: [HostCommandUsage; 6] = [
     HostCommandUsage {
         name: "grep",
         replacement: "`search rg`",
@@ -1302,6 +1314,18 @@ const HASHLINE_HOST_COMMANDS: [HostCommandUsage; 3] = [
     HostCommandUsage {
         name: "find",
         replacement: "`fd`",
+    },
+    HostCommandUsage {
+        name: "gdb",
+        replacement: "`debug` (read `skills/debug/SKILL.md` first)",
+    },
+    HostCommandUsage {
+        name: "lldb",
+        replacement: "`debug` (read `skills/debug/SKILL.md` first)",
+    },
+    HostCommandUsage {
+        name: "dlv",
+        replacement: "`debug` (read `skills/debug/SKILL.md` first)",
     },
 ];
 

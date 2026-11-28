@@ -528,6 +528,7 @@ where
             session_role: may_agent::fusion::SessionRole::Main,
             tui_registry: None,
             non_interactive: true,
+            network_restricted: false,
             llm,
             ask_flagship: None,
             ask_balanced: None,

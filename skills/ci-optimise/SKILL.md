@@ -1,6 +1,7 @@
 ---
 name: ci-optimise
 description: Read when a CI alert says a job ran abnormally long, or before changing CI or a test suite to make a run faster. Gives the procedure for finding where a slow run spends its time and proving the fix.
+requires-command: ci
 ---
 
 # Making a slow CI run faster

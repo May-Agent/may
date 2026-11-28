@@ -12,7 +12,7 @@ A skill is a folder of instructions for one kind of task. When a request matches
 {% for skill in skills %}- {{ skill.name }} (`skills/{{ skill.dir_name }}/SKILL.md`): {{ skill.description }}
 {% endfor %}</skills>
 {% endif %}<subagents>
-A subagent works in a context of its own and returns only its result. Write the brief to a file, then run `subagent <name> --prompt-file <path>`. Give one a self-contained piece of work whose intermediate output you do not need; work that depends on what you have read and decided goes to `fork` or stays with you.
+A subagent works in a context of its own and returns only its result, keeping intermediate exploration and command noise out of your context. Run `subagent <name> "<brief>"` (or `--prompt-file <path>` for long multi-line briefs). Give one a self-contained piece of work whose intermediate output you do not need; use `explore "<brief>"` for read-only codebase investigation; work that depends on what you have read and decided goes to `fork` or stays with you.
 {% for subagent in subagents %}- {{ subagent.id }}: {{ subagent.description }}
 {% endfor %}</subagents>
 </capabilities>

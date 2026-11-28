@@ -341,3 +341,41 @@ fn a_scaled_foreground_wait_reports_scaled_high_and_normal_windows() {
     );
     assert_eq!(base.get(), NORMAL_WAIT);
 }
+
+#[tokio::test]
+async fn host_conditions_emit_tail_blocks_while_high_and_clear_on_normal() {
+    use aither_agent::{ContextSource, Moment, Placement};
+
+    let (senders, channels) = channels();
+    let (mut conditions, _events) = channels.into_sources();
+    let req = Moment::Request { reassembled: false };
+
+    assert_eq!(
+        conditions.blocks(req).await,
+        [] as [aither_agent::ContextBlock; 0]
+    );
+
+    senders
+        .send(HostLoadEvent::LoadHigh {
+            load: MachineLoad(2.5),
+            foreground_wait: Duration::from_secs(60),
+        })
+        .await;
+    let high_blocks = conditions.blocks(req).await;
+    assert_eq!(high_blocks.len(), 1);
+    assert_eq!(high_blocks[0].placement(), Placement::Tail);
+    assert!(high_blocks[0].block().content().contains("250%"));
+
+    // Once load returns to normal, the transient tail block disappears with no
+    // lingering normal/ended alert added to conversation history.
+    senders
+        .send(HostLoadEvent::LoadEnded {
+            load: MachineLoad(0.2),
+            foreground_wait: Duration::from_secs(10),
+        })
+        .await;
+    assert_eq!(
+        conditions.blocks(req).await,
+        [] as [aither_agent::ContextBlock; 0]
+    );
+}

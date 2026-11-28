@@ -26,13 +26,13 @@ use super::loop_watch::{LoopPattern, LoopWatch};
 use super::permission::PermissionApprover;
 use super::provider::{ModelSlot, ProviderLlm, resolve_provider_runtime};
 use super::runtime_context::{
-    RepoCloneEntry, RuntimeSystemContext, build_agents_md_blocks, build_browser_context,
-    build_capabilities, build_commands, build_efficiency, build_environment, build_evidence,
-    build_fusion_lead_context, build_fusion_sidekick_context, build_harness, build_identity,
-    build_languages, build_orchestrator_mode_context, build_permissions, build_plan_mode_context,
-    build_prepared_tools, build_profile_memories, build_profile_persona, build_repo_clones_context,
-    build_session, build_subagent_instructions, build_terminal, build_time, build_work,
-    build_workspace_workdirs_context, tag,
+    RepoCloneEntry, RuntimeSystemContext, SubagentInstructionsInput, build_agents_md_blocks,
+    build_browser_context, build_capabilities, build_commands, build_efficiency, build_environment,
+    build_evidence, build_fusion_lead_context, build_fusion_sidekick_context, build_harness,
+    build_identity, build_languages, build_orchestrator_mode_context, build_permissions,
+    build_plan_mode_context, build_prepared_tools, build_profile_memories, build_profile_persona,
+    build_repo_clones_context, build_session, build_subagent_instructions, build_terminal,
+    build_time, build_work, build_workspace_workdirs_context, tag,
 };
 use crate::agent::browser_tool::BrowserBroker;
 use crate::agent::register_tool::RegisterBroker;
@@ -563,6 +563,8 @@ pub struct MayAgent {
     edit_tracker: Option<crate::fusion::WorkspaceEditTracker>,
     /// Parent session grants mirrored into a Fusion companion sidekick across turns.
     shared_grants: Option<Grants>,
+    /// Whether outbound network is blocked (restricted network policy).
+    network_restricted: bool,
     /// Whether this session runs non-interactively (no user prompts or `unsafe` approval).
     non_interactive: bool,
     /// Issue backend metadata for live `<work>` instruction updates.
@@ -920,6 +922,7 @@ impl MayAgent {
             config.network_policy.clone(),
             config.profile_id.clone(),
         )
+        .with_non_interactive(config.non_interactive)
         .with_ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new_with_pause(
             config.session_id.as_str().to_string(),
             config.ask_user_broker.clone(),
@@ -1149,15 +1152,17 @@ impl MayAgent {
                     config.location.as_ref(),
                 );
                 let prepared_tools = build_prepared_tools(&catalog, config.hashline)?;
-                let subagent_instructions = build_subagent_instructions(
-                    &config.environment,
-                    config.ssh_servers.clone(),
-                    config.hashline,
-                    Some(prepared_tools.clone()),
-                    config.secrets.names(),
-                    config.network_policy.as_ref(),
-                    &config.request_parameters,
-                );
+                let subagent_instructions =
+                    build_subagent_instructions(SubagentInstructionsInput {
+                        environment: &config.environment,
+                        non_interactive: config.non_interactive,
+                        remote_hosts: config.ssh_servers.clone(),
+                        hashline: config.hashline,
+                        prepared_tools: Some(prepared_tools.clone()),
+                        secret_names: config.secrets.names(),
+                        network_policy: config.network_policy.as_ref(),
+                        request_parameters: &config.request_parameters,
+                    });
                 let mut runtime_system_context =
                     RuntimeSystemContext::new(memory_file, memory_content)
                         .with_memory_enabled(!config.memory_off)
@@ -1397,11 +1402,29 @@ impl MayAgent {
                         })
                     });
                 }
-                let imagine_config = ImagineCommandConfig {
-                    generator: config.image_generator.clone(),
-                    artifacts_dir: session_paths.artifacts_dir(),
-                };
-                let agent_messaging = config.agent_messaging.clone();
+                let network_restricted = config.network_policy.as_ref().is_some_and(|policy| {
+                    policy.mode() == crate::network_policy::NetworkPolicyMode::Restricted
+                });
+                let imagine_config =
+                    config
+                        .image_generator
+                        .clone()
+                        .map(|generator| ImagineCommandConfig {
+                            generator: Some(generator),
+                            artifacts_dir: session_paths.artifacts_dir(),
+                        });
+                let agent_messaging = (!config.non_interactive)
+                    .then(|| config.agent_messaging.clone())
+                    .flatten();
+                let task_broker = (!config.non_interactive)
+                    .then(|| config.task_broker.clone())
+                    .flatten();
+                let tunnel_broker = (!config.non_interactive)
+                    .then(|| config.tunnel_broker.clone())
+                    .flatten();
+                let register_skills_broker = (!config.non_interactive)
+                    .then(|| config.register_skills_broker.clone())
+                    .flatten();
                 let hook_runtime = permission_approver
                     .as_ref()
                     .and_then(|approver| approver.runtime_service.clone());
@@ -1442,15 +1465,15 @@ impl MayAgent {
                         cwd: config.cwd.clone(),
                         db: config.db.clone(),
                         ask_user: hook_runtime.clone(),
-                        imagine: Some(imagine_config),
+                        imagine: imagine_config,
                         task_runtime: match &config.environment {
                             AgentEnvironment::Container { .. } => TaskRuntimeKind::Container,
                             AgentEnvironment::Local => TaskRuntimeKind::Local,
                         },
-                        task_broker: config.task_broker.clone(),
-                        tunnel_broker: config.tunnel_broker.clone(),
+                        task_broker,
+                        tunnel_broker,
                         browser_broker: config.browser_broker.clone(),
-                        register_skills_broker: config.register_skills_broker.clone(),
+                        register_skills_broker,
                         request_parameters: config.request_parameters.clone(),
                         workspace_request_broker: (!is_container)
                             .then_some(config.workspace_request_broker.clone()),
@@ -1484,6 +1507,7 @@ impl MayAgent {
                         session_role: config.session_role.clone(),
                         tui_registry: config.tui_registry.clone(),
                         non_interactive: config.non_interactive,
+                        network_restricted,
                     },
                 ))
                 .await?;
@@ -1560,11 +1584,15 @@ impl MayAgent {
         let tui_registry = shared_terminal_commands.tui_registry.clone();
         let command_descriptions = shared_terminal_commands.descriptions.clone();
         let core_commands = shared_terminal_commands.usages.clone();
+        let network_restricted = config.network_policy.as_ref().is_some_and(|policy| {
+            policy.mode() == crate::network_policy::NetworkPolicyMode::Restricted
+        });
         let capabilities = build_capabilities(
             &command_descriptions,
             &core_commands,
             &config.request_parameters,
             &skills_dir,
+            network_restricted,
         )
         .await?;
         let issue_backend = crate::issue::IssueStore::info(&issue_store);
@@ -1872,6 +1900,7 @@ impl MayAgent {
             fusion_pair,
             edit_tracker,
             shared_grants: config.shared_grants,
+            network_restricted,
             non_interactive: config.non_interactive,
             issue_backend,
             works_in_clone,
@@ -2831,7 +2860,13 @@ impl MayAgent {
         let inner_context = self.inner.context_mut();
         let ((), capabilities_res) = futures_lite::future::zip(
             runtime_system_context.sync_live_files(inner_context, handoff.as_deref()),
-            build_capabilities(command_descriptions, core_commands, &params, skills_dir),
+            build_capabilities(
+                command_descriptions,
+                core_commands,
+                &params,
+                skills_dir,
+                self.network_restricted,
+            ),
         )
         .await;
         // A skill may have been added, changed or removed since the last turn.
@@ -3033,6 +3068,9 @@ impl MayAgent {
             .compile()
             .map_err(|error| MayAgentError::Sandbox(error.to_string()))?;
         self.permissions.set_network_policy(network_policy.clone());
+        self.network_restricted = network_policy.as_ref().is_some_and(|policy| {
+            policy.mode() == crate::network_policy::NetworkPolicyMode::Restricted
+        });
         let secret_names = secrets_res?;
         if let Ok(Some(bytes)) = secrets_bytes_res {
             self.secret_names_cache = Some((bytes, secret_names.clone()));

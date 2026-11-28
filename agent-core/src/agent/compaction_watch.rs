@@ -190,11 +190,11 @@ impl RunWatch {
         self.gauge.set_window(window);
     }
 
-    /// Records that the context holds `tokens` and no compaction is in
-    /// flight.
+    /// Records that the context holds `tokens`, preserving whether a
+    /// compaction is currently in flight.
     pub fn measured(&self, tokens: usize) {
         self.gauge.record(tokens);
-        self.valve.sync(false, tokens, self.floor);
+        self.valve.record_tokens(tokens, self.floor);
     }
 
     /// Records an estimate of the context's tokens, for a window the
@@ -214,10 +214,11 @@ impl RunWatch {
     pub fn ended(&self, applied: bool) {
         if applied {
             self.read_epochs.bump(&self.own);
-            self.measured(0);
+            self.gauge.record(0);
+            self.valve.sync(false, 0, self.floor);
             self.valve.landed();
         } else {
-            self.measured(self.gauge.tokens());
+            self.valve.sync(false, self.gauge.tokens(), self.floor);
         }
     }
 
@@ -334,5 +335,27 @@ mod tests {
             1,
             "a refilled window warns again"
         );
+    }
+
+    #[test]
+    fn measured_during_in_flight_compaction_keeps_valve_in_flight() {
+        use crate::harness::compact_tool::CompactRequest;
+
+        let own = AgentPath::default();
+        let gauge = Arc::new(WindowGauge::new(policy(), Some(200_000)));
+        let valve = Arc::new(CompactSignal::with_floor(10_000));
+        let watch = RunWatch::new(own, gauge, valve.clone(), 10_000);
+
+        watch.measured(180_000);
+        valve.sync(true, 180_000, 10_000);
+        assert_eq!(valve.request(), CompactRequest::InFlight);
+
+        // A later turn ending while background compaction is still running
+        // must not clear the valve back to idle.
+        watch.measured(188_000);
+        assert_eq!(valve.request(), CompactRequest::InFlight);
+
+        watch.ended(true);
+        assert_eq!(valve.request(), CompactRequest::Settled);
     }
 }

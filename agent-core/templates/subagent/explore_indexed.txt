@@ -1,0 +1,2 @@
+This repository already has a ready hybrid (semantic + full-text) code index available through `{{ search_cmd }}`.
+Actively start conceptual, architectural, or cross-file questions with `{{ search_cmd }} "<description>"` to jump directly to the relevant files and symbols, then narrow with `rg` / `ast-grep` and targeted line reads.

@@ -173,6 +173,14 @@ pub struct SubagentSettings<LLM> {
     /// Shared hashline `edit`-bypass notice store attached to writable
     /// subagents when `[experimental] hashline` is enabled.
     pub edit_bypass_notices: Option<crate::command_policy::EditBypassNotices>,
+    /// Optional `repo-search` handle used to probe whether the target repository
+    /// already has a ready index when launching `explore`.
+    pub repo_search: Option<crate::repo_search::RepoSearch>,
+    /// Command name exposing indexed code search (`search`, or `rag` in hashline mode).
+    pub indexed_search_command: &'static str,
+    /// Host working directory of the session; fallback when `explore` is launched
+    /// from the session sandbox directory rather than inside a git worktree.
+    pub session_cwd: Option<PathBuf>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentSettings<LLM> {
@@ -293,6 +301,8 @@ struct Pending<LLM: LanguageModel + 'static> {
     /// The `AGENTS.md` blocks a named call's context gets; empty for a fork,
     /// which inherits the parent's.
     agents: AgentsMdBlocks,
+    /// Set for `explore` only when the target repository already has a ready index.
+    indexed_search_command: Option<&'static str>,
 }
 
 enum Source {
@@ -381,8 +391,46 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         }
     }
 
-    /// Reads the brief a call names; an inline text is no path, and an empty
-    /// file is no brief.
+    fn check_prompt_language(&self, prompt: &str) -> anyhow::Result<()> {
+        if let Some(guard) = &self.settings().languages {
+            guard
+                .check_working(prompt, WorkingText::Internal)
+                .map_err(|refusal| crate::agent::notices::subagent_language_refused(&refusal))?;
+        }
+        Ok(())
+    }
+
+    /// Resolves the brief from inline prompt text or `--prompt-file`, rejecting
+    /// empty briefs and checking the working language.
+    async fn resolve_prompt(
+        &self,
+        args: &SubagentArgs,
+        caller: Option<&Path>,
+    ) -> anyhow::Result<String> {
+        match (args.prompt.as_deref(), args.prompt_file.as_deref()) {
+            (Some(inline), None) => {
+                let prompt = inline.trim();
+                if prompt.is_empty() {
+                    anyhow::bail!("subagent prompt is empty");
+                }
+                self.check_prompt_language(prompt)?;
+                Ok(prompt.to_string())
+            }
+            (None, Some(file)) => self.read_prompt(file, caller).await,
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "pass either an inline prompt (`--prompt`) or `--prompt-file`, not both"
+                );
+            }
+            (None, None) => {
+                anyhow::bail!(
+                    "missing brief: pass an inline prompt (or `--prompt <text>`) or `--prompt-file <path>`"
+                );
+            }
+        }
+    }
+
+    /// Reads the brief a `--prompt-file` call names; an empty file is no brief.
     async fn read_prompt(&self, file: &str, caller: Option<&Path>) -> anyhow::Result<String> {
         let resolved = self
             .settings()
@@ -390,7 +438,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             .resolve(Path::new(file), caller)
             .await
             .map_err(|error| {
-                anyhow::anyhow!("subagent prompt must be a path to a prompt file: {error}")
+                anyhow::anyhow!("subagent `--prompt-file` must be a path to a prompt file: {error}")
             })?;
         let content = async_fs::read_to_string(&resolved).await.map_err(|error| {
             anyhow::anyhow!(
@@ -402,11 +450,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         if prompt.is_empty() {
             anyhow::bail!("subagent prompt file '{}' is empty", resolved.display());
         }
-        if let Some(guard) = &self.settings().languages {
-            guard
-                .check_working(prompt, WorkingText::Internal)
-                .map_err(|refusal| crate::agent::notices::subagent_language_refused(&refusal))?;
-        }
+        self.check_prompt_language(prompt)?;
         Ok(prompt.to_string())
     }
 
@@ -684,8 +728,8 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
         // A named subagent works under the rules of where it works: its
         // granted worktree or cloned working copy, else the directory the
         // call ran in. A fork inherits the parent's blocks instead.
-        let agents = match &source {
-            Source::Definition(_) => {
+        let (agents, indexed_search_command) = match &source {
+            Source::Definition(definition) => {
                 let root = granted
                     .first()
                     .cloned()
@@ -695,9 +739,30 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                             .and_then(|space| space.working_copies().first().cloned())
                     })
                     .unwrap_or_else(|| working_dir.to_path_buf());
-                load_agents_md(self.settings().global_agents.as_deref(), &root).await
+                let agents_fut = load_agents_md(self.settings().global_agents.as_deref(), &root);
+                let indexed_fut = async {
+                    if definition.name != "explore" {
+                        return None;
+                    }
+                    let repo_search = self.settings().repo_search.as_ref()?;
+                    let fallback = self.settings().session_cwd.clone();
+                    let root_for_wt = root.clone();
+                    let worktree = blocking::unblock(move || {
+                        crate::repo_search::worktree_root(&root_for_wt).or_else(|| {
+                            fallback
+                                .as_deref()
+                                .and_then(crate::repo_search::worktree_root)
+                        })
+                    })
+                    .await?;
+                    repo_search
+                        .worktree_index_ready(&worktree)
+                        .await
+                        .then_some(self.settings().indexed_search_command)
+                };
+                futures_lite::future::zip(agents_fut, indexed_fut).await
             }
-            Source::Fork(_) => AgentsMdBlocks::default(),
+            Source::Fork(_) => (AgentsMdBlocks::default(), None),
         };
         Ok(Pending {
             name,
@@ -709,6 +774,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             source,
             granted,
             agents,
+            indexed_search_command,
         })
     }
 
@@ -726,6 +792,7 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
             source,
             granted,
             agents,
+            indexed_search_command,
         } = pending;
         let floor = match &source {
             Source::Definition(_) => ContextPolicy::default().compaction_floor,
@@ -762,6 +829,10 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                     ))
                     .cache_lifetime(settings.cache_lifetime)
                     .instruction(definition.prompt.clone());
+                if let Some(search_cmd) = indexed_search_command {
+                    builder =
+                        builder.instruction(render(&super::report::ExploreIndexed { search_cmd }));
+                }
                 for block in &settings.instructions {
                     builder = builder.instruction(block.clone());
                 }
@@ -930,7 +1001,7 @@ impl<LLM: LanguageModel + Clone + 'static> SubagentCommand<LLM> {
             _ => {}
         }
         let caller = cx.working_dir().map(Path::new);
-        let prompt = self.read_prompt(&args.prompt_file, caller).await?;
+        let prompt = self.resolve_prompt(&args, caller).await?;
         let service = &self.service;
         let (ready, id) = self.acquire(call, &prompt, caller).await?;
         let lease = id.lease.clone();
@@ -1318,5 +1389,18 @@ mod tests {
             rules.contains("<project_rules>") && rules.contains("docs/AGENTS.md"),
             "{rules}"
         );
+    }
+
+    #[test]
+    fn explore_indexed_instruction_renders_search_and_rag() {
+        let search = render(&super::super::report::ExploreIndexed {
+            search_cmd: "search",
+        });
+        assert!(search.contains("`search`"), "{search}");
+        assert!(search.contains("`search \"<description>\"`"), "{search}");
+
+        let rag = render(&super::super::report::ExploreIndexed { search_cmd: "rag" });
+        assert!(rag.contains("`rag`"), "{rag}");
+        assert!(rag.contains("`rag \"<description>\"`"), "{rag}");
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: tui
-description: Read before driving interactive terminal or full-screen TUI applications with the `tui` command, to open, observe, read text, send keys, type, click, drag, scroll, resize, and stop them.
+description: "Read before driving interactive terminal, PTY, or full-screen TUI applications (open, observe, read text, send keys, type, click, drag, scroll, resize, and stop them via the `tui` command)."
 requires-command: tui
 ---
 
