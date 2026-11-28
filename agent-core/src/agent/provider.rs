@@ -152,6 +152,21 @@ fn resolve_model_selector(
 /// stream before aborting so a hanging upstream cannot wedge a session.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Extended stream idle timeout for high-effort reasoning models (`High`,
+/// `XHigh`, `Max`), which can legitimately spend up to 10 minutes in prefill
+/// or deep reasoning before emitting their next stream event.
+const HIGH_REASONING_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Returns the stream idle timeout for a request's configured reasoning effort.
+const fn stream_idle_timeout(effort: Option<ReasoningEffort>) -> std::time::Duration {
+    match effort {
+        Some(ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max) => {
+            HIGH_REASONING_STREAM_IDLE_TIMEOUT
+        }
+        _ => STREAM_IDLE_TIMEOUT,
+    }
+}
+
 /// Longest a provider's non-stream wait — building a client (auth refresh,
 /// discovery) or answering a profile or token-count call — may run before
 /// it is failed: none of it is bounded downstream like the response stream.
@@ -279,6 +294,61 @@ where
     })
 }
 
+/// Opens a response stream via `open`, automatically retrying per `policy` when
+/// no first event arrives within `idle_timeout` (prefill / initial-reasoning
+/// stall). Once the first event arrives, subsequent gaps are guarded by
+/// `with_stream_idle_timeout` (which `aither-agent` retries as a mid-stream
+/// transient break).
+async fn open_stream_with_idle_retry<'a, S, E, F>(
+    mut open: F,
+    idle_timeout: std::time::Duration,
+    policy: RetryPolicy,
+) -> Pin<Box<dyn Stream<Item = Result<LlmEvent, RedactedError<E>>> + Send + 'a>>
+where
+    S: Stream<Item = Result<LlmEvent, RedactedError<E>>> + Send + 'a + ?Sized,
+    E: Send + 'a,
+    F: FnMut() -> Pin<Box<S>>,
+{
+    enum First<T, E> {
+        Item(Option<Result<T, RedactedError<E>>>),
+        Timeout,
+    }
+
+    let transient = Failure::transient();
+    let mut retries = 0u32;
+    loop {
+        let mut inner = open();
+        let first = futures_lite::future::race(async { First::Item(inner.next().await) }, async {
+            async_io::Timer::after(idle_timeout).await;
+            First::Timeout
+        })
+        .await;
+        match first {
+            First::Item(Some(item)) => {
+                let rest = with_stream_idle_timeout(inner, idle_timeout);
+                return Box::pin(futures_lite::stream::once(item).chain(rest));
+            }
+            First::Item(None) => return Box::pin(futures_lite::stream::empty()),
+            First::Timeout => {
+                if !policy.allows(retries, &transient) {
+                    return Box::pin(futures_lite::stream::once(Err(
+                        RedactedError::StreamTimeout(idle_timeout),
+                    )));
+                }
+                let delay = policy.delay(retries, &transient);
+                tracing::warn!(
+                    attempt = retries + 1,
+                    timeout_secs = idle_timeout.as_secs(),
+                    delay_ms = delay.as_millis(),
+                    "model stream timed out before first event; retrying"
+                );
+                retries += 1;
+                async_io::Timer::after(delay).await;
+            }
+        }
+    }
+}
+
 impl<M> LanguageModel for RedactedModel<M>
 where
     M: LanguageModel,
@@ -298,12 +368,21 @@ where
                     match self.redactor.current().await {
                         Ok(redactions) => {
                             redactions.redact_request(&mut request);
-                            let inner = Box::pin(
-                                self.inner
-                                    .respond(request)
-                                    .map(|event| event.map_err(RedactedError::Model)),
-                            );
-                            Box::pin(with_stream_idle_timeout(inner, STREAM_IDLE_TIMEOUT))
+                            let idle_timeout =
+                                stream_idle_timeout(request.parameters().reasoning_effort);
+                            let policy = self.inner.retry_policy();
+                            open_stream_with_idle_retry(
+                                move || {
+                                    Box::pin(
+                                        self.inner
+                                            .respond(request.clone())
+                                            .map(|event| event.map_err(RedactedError::Model)),
+                                    )
+                                },
+                                idle_timeout,
+                                policy,
+                            )
+                            .await
                         }
                         Err(error) => Box::pin(futures_lite::stream::once(Err(
                             RedactedError::Secrets(error),
@@ -864,14 +943,18 @@ async fn build_cloud_provider_from_instance_inner(
 
     let llm: CloudProvider = match provider_type {
         ProviderType::Anthropic => {
-            let mut client = Claude::new(api_key).with_model(model);
+            let mut client = Claude::new(api_key)
+                .with_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT);
             if let Some(url) = base_url {
                 client = client.with_base_url(url);
             }
             client.into()
         }
         ProviderType::Google => {
-            let mut client = Gemini::new(api_key).with_text_model(model);
+            let mut client = Gemini::new(api_key)
+                .with_text_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT);
             if let Some(url) = base_url {
                 client = client.with_base_url(url);
             }
@@ -883,7 +966,9 @@ async fn build_cloud_provider_from_instance_inner(
                     "xAI Grok not authenticated. Use /login to sign in.".to_string(),
                 ));
             };
-            let mut client = OpenAI::new(&token).with_model(model);
+            let mut client = OpenAI::new(&token)
+                .with_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT);
             if let Some(url) = base_url {
                 client = client.with_base_url(url);
             }
@@ -894,14 +979,22 @@ async fn build_cloud_provider_from_instance_inner(
         | ProviderType::Together
         | ProviderType::Mistral
         | ProviderType::XAI => {
-            let mut client = OpenAI::new(api_key).with_model(model);
+            let mut client = OpenAI::new(api_key)
+                .with_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT);
             if let Some(url) = base_url {
                 client = client.with_base_url(url);
             }
             client.into()
         }
-        ProviderType::OpenRouter => OpenAI::openrouter(api_key).with_model(model).into(),
-        ProviderType::DeepSeek => OpenAI::deepseek(api_key).with_model(model).into(),
+        ProviderType::OpenRouter => OpenAI::openrouter(api_key)
+            .with_model(model)
+            .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT)
+            .into(),
+        ProviderType::DeepSeek => OpenAI::deepseek(api_key)
+            .with_model(model)
+            .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT)
+            .into(),
         ProviderType::Copilot => {
             let credentials = match crate::copilot::get_copilot_credentials().await {
                 Ok(Some(credentials)) => credentials,
@@ -957,6 +1050,7 @@ async fn build_cloud_provider_from_instance_inner(
             OpenAI::new(api_key)
                 .with_base_url(url)
                 .with_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT)
                 .into()
         }
         ProviderType::LMStudio => {
@@ -964,6 +1058,7 @@ async fn build_cloud_provider_from_instance_inner(
             OpenAI::new(api_key)
                 .with_base_url(url)
                 .with_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT)
                 .with_chat_completions_api()
                 .into()
         }
@@ -973,7 +1068,10 @@ async fn build_cloud_provider_from_instance_inner(
                     "Base URL required for custom provider '{id}'"
                 ))
             })?;
-            let client = OpenAI::new(api_key).with_base_url(url).with_model(model);
+            let client = OpenAI::new(api_key)
+                .with_base_url(url)
+                .with_model(model)
+                .with_idle_timeout(HIGH_REASONING_STREAM_IDLE_TIMEOUT);
             match instance.api {
                 Some(ProviderApi::Responses) => client.with_responses_api().into(),
                 _ => client.with_chat_completions_api().into(),
@@ -1223,6 +1321,98 @@ mod tests {
         assert!(message.contains("Fast"), "{message}");
         assert!(message.contains("ghost"), "{message}");
         assert!(message.contains("some-model"), "{message}");
+    }
+
+    #[test]
+    fn high_reasoning_effort_gets_extended_stream_idle_timeout() {
+        assert_eq!(stream_idle_timeout(None), STREAM_IDLE_TIMEOUT);
+        assert_eq!(
+            stream_idle_timeout(Some(ReasoningEffort::Medium)),
+            STREAM_IDLE_TIMEOUT
+        );
+        assert_eq!(
+            HIGH_REASONING_STREAM_IDLE_TIMEOUT,
+            std::time::Duration::from_secs(600)
+        );
+        for effort in [
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(
+                stream_idle_timeout(Some(effort)),
+                HIGH_REASONING_STREAM_IDLE_TIMEOUT
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn first_event_timeout_retries_automatically_under_retry_policy() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let policy = RetryPolicy {
+            max_retries: 2,
+            initial_delay: std::time::Duration::from_millis(5),
+            max_delay: std::time::Duration::from_millis(10),
+            multiplier: 2,
+        };
+        let attempts_ref = attempts.clone();
+        let mut stream = open_stream_with_idle_retry(
+            move || -> Pin<Box<dyn Stream<Item = Result<LlmEvent, RedactedError<std::io::Error>>> + Send>> {
+                let attempt = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Box::pin(futures_lite::stream::pending())
+                } else {
+                    Box::pin(futures_lite::stream::once(Ok(LlmEvent::Text(
+                        "recovered".to_string(),
+                    ))))
+                }
+            },
+            std::time::Duration::from_millis(20),
+            policy,
+        )
+        .await;
+
+        let item = stream.next().await.expect("recovered event arrives");
+        assert!(
+            matches!(item, Ok(LlmEvent::Text(ref text)) if text == "recovered"),
+            "{item:?}"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_event_timeout_fails_after_exhausting_retries() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let policy = RetryPolicy {
+            max_retries: 1,
+            initial_delay: std::time::Duration::from_millis(5),
+            max_delay: std::time::Duration::from_millis(10),
+            multiplier: 2,
+        };
+        let attempts_ref = attempts.clone();
+        let mut stream = open_stream_with_idle_retry(
+            move || -> Pin<Box<dyn Stream<Item = Result<LlmEvent, RedactedError<std::io::Error>>> + Send>> {
+                attempts_ref.fetch_add(1, Ordering::SeqCst);
+                Box::pin(futures_lite::stream::pending())
+            },
+            std::time::Duration::from_millis(15),
+            policy,
+        )
+        .await;
+
+        let err = stream
+            .next()
+            .await
+            .expect("timeout error arrives")
+            .expect_err("exhausted retries return StreamTimeout");
+        assert!(matches!(err, RedactedError::StreamTimeout(_)), "{err:?}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

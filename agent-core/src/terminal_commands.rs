@@ -178,9 +178,13 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// main-agent rebuilds; `None` starts a fresh registry.
     pub tui_registry: Option<crate::agent::tui_tool::TuiRegistry>,
     /// Whether this session is non-interactive (`may "<prompt>"`): interactive
-    /// prompt commands (`ask_user`, `withdraw_ask_user`, `request_workspace`)
-    /// are omitted from registration and prompt usage blocks.
+    /// prompt commands (`ask_user`, `withdraw_ask_user`, `request_workspace`,
+    /// `register-skills`) and verbose inline usages (`subagent`, `explore`)
+    /// are omitted from registration or prompt usage blocks.
     pub non_interactive: bool,
+    /// Whether outbound network is blocked (restricted policy), so network-only
+    /// commands such as `webfetch` are omitted.
+    pub network_restricted: bool,
 }
 
 /// Handles the host owns once and every session's commands share: cloning
@@ -388,7 +392,7 @@ where
         .parent_session_id()
         .map_or_else(|| config.session_id.clone(), |id| id.as_str().to_string());
 
-    if !config.request_parameters.hosted_web_fetch() {
+    if !config.request_parameters.hosted_web_fetch() && !config.network_restricted {
         register_tool_with_description(builder, &mut descriptions, MayWebFetch::new());
     }
     // The model of each tier; a tier nothing is configured for runs on the
@@ -819,7 +823,10 @@ where
         builder.configure_image_tool(tool);
     }
 
-    if !is_sidekick && let Some(register_skills_broker) = config.register_skills_broker {
+    if !is_sidekick
+        && !config.non_interactive
+        && let Some(register_skills_broker) = config.register_skills_broker
+    {
         // Registering skills reshapes the session: main-agent authority.
         builder.main_only(|reserved| {
             register_tool_with_description(
@@ -958,18 +965,27 @@ where
         registry: registry_slot.clone(),
         timeout_cap: config.timeout_cap.clone(),
         edit_bypass_notices,
+        repo_search: Some(config.services.repo_search.clone()),
+        indexed_search_command: if may_config.experimental.hashline {
+            "rag"
+        } else {
+            "search"
+        },
+        session_cwd: Some(config.cwd.clone()),
     });
     if !is_sidekick {
         describe_arguments::<SubagentArgs>(&mut descriptions, "subagent");
-        usages.push(CoreCommandUsage {
-            name: "subagent".to_string(),
-            usage: arguments_usage::<SubagentArgs>(),
-        });
         describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
-        usages.push(CoreCommandUsage {
-            name: "explore".to_string(),
-            usage: arguments_usage::<ExploreArgs>(),
-        });
+        if !config.non_interactive {
+            usages.push(CoreCommandUsage {
+                name: "subagent".to_string(),
+                usage: arguments_usage::<SubagentArgs>(),
+            });
+            usages.push(CoreCommandUsage {
+                name: "explore".to_string(),
+                usage: arguments_usage::<ExploreArgs>(),
+            });
+        }
         // Built for the main agent's shell alone: a subagent has no `subagent`,
         // `explore`, or `sidekick` command.
         builder.main_exclusive(|main| {
@@ -1238,6 +1254,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1344,6 +1361,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: true,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1422,6 +1440,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1499,6 +1518,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1570,6 +1590,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1636,6 +1657,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1815,6 +1837,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -1952,6 +1975,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -2020,6 +2044,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(temp.path()),
                 llm: MockLlm,
                 ask_flagship: None,
@@ -2092,6 +2117,7 @@ mod tests {
                 session_role: crate::fusion::SessionRole::Main,
                 tui_registry: None,
                 non_interactive: false,
+                network_restricted: false,
                 services: SharedServices::new(session_dir),
                 llm: MockLlm,
                 ask_flagship: None,

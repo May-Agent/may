@@ -1,6 +1,7 @@
 ---
 name: new-repo
 description: "MUST read before creating a GitHub repository (gh repo create, a new project's first push). Sets the default branch, branch protection, CI jobs, license and README to one fixed standard."
+requires-command: ask_user
 ---
 
 # New repository

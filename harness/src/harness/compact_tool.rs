@@ -112,13 +112,19 @@ impl CompactSignal {
             .is_ok()
     }
 
+    /// Updates the last measured token count and compaction floor without
+    /// altering whether a compaction is requested or running.
+    pub fn record_tokens(&self, tokens: usize, floor: usize) {
+        self.tokens.store(tokens, Ordering::Release);
+        self.floor.store(floor, Ordering::Release);
+    }
+
     /// Brings the valve in line with the agent at a request boundary: a
     /// compaction is running while one is in flight or waiting to be applied
     /// and idle once none is, a request not yet taken is kept, and the
     /// context holds `tokens` against the policy's `floor`.
     pub fn sync(&self, in_flight: bool, tokens: usize, floor: usize) {
-        self.tokens.store(tokens, Ordering::Release);
-        self.floor.store(floor, Ordering::Release);
+        self.record_tokens(tokens, floor);
         if in_flight {
             self.state.store(RUNNING, Ordering::Release);
         } else {
@@ -242,7 +248,10 @@ mod tests {
         assert_eq!(signal.request(), CompactRequest::InFlight);
         signal.sync(true, 0, 0);
         assert_eq!(signal.request(), CompactRequest::InFlight);
-        signal.sync(false, 0, 0);
+        // Token updates during an in-flight compaction keep the valve RUNNING.
+        signal.record_tokens(185_000, 10_000);
+        assert_eq!(signal.request(), CompactRequest::InFlight);
+        signal.sync(false, 185_000, 10_000);
         assert_eq!(signal.request(), CompactRequest::Started);
     }
 

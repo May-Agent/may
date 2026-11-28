@@ -1071,6 +1071,7 @@ pub async fn build_capabilities(
     core_commands: &[CoreCommandUsage],
     request_parameters: &Parameters,
     skills_dir: &Path,
+    offline: bool,
 ) -> Result<String, MayAgentError> {
     let has_browser_command = commands.iter().any(|(name, _)| name == "browser");
 
@@ -1094,8 +1095,10 @@ pub async fn build_capabilities(
         })
         .collect::<Vec<_>>();
 
+    let can_web_research = !offline || request_parameters.hosted_web_search();
     let mut subagents: Vec<CatalogSubagent> = crate::bundle::Bundle::subagent_definitions()
         .into_iter()
+        .filter(|definition| can_web_research || definition.name != "research")
         .map(|definition| CatalogSubagent {
             id: definition.name,
             description: definition.description,
@@ -1298,19 +1301,23 @@ pub fn build_subagent_terminal(environment: &AgentEnvironment, hashline: bool) -
 #[template(path = "prompt/subagent/permissions.md", escape = "none")]
 struct SubagentPermissionsTemplate<'a> {
     home: HomeEnvironment,
+    non_interactive: bool,
     secret_names: Vec<&'a str>,
     network: Option<NetworkRestriction>,
 }
 
 /// The permissions section of a subagent's instructions: escalation asks
-/// the agent that launched it, not the user.
+/// the agent that launched it when interactive, and is unavailable in
+/// non-interactive sessions.
 pub fn build_subagent_permissions(
     environment: &AgentEnvironment,
+    non_interactive: bool,
     secret_names: Vec<&str>,
     network_policy: Option<&CompiledNetworkPolicy>,
 ) -> String {
     SubagentPermissionsTemplate {
         home: HomeEnvironment::of(environment),
+        non_interactive,
         secret_names,
         network: network_policy.and_then(NetworkRestriction::of),
     }
@@ -1345,35 +1352,48 @@ pub fn build_subagent_time(request_parameters: &Parameters) -> String {
     .unwrap_or_else(|error| panic!("failed to render subagent time: {error}"))
 }
 
+/// Inputs used to render the instruction blocks shared by every named subagent.
+pub struct SubagentInstructionsInput<'a> {
+    /// Execution environment (local sandbox or container).
+    pub environment: &'a AgentEnvironment,
+    /// Whether the parent session runs non-interactively (`unsafe` unavailable).
+    pub non_interactive: bool,
+    /// Connected SSH hosts reachable via `terminal` `location`.
+    pub remote_hosts: Vec<SshServerConfig>,
+    /// Whether experimental hashline mode is active.
+    pub hashline: bool,
+    /// Rendered `<prepared_tools>` block, when available.
+    pub prepared_tools: Option<String>,
+    /// Names of stored secrets available as environment variables.
+    pub secret_names: Vec<&'a str>,
+    /// Active outbound network restriction policy, if any.
+    pub network_policy: Option<&'a CompiledNetworkPolicy>,
+    /// Model request parameters (hosted search/fetch capabilities).
+    pub request_parameters: &'a Parameters,
+}
+
 /// The instruction blocks every named subagent's context starts with, after
 /// its definition's own prompt: the parent contract first, then the same
 /// mechanisms the main agent works under, scoped to an agent that reports
 /// to its parent and never to the user.
-pub fn build_subagent_instructions(
-    environment: &AgentEnvironment,
-    remote_hosts: Vec<SshServerConfig>,
-    hashline: bool,
-    prepared_tools: Option<String>,
-    secret_names: Vec<&str>,
-    network_policy: Option<&CompiledNetworkPolicy>,
-    request_parameters: &Parameters,
-) -> Vec<String> {
+pub fn build_subagent_instructions(input: SubagentInstructionsInput<'_>) -> Vec<String> {
     let mut blocks = vec![
         build_subagent_reporting(),
         build_harness(),
         build_subagent_evidence(),
-        build_subagent_environment(environment, remote_hosts),
-        build_subagent_terminal(environment, hashline),
+        build_subagent_environment(input.environment, input.remote_hosts),
+        build_subagent_terminal(input.environment, input.hashline),
     ];
-    if let Some(prepared_tools) = prepared_tools {
+    if let Some(prepared_tools) = input.prepared_tools {
         blocks.push(prepared_tools);
     }
     blocks.push(build_subagent_permissions(
-        environment,
-        secret_names,
-        network_policy,
+        input.environment,
+        input.non_interactive,
+        input.secret_names,
+        input.network_policy,
     ));
-    blocks.push(build_subagent_time(request_parameters));
+    blocks.push(build_subagent_time(input.request_parameters));
     blocks
 }
 

@@ -43,6 +43,10 @@ pub struct TerminalPermissionHandler {
     /// The shell this handler serves never leaves the sandbox: a read-only
     /// subagent's, whose every request is refused without asking.
     confined: bool,
+    /// Whether this session is non-interactive: `unsafe` escalations are
+    /// denied immediately for both the main agent and subagents without
+    /// parking on parent approval or user prompts.
+    non_interactive: bool,
     /// The requests subagents put to the agent that launched them: a child's
     /// unsandboxed escalation waits on its parent's `subagent approve`/`deny`
     /// before it reaches the session's user.
@@ -80,6 +84,7 @@ impl TerminalPermissionHandler {
             approver,
             subagent_approver: Arc::new(std::sync::OnceLock::new()),
             confined: false,
+            non_interactive: false,
             child_approvals: crate::subagent::ChildApprovals::new(),
             runtime_service,
             session_id,
@@ -124,6 +129,7 @@ impl TerminalPermissionHandler {
             approver: None,
             subagent_approver: Arc::new(std::sync::OnceLock::new()),
             confined: false,
+            non_interactive: false,
             child_approvals: crate::subagent::ChildApprovals::new(),
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
@@ -137,6 +143,14 @@ impl TerminalPermissionHandler {
     /// Replaces the live outbound network policy used by subsequent requests.
     pub fn set_network_policy(&self, policy: Option<CompiledNetworkPolicy>) {
         self.network_policy.store(Arc::new(policy));
+    }
+
+    /// Marks this handler as belonging to a non-interactive session, where
+    /// `unsafe` execution is unavailable for both the main agent and subagents.
+    #[must_use]
+    pub const fn with_non_interactive(mut self, non_interactive: bool) -> Self {
+        self.non_interactive = non_interactive;
+        self
     }
 
     /// Shares `approvals` with the session's `subagent` command: the requests
@@ -253,6 +267,11 @@ impl Approver for TerminalPermissionHandler {
         if self.confined {
             return Ok(Approval::Denied {
                 reason: "a read-only subagent cannot run outside the sandbox".to_string(),
+            });
+        }
+        if self.non_interactive && request.kind().as_str() == UNSANDBOXED_KIND {
+            return Ok(Approval::Denied {
+                reason: "`unsafe` mode is unavailable in non-interactive mode".to_string(),
             });
         }
         // A subagent never reaches the session's approver directly: its

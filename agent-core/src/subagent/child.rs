@@ -335,7 +335,7 @@ impl<LLM: LanguageModel + 'static> ChildSession<LLM> {
                                 let tokens = reported.prompt_tokens.unwrap_or(0);
                                 let tokens = usize::try_from(tokens).unwrap_or(usize::MAX);
                                 credit.tokens.store(tokens, Ordering::Relaxed);
-                                valve.sync(false, tokens, credit.floor);
+                                valve.record_tokens(tokens, credit.floor);
                             }
                         }
                         AgentEvent::CompactionStarted { .. } => {

@@ -1,5 +1,10 @@
-//! One-shot system alerts when a managed-bash script invokes host `grep`,
-//! `awk`, or `find` instead of the preferred managed tools.
+//! One-shot transient tail alerts when a managed-bash script invokes host
+//! `grep`, `awk`, `find`, or native debuggers instead of the preferred managed
+//! tools.
+//!
+//! Rendered with [`aither_agent::Placement::Tail`] so each notice reaches the
+//! model on the immediately following request without permanently accumulating
+//! in conversation history or moving the cached prompt prefix.
 
 use aither_agent::{ContextBlock, ContextSource, Moment, SourceId};
 use askama::Template;
@@ -18,7 +23,7 @@ fn alert_blocks(items: &[HostCommandUsage]) -> Vec<ContextBlock> {
     if items.is_empty() {
         return Vec::new();
     }
-    vec![ContextBlock::stable(
+    vec![ContextBlock::tail(
         TAG,
         HostCommandAlertText { items }
             .render()
@@ -80,6 +85,7 @@ mod tests {
         });
         let first = source.blocks(moment).await;
         assert_eq!(first.len(), 1);
+        assert_eq!(first[0].placement(), aither_agent::Placement::Tail);
         assert!(
             first[0].block().content().contains("`grep`"),
             "{}",

@@ -477,7 +477,6 @@ impl HostLoadChannels {
                 receiver: self.conditions,
                 readings: HashMap::new(),
                 levels: HashMap::new(),
-                seen: HashMap::new(),
             },
             HostEvents {
                 receiver: self.events,
@@ -500,21 +499,20 @@ pub fn channels() -> (HostLoadSenders, HostLoadChannels) {
     )
 }
 
-/// Host load, memory and disk pressure as state: the model hears of a
-/// condition only when its level differs from the one it last saw, in the
-/// words for that change.
+/// Host load, memory and disk pressure as live state.
+///
+/// Any condition currently above normal renders in the request tail
+/// ([`aither_agent::Placement::Tail`]) and disappears once it returns to
+/// normal, so fluctuating host load never accumulates stale alerts in
+/// permanent conversation history.
 #[derive(Debug)]
 pub struct HostConditions {
     receiver: Receiver<HostLoadEvent>,
     /// The latest event of each condition: the readings (load, jobs, free
-    /// space) the alert quotes. Which words it gets depends on what the
-    /// model saw, not on this event.
+    /// space) the alert quotes.
     readings: HashMap<HostCondition, HostLoadEvent>,
     /// The latest level of each condition the monitor has reported.
     levels: HashMap<HostCondition, HostLevel>,
-    /// The level of each condition the model last saw; a condition absent
-    /// here is one the model assumes normal.
-    seen: HashMap<HostCondition, HostLevel>,
 }
 
 impl HostConditions {
@@ -528,46 +526,23 @@ impl HostConditions {
         }
     }
 
-    /// The alerts for the conditions whose level differs from what the model
-    /// last saw, given the model's memory `seen`. A model that has forgotten
-    /// everything hears only of the conditions that are not normal.
-    fn changes(&self, seen: &HashMap<HostCondition, HostLevel>) -> Vec<(HostCondition, HostLevel)> {
-        let mut changes: Vec<_> = self
+    fn active_alerts(&self) -> Vec<ContextBlock> {
+        let mut active: Vec<_> = self
             .levels
             .iter()
-            .filter(|(condition, now)| {
-                seen.get(*condition)
-                    .map_or_else(|| !now.is_normal(), |last| last != *now)
-            })
-            .map(|(condition, now)| (condition.clone(), *now))
+            .filter(|(_, level)| !level.is_normal())
+            .map(|(condition, level)| (condition.clone(), *level))
             .collect();
-        changes.sort_by(|(a, _), (b, _)| format!("{a:?}").cmp(&format!("{b:?}")));
-        changes
-    }
-
-    fn alerts(
-        &self,
-        seen: &HashMap<HostCondition, HostLevel>,
-    ) -> Vec<(HostCondition, HostLevel, ContextBlock)> {
-        self.changes(seen)
+        active.sort_by(|(a, _), (b, _)| format!("{a:?}").cmp(&format!("{b:?}")));
+        active
             .into_iter()
             .map(|(condition, now)| {
                 let reading = self
                     .readings
                     .get(&condition)
                     .expect("a condition with a level has the event that set it");
-                let text = HostLoadEvent::for_change(
-                    &condition,
-                    seen.get(&condition).copied(),
-                    now,
-                    reading,
-                )
-                .alert_text();
-                (
-                    condition,
-                    now,
-                    ContextBlock::stable("system-reminder", text),
-                )
+                let text = HostLoadEvent::for_change(&condition, None, now, reading).alert_text();
+                ContextBlock::tail("system-reminder", text)
             })
             .collect()
     }
@@ -580,37 +555,19 @@ impl ContextSource for HostConditions {
 
     #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn blocks(&mut self, moment: Moment) -> Vec<ContextBlock> {
-        let Moment::Request { reassembled } = moment else {
+        if !matches!(moment, Moment::Request { .. }) {
             return Vec::new();
-        };
+        }
         self.take_events();
-        if reassembled {
-            self.seen.clear();
-        }
-        let alerts = self.alerts(&self.seen);
-        let mut blocks = Vec::with_capacity(alerts.len());
-        for (condition, now, block) in alerts {
-            if now.is_normal() {
-                self.seen.remove(&condition);
-            } else {
-                self.seen.insert(condition, now);
-            }
-            blocks.push(block);
-        }
-        blocks
+        self.active_alerts()
     }
 
     #[allow(clippy::unused_async_trait_impl, reason = "the trait method is async")]
     async fn peek(&self, moment: Moment) -> Vec<ContextBlock> {
-        let Moment::Request { reassembled } = moment else {
+        if !matches!(moment, Moment::Request { .. }) {
             return Vec::new();
-        };
-        let empty = HashMap::new();
-        let seen = if reassembled { &empty } else { &self.seen };
-        self.alerts(seen)
-            .into_iter()
-            .map(|(_, _, block)| block)
-            .collect()
+        }
+        self.active_alerts()
     }
 }
 

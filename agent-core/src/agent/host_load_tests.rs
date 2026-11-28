@@ -44,7 +44,7 @@ async fn mentions(stub: &StubModel, text: &str) -> usize {
 }
 
 #[tokio::test]
-async fn the_load_alert_fires_once_on_entering_and_once_on_leaving_high_load() {
+async fn the_load_alert_renders_in_tail_while_high_and_clears_when_normal() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
     let mut config = saved_config(&stub, None);
     config.host_load.load_threshold = 1.0;
@@ -68,7 +68,21 @@ async fn the_load_alert_fires_once_on_entering_and_once_on_leaving_high_load() {
         "the configured foreground window reaches the alert"
     );
 
-    // The load persists: the alert is not restated.
+    // While load remains high, only the single transient tail block is sent;
+    // it never accumulates in conversation history.
+    settle(&session).await;
+    run_short_turn(&mut session.agent).await;
+    assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
+
+    // Returning to normal removes the tail block with no lingering history.
+    session.parts.host.set_load(0.1);
+    settle(&session).await;
+    run_short_turn(&mut session.agent).await;
+    assert_eq!(mentions(&stub, LOAD_HIGH).await, 0);
+    assert_eq!(mentions(&stub, LOAD_ENDED).await, 0);
+
+    // Repeated spikes never accumulate in history.
+    session.parts.host.set_load(2.5);
     settle(&session).await;
     run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
@@ -76,16 +90,12 @@ async fn the_load_alert_fires_once_on_entering_and_once_on_leaving_high_load() {
     session.parts.host.set_load(0.1);
     settle(&session).await;
     run_short_turn(&mut session.agent).await;
-    assert_eq!(mentions(&stub, LOAD_ENDED).await, 1);
-    assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
-
-    settle(&session).await;
-    run_short_turn(&mut session.agent).await;
-    assert_eq!(mentions(&stub, LOAD_ENDED).await, 1);
+    assert_eq!(mentions(&stub, LOAD_HIGH).await, 0);
+    assert_eq!(mentions(&stub, LOAD_ENDED).await, 0);
 }
 
 #[tokio::test]
-async fn red_then_green_while_idle_emits_only_per_seen_state_and_starts_no_turn() {
+async fn red_then_green_while_idle_emits_only_current_state_and_starts_no_turn() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
     let mut config = saved_config(&stub, None);
     config.host_load.load_threshold = 1.0;
@@ -100,7 +110,7 @@ async fn red_then_green_while_idle_emits_only_per_seen_state_and_starts_no_turn(
     assert_eq!(stub.requests.lock().await.len(), 1);
 
     // Normal -> Red -> Green while idle: no turn starts, and returning to
-    // the normal state the model already assumed produces no alert.
+    // normal produces no alert.
     session.parts.host.set_load(2.5);
     settle(&session).await;
     session.parts.host.set_load(0.1);
@@ -115,7 +125,7 @@ async fn red_then_green_while_idle_emits_only_per_seen_state_and_starts_no_turn(
     assert_eq!(mentions(&stub, LOAD_ENDED).await, 0);
 
     // Now the model sees Red, then the host returns to Green while idle:
-    // the next request carries one green alert.
+    // no turn starts while idle, and the next request has no stale alert.
     session.parts.host.set_load(2.5);
     settle(&session).await;
     run_short_turn(&mut session.agent).await;
@@ -129,11 +139,12 @@ async fn red_then_green_while_idle_emits_only_per_seen_state_and_starts_no_turn(
         "no turn started while idle"
     );
     run_short_turn(&mut session.agent).await;
-    assert_eq!(mentions(&stub, LOAD_ENDED).await, 1);
+    assert_eq!(mentions(&stub, LOAD_HIGH).await, 0);
+    assert_eq!(mentions(&stub, LOAD_ENDED).await, 0);
 }
 
 #[tokio::test]
-async fn cold_reassembly_drops_superseded_state_alerts() {
+async fn cold_reassembly_reflects_only_current_non_normal_host_state() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
     let compaction = StubModel::spawn(COMPACTION_MODEL).await;
     let mut config = saved_config(&stub, Some(&compaction));
@@ -151,16 +162,16 @@ async fn cold_reassembly_drops_superseded_state_alerts() {
     session.parts.host.set_load(0.1);
     settle(&session).await;
     run_short_turn(&mut session.agent).await;
-    assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
-    assert_eq!(mentions(&stub, LOAD_ENDED).await, 1);
+    assert_eq!(mentions(&stub, LOAD_HIGH).await, 0);
+    assert_eq!(mentions(&stub, LOAD_ENDED).await, 0);
 
-    // Cold cache reassembly while normal drops earlier red/green alerts.
+    // Cold cache reassembly while normal carries no host load alert.
     session.clock.advance(Duration::from_mins(61));
     run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_HIGH).await, 0);
     assert_eq!(mentions(&stub, LOAD_ENDED).await, 0);
 
-    // Cold cache reassembly while still Red drops superseded history and keeps one fresh Red alert.
+    // Cold cache reassembly while still Red keeps one fresh Red tail alert.
     session.parts.host.set_load(2.5);
     settle(&session).await;
     run_short_turn(&mut session.agent).await;
