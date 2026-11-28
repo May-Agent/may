@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/May-Agent/may/compare/patch/v0.1.2...patch/v0.2.0) - 2026-11-28
+
+### Added
+
+- *(patch)* [**breaking**] match exactly first, then with all whitespace removed, and report each ambiguity
+
+### Fixed
+
+- *(patch,bot)* skip mkdir on existing patch parent dir and remove 30ms test race
+- *(tui,startup)* keep daemon ask-user dialogs open, cut cold-start latency, and ban blocking sync calls in async code
+
+### Other
+
+- *(patch)* read runtime CARGO_BIN_EXE_apply_patch for nextest archives
+- Optimize token efficiency: folding boundaries, 5x non-interactive wait, and leaner prompts
+- *(deps)* disable default features and prune unused dependencies
+- extract protocol, tool-dist, config, and command-policy crates
+- Harden git tools, merge flow, and sandbox task editing
+
 ## [0.1.2](https://github.com/May-Agent/may/compare/patch/v0.1.1...patch/v0.1.2) - 2026-11-12
 
 ### Added
