@@ -740,15 +740,18 @@ impl<LLM: LanguageModel + Clone + Sync + 'static> SubagentCommand<LLM> {
                     })
                     .unwrap_or_else(|| working_dir.to_path_buf());
                 let agents_fut = load_agents_md(self.settings().global_agents.as_deref(), &root);
+                // Probe the caller's checkout (matching `CodeSearchTool`'s default worktree),
+                // never the freshly cloned ephemeral `working_copies` child repo which has no
+                // index of its own.
                 let indexed_fut = async {
                     if definition.name != "explore" {
                         return None;
                     }
                     let repo_search = self.settings().repo_search.as_ref()?;
+                    let caller_dir = working_dir.to_path_buf();
                     let fallback = self.settings().session_cwd.clone();
-                    let root_for_wt = root.clone();
                     let worktree = blocking::unblock(move || {
-                        crate::repo_search::worktree_root(&root_for_wt).or_else(|| {
+                        crate::repo_search::worktree_root(&caller_dir).or_else(|| {
                             fallback
                                 .as_deref()
                                 .and_then(crate::repo_search::worktree_root)
