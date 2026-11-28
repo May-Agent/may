@@ -7,6 +7,453 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/May-Agent/may/compare/v0.1.1...v0.2.0) - 2026-11-28
+
+### Added
+
+- *(hashline)* inject full syntax and alert on edit bypasses
+- *(session-runtime,browser)* preserve live resources across rebuilds and reclaim idle state
+- *(tui)* add tui IPC command, terminal state machine, region observation, and cell rasterizer
+- *(update)* concurrent Range downloads with real-time progress
+- *(agent)* keep exchanges in place and sync provider cache TTL live
+- *(repo_gate)* remove checkout preflight modal and speed up session startup
+- *(swarm,daemon)* extend agent swarm across worktrees, tailnet peers and cloud homes
+- *(shell,ui)* retain slow pipeline stages and add live stage UI
+- *(agent_link,daemon)* add cross-machine discovery, messaging and btw
+- *(swarm)* add experimental per-worktree coordination board
+- *(trust,tui)* drop startup access gates and derive default repository trust
+- *(subagent)* name concrete models with --model and models
+- *(tui)* /gui opens the session in the web UI
+- *(tui,daemon,web)* highlight terminal calls by language ([#156](https://github.com/May-Agent/may/pull/156))
+- *(daemon,cli)* unix socket by default; gui/rest pin a loopback TCP port
+- *(update)* name the commit while downloading and show a progress bar
+- *(update)* [**breaking**] stable and dev channels, auto-update of installed builds, graceful restart
+- *(patch)* [**breaking**] match exactly first, then with all whitespace removed, and report each ambiguity
+- close linked May issues on PR merge, gate undecided checkouts, and add /chat
+- *(pr)* add PR surfaces, provenance, and orphaned PR user actions
+- *(session)* derive workspaces on demand from daemon checkouts
+- *(harness)* review outbound published text with fast model
+- *(session)* support turning memory off per session and in one-shot runs
+- *(agent)* enforce context-state transition and wake rules
+- *(agent)* update live agents in place and retire on archive
+- *(vision)* run on-device OCR and downscale text-dense images
+- *(ssh)* enforce per-profile SSH attachments, live context diff, and session-scoped connect approval
+
+### Fixed
+
+- *(subagent)* probe caller worktree rather than ephemeral child clone for explore index readiness
+- *(harness)* tighten non-interactive context, compaction valve, timeouts, and explore ergonomics
+- *(command-policy)* do not treat /tmp sandboxes or granted repos as scratch
+- *(hashline)* skip create_dir_all when target parent exists
+- keep interrupted turn work expanded
+- *(tui)* make non-macos promote_thread_qos const
+- *(tui)* raise inline paste limit to 500 chars and allow re-paste to inline
+- rank exact model search matches first
+- *(update)* stop stale progress redraws and show post-download steps
+- *(tui)* mark non-macOS SystemHostModifiers::detect const
+- *(tui)* align sidebar bottom with input band and restore IME input
+- *(debug)* launch macOS lldb-dap targets via POSIX_SPAWN_START_SUSPENDED
+- *(debug)* synchronize macOS lldb-dap waitFor on debugserver and bound adapter teardown
+- *(runtime)* await bot loop shutdown on teardown and resume stopped targets on macOS detach
+- *(debug)* map Linux heel sandbox PIDs to host PIDs before adapter attach
+- *(debug)* gate native debug launch on stdin and mirror job stdout
+- *(bot)* keep curator network audit log outside staging directory
+- *(patch,bot)* skip mkdir on existing patch parent dir and remove 30ms test race
+- *(tests)* resolve runtime CARGO_BIN_EXE_may in startup_config
+- *(daemon)* enable skyzen/static-files under ui feature
+- *(tests)* use in-memory secret store in provider redaction test
+- *(tui)* resolve tilde links in agent output against session sandbox
+- *(daemon)* filter config.toml watcher read/mid-truncate events and save atomically
+- *(tui)* pad after user messages and equalize input band outer margins
+- *(tui)* close OSC 8 hyperlinks and support Cmd hover underline and click
+- *(ui)* render pipelines inline in highlighted commands with stage hover and non-folding clicks
+- *(tool-dist)* preserve input path on verification failures before canonicalizing bin_dir
+- *(clippy)* handle linux conditional paths and sed tests under disallowed_methods
+- *(tui,startup)* keep daemon ask-user dialogs open, cut cold-start latency, and ban blocking sync calls in async code
+- *(ipc)* preserve command names registered under kept_through_compaction
+- *(session-runtime)* keep model context and background work consistent across rewind
+- *(ci)* skip water-rs/stow setup on Windows-ARM64 where stow-cli ships no binary
+- *(ci)* include may-agent-core in container/ embedded owners
+- *(web-ui)* update artifact_runtime_bridge.js path after may-daemon extraction
+- point extracted crates' ACP fixture paths to workspace root and drop AssertSend
+- *(ci)* build tests via cargo nextest --no-run to prevent second workspace compile
+- *(ci)* pass --workspace to cargo test --no-run so nextest does not recompile
+- *(ci)* pass CARGO_BIN_EXE_may when running built terminal_first_e2e binary directly
+- *(ci)* pass CARGO_BIN_EXE_may when running built terminal_first_e2e binary directly
+- remove orphaned host_load doc comments and avoid e2e recompile in Verify baseline tools
+- *(ci)* invoke built e2e binary directly in Verify baseline tools and raise macOS maxfiles
+- *(shell)* grant read+exec on host stow/tools for managed mold linker
+- *(shell)* bump heel for multi-threaded Linux Unix socket SO_PEERCRED
+- *(shell)* pair heel SO_PEERCRED preservation with per-sandbox Linux STOW_DAEMON_DIR
+- *(shell)* bump heel so Linux sandboxes preserve caller SO_PEERCRED for host stow
+- *(shell)* run a namespace-local 0700 stow daemon dir inside Linux sandboxes
+- *(shell)* grant parent <cache>/stow directory for Linux seccomp mkdir
+- *(ci)* guard optional stow build-dir and avoid SIGPIPE when packing e2e binary
+- *(shell)* grant host stow cache and daemon runtime to local sandboxes
+- fix lint: keep closed() Send for non-Sync Args, no mid-scope items, checked ms casts
+- *(tui,daemon,web)* render refused tool calls as notices, not failures ([#866](https://github.com/May-Agent/may/pull/866))
+- *(prompt,harness)* keep system alerts silent and scope pressure and memory prompts
+- *(daemon)* drop blocking ask-user prompts whose asker is gone
+- *(agent,daemon,grok,models,openrouter)* bound the provider waits a turn makes before streaming
+- *(daemon,tui,db)* add missing indexes, startup redraw, last_model priority, and stream timeout
+- *(tui)* qualify crate::ChatMessage in rewind test
+- *(tui)* sync UserMessage history indices and guard /rewind targets
+- *(daemon)* cancel preparation and blocking ask-user waits on stop_session
+- *(tui)* place picker search cursor at column 0 when query is empty
+- *(tui)* hide /sandbox on empty sessions and report open errors in chat
+- *(tui)* add gap between chat column and right sidebar
+- *(tools)* pin repo-search 0.0.15 and take its client from crates.io
+- *(tools)* pin bash to May's own patch/v0.1.2 build
+- *(ci)* scope ci slow job baselines by workflow trigger event ([#883](https://github.com/May-Agent/may/pull/883))
+- *(publish)* annotate Cow str type in contains_home
+- *(publish)* use Cow in contains_home for clippy on linux and macos
+- *(publish)* unify needle borrow for cross-platform clippy
+- *(openai)* measure custom Responses prompt cache and replay reasoning summaries
+- *(vision-ocr)* replace lower-confidence overlapping misreads during CJK fallback
+- *(vision-ocr)* fall back to Apple Accurate CJK tags when native omits them
+- *(vision-ocr)* merge non-overlapping CJK fallback passes for mixed screens
+- *(vision-ocr)* use Apple Vision auto language detection for mixed CJK
+- *(vision)* prioritize Japanese ahead of Chinese tags and keep low-confidence secondary CJK lines
+- *(vision)* enable reliable EN/CJK/KO OCR on macOS and log OCR errors
+- *(build)* avoid rebuilding Swift bindings and starving nextest cores
+- *(daemon)* stop terminal jobs and persist stopped call on client disconnect ([#1181](https://github.com/May-Agent/may/pull/1181))
+- *(tests)* keep PathBuf import unconditional for non-macOS builds
+- *(cloud)* relay an answer to the codespace daemon that holds the question
+- *(cloud)* end a bootstrap step's input once it is written
+
+### Other
+
+- Continue the active turn after model-requested compaction
+- Restore stream retries for reachable providers on isolated networks
+- Retry Responses streams cut off before a terminal event
+- Keep baseline sed -i handled by aither-sed and mark temp repo with .git in test
+- Switch experimental hashline to stateless per-line hashes and auto-rewrite bare reads
+- Merge pull request #1406 from May-Agent/ci/split-unit-e2e
+- split unit tests and E2E archive builds in parallel per OS
+- Merge pull request #1402 from May-Agent/feat/hashline-syntax-and-bypass-alert
+- limit strip="debuginfo" to Linux ELF binaries
+- keep merge_group under 15m by avoiding baseline recompile and macOS RAM/runner contention
+- Merge pull request #1404 from May-Agent/ci/strip-linux-test-debuginfo
+- Merge pull request #1403 from May-Agent/ci/hashline-tool-ci-and-release
+- strip workspace test debuginfo and run baseline check directly
+- Merge pull request #1400 from May-Agent/fix/1396-turn-end-reasons
+- add standalone CI and release artifact wiring for hashline
+- Persist why every turn ends and rebuild history from it
+- Merge pull request #1397 from May-Agent/ci/consolidate-builds-and-stow
+- Merge pull request #1398 from May-Agent/ci/lean-container-stage
+- Merge pull request #1399 from May-Agent/fix/hashline-landlock-parent-dir
+- *(patch)* read runtime CARGO_BIN_EXE_apply_patch for nextest archives
+- stage container workspace image from may-tool-dist
+- Merge pull request #1390 from May-Agent/fix/tui-high-load-stutter
+- Merge pull request #1395 from May-Agent/ci/tool-artifacts-release-only
+- consolidate test/clippy builds and tune stow caching
+- Merge remote-tracking branch 'origin/main' into fix/tui-high-load-stutter
+- run tool-artifacts nightly build only on release or manual dispatch
+- Merge remote-tracking branch 'origin/main' into fix/tui-high-load-stutter
+- Merge pull request #1394 from May-Agent/feat/token-efficiency-r2
+- Merge pull request #1393 from May-Agent/fix/1389-interrupt-worked-for
+- Optimize token efficiency: folding boundaries, 5x non-interactive wait, and leaner prompts
+- Merge pull request #1392 from May-Agent/feat/command-reading-file-edits
+- Merge pull request #1391 from May-Agent/fix/paste-inline-threshold
+- Merge pull request #1387 from May-Agent/fix/cross-repo-workspace-guidance
+- Recognise shell file edits in command reading with syntax-highlighted diff view
+- Fix TUI stutter under high host CPU load
+- Clarify cross-repository repo clone --path and pr guidance
+- Merge remote-tracking branch 'origin/main' into fix/1381-model-search-ranking
+- Merge remote-tracking branch 'origin/main' into feat/harness-efficiency
+- Fix non-interactive prompts, host command alerts, monitor cleanup, and sandbox grants
+- Merge remote-tracking branch 'origin/main' into fix/1375-startup-turn-prep
+- unblock daemon startup, TUI loop, and warm turn preparation
+- Merge pull request #1376 from May-Agent/fix/tui-sidebar-align-ime
+- *(debug)* allow unused_async on macos_developer_mode_enabled outside macOS
+- Offload lldb-dap PATH lookup via blocking::unblock to fix Linux clippy::unused_async
+- Integrate debug live resources and teardown with unified live-resources lifecycle
+- Merge branch 'feat/1307-tui-command' into feat/1360-debug-command
+- *(e2e)* keep compaction probe first request near 33k tokens
+- scan full font catalog and add missing-glyph tofu fallback
+- Fix large_futures clippy lint in warm_aux_tests and finalize fusion_tests assertions
+- Merge remote-tracking branch 'origin/main' into feat/1294-fusion-mode
+- Add experimental Fusion mode with persistent cache-warm sidekick
+- Merge remote-tracking branch 'origin/main' into feat/1310-may-bot
+- Handle bot_supervised_sessions and bot_approvals in session deletion
+- Merge pull request #1363 from May-Agent/fix/1358-swarm-board-host-notices
+- Fix SlashCommand::ALL length after main merge and remove BotsPage effect setState
+- swarm, daemon: keep sticky board host on peer join and persist buffered cloud notices
+- Merge remote-tracking branch 'origin/main' into feat/1310-may-bot
+- Add host-brokered DAP debug command and lifecycle integration
+- Add May Bot resident bridge agents with git-backed hierarchical memory
+- Add experimental orchestrator execution mode
+- Merge remote-tracking branch 'origin/main' into ci/parallel-jobs
+- parallelize clippy, sed, unit, and sharded E2E jobs
+- *(deps)* lock headers crates for skyzen/static-files
+- Merge remote-tracking branch 'origin/main' into chore/prune-and-upgrade-deps
+- *(deps)* upgrade workspace dependencies to latest versions
+- *(deps)* disable default features and prune unused dependencies
+- Merge pull request #1354 from May-Agent/fix/config-watcher-race-1353
+- Merge pull request #1352 from May-Agent/feat/concurrent-update-1347
+- *(skills)* update stale gh auth references to [forge] credentials
+- Merge pull request #1349 from May-Agent/fix/swarm-pending-claim-race
+- *(swarm_peers)* poll pending claims instead of racing delivery
+- Merge pull request #1341 from May-Agent/fix/yanked-deps
+- Merge pull request #1348 from May-Agent/fix/gui-slash-feature
+- Merge pull request #1344 from May-Agent/fix/sidebar-session-prs
+- Merge pull request #1345 from May-Agent/fix/selection-offset
+- omit /gui slash command when ui feature is disabled
+- Merge pull request #1339 from May-Agent/perf/fix-stow-and-macos-ci
+- translate mouse selection coordinates relative to chat_area
+- tui, web-ui: show only session PRs in the right sidebar
+- configure per-package debug=0 in cargo config and fix media test race
+- update yanked async-executor and clipboard-win
+- Merge pull request #1338 from May-Agent/fix/tui-message-and-band-padding
+- fix stow target cache matching and speed up slow tests
+- Merge pull request #1334 from May-Agent/perf/cold-start-and-stages
+- skip turn stage frames in the reconnect cursor e2e
+- prewarm cold turn path and stream real turn stages to clients
+- use a generic panic for the may exec subprocess result
+- revert non-request unwrap_or_else sites swept up by the sweep
+- recover the response from zenwave's Http error in e2e requests
+- Merge remote-tracking branch 'origin/perf/parallel-agent-prep' into feat/zenwave-http
+- lengthen the create/adopt retry window for slow recreate cycles
+- Merge remote-tracking branch 'origin/perf/parallel-agent-prep' into feat/zenwave-http
+- wait out the winner's removal window between create retries
+- Merge remote-tracking branch 'origin/perf/parallel-agent-prep' into feat/zenwave-http
+- retry create when the 409 winner already removed itself
+- Merge remote-tracking branch 'origin/perf/parallel-agent-prep' into feat/zenwave-http
+- adopt the racing caller's container on a 409 name conflict
+- count tool readiness lines, not the prepared outcome
+- count tool readiness lines, not the prepared outcome
+- replace reqwest with zenwave and build TLS at daemon startup
+- Merge remote-tracking branch 'origin/main' into perf/parallel-agent-prep
+- parallelize agent preparation and pre-warm session agents
+- Merge pull request #1329 from May-Agent/fix/1274-subagent-rules
+- load AGENTS.md, scope prompt to the parent contract, add send_message and an inline diff
+- Merge pull request #1323 from May-Agent/fix/ask-user-and-startup-blocking
+- *(deps)* bump aither to include host IPC request timeout fix
+- Merge pull request #1328 from May-Agent/fix/1229-cache-ttl-kept
+- Merge remote-tracking branch 'origin/main' into fix/ask-user-and-startup-blocking
+- Init retained_pid in the wire-shape test's CommandResult
+- Merge pull request #1327 from May-Agent/feat/remove-repo-preflight-dialog
+- Merge remote-tracking branch 'origin/main' into fix/1229-cache-ttl-kept
+- *(daemon)* park the follow-up dispatcher before asserting a queued peer message
+- Merge remote-tracking branch 'origin/main' into feat/1292-pipeline-stages
+- Merge remote-tracking branch 'origin/main' into feat/1292-pipeline-stages
+- *(daemon)* update PrefixChain::of call in swarm_peers test
+- *(daemon)* read delivered peer messages through runtime summary
+- Merge remote-tracking branch 'origin/main' into feat/1317-cross-machine-swarm
+- Merge remote-tracking branch 'origin/main' into fix/ask-user-and-startup-blocking
+- Merge origin/main (peers); adapt peers PrefixChain::of to new aither
+- *(tui)* decode ANSI slices without byte-offset str indexing
+- Merge remote-tracking branch 'origin/main' into feat/1292-pipeline-stages
+- *(e2e)* match the fork probe marker at message start again
+- Pass PrefixChain::of the new has_tail arg in swarm tests
+- Adapt merged board tool to aither Tool::Error; drop stale subagent imports
+- Merge remote-tracking branch 'origin/main' into fix/1278-compaction-recall
+- Document the session-find error surface for missing_docs
+- Isolate the sandboxed cargo probe from the host cargo config
+- Track aither main and acpsub dev at their branch tips
+- Merge pull request #1322 from May-Agent/feat/1295-agent-swarm
+- Merge pull request #1284 from May-Agent/fix/1283-read-only-confined
+- Merge remote-tracking branch 'origin/main' into feat/1295-agent-swarm
+- Merge origin/main (rewind consistency, stow CI, merge-queue macOS)
+- quiet the clippy gate on build_exec_commands' merged signature
+- Merge pull request #1281 from May-Agent/fix/1228-tui-webui
+- move the user-question template under agent-core after the crate split
+- Merge remote-tracking branch 'origin/main' into fix/1228-tui-webui
+- Merge remote-tracking branch 'origin/main' into fix/1228-tui-webui
+- Expect terminal_kill in the native tool surface; strip stow env in sandbox test
+- Merge pull request #1320 from May-Agent/feat/github-oauth-client-id
+- Merge pull request #1319 from May-Agent/fix/1309-rewind-consistency
+- Merge remote-tracking branch 'origin/main' into fix/1283-read-only-confined
+- register May's built-in GitHub OAuth client_id
+- Name the job argument task_id in shell tool identities
+- Adapt merged tree to aither@main#ccfec32c task_id APIs
+- Merge remote-tracking branch 'origin/main' into fix/1086-stow-and-sed
+- switch entirely to water-rs/stow@main and isolate sed/ workspace
+- Merge origin/main (workspace crate split + scoped CI)
+- Merge remote-tracking branch 'origin/main' into fix/1086-merge-queue-macos
+- *(ci)* run up to 2 terminal_first_e2e tests concurrently via test-group
+- Merge remote-tracking branch 'origin/main' into feat/1301-affected-crates
+- *(ci)* cap concurrent terminal_first_e2e binaries via threads-required = 2
+- *(ci)* invoke cargo nextest once per test job and stage artifacts in runner.temp
+- *(ci)* invoke cargo nextest once per test job and stage artifacts in runner.temp
+- extract may-agent-core and may-daemon so may-agent becomes thin assembly layer
+- Merge branch 'refactor/1302-foundational-crates' into refactor/1304-db-client-tui
+- extract db, providers, repo-search, git-forge, client, and tui crates
+- Merge branch 'fix/1299-ci-infra' into refactor/1302-foundational-crates
+- Merge branch 'fix/1299-ci-infra' into feat/1301-affected-crates
+- scope clippy, tests, and e2e gates to affected workspace crates
+- extract may-media and may-harness workspace crates
+- extract protocol, tool-dist, config, and command-policy crates
+- remove job context expression from composite action description
+- wire stow prebuilt cache, drop test DWARF tables, and stop baseline recompile
+- Merge pull request #1296 from May-Agent/feat/1291-pid-jobs
+- keep the macOS test job at its 40-minute cap
+- give the macOS test job 60 minutes
+- *(e2e)* retry a flaked terminal e2e test on the shared runner
+- Use is_ok_and for the hashline config probe
+- *(e2e)* drop the stale outlives assertion on daemon kill
+- Format the hashline link lifecycle code
+- Skip absent hashline links when the feature is off
+- *(runaway)* map exec-root host pids to reported pids under a pid ns
+- *(runaway)* map host pids back to sandbox pids for scripted footprints
+- *(runaway)* name the parent pid differently in the host-pid probe
+- lock aither serve-job-base at 8256742a
+- *(runaway)* resolve the host pid of sandbox jobs on Linux
+- Add experimental hashline search and edit mode
+- Identify background jobs by real PID and replace terminal_kill with native signals
+- Lock aither at main's keep-warm merge for the acpsub pairing
+- Pin the aither patch set to serve-job-base like upstream
+- Keep the serve-job-base aither pin and its acpsub pairing
+- Merge remote-tracking branch 'origin/main' into fix/1278-compaction-recall
+- Merge pull request #1290 from May-Agent/feat/parent-approval
+- quiet the clippy gate on the fork's register and side_answer
+- Merge remote-tracking branch 'origin/main' into fix/1228-tui-webui
+- Merge pull request #1289 from May-Agent/feat/812-keepwarm
+- Merge pull request #1277 from May-Agent/fix/1224-daemon-db
+- park unsafe requests for the launching agent
+- Wire the pi-model keep-warm port into keep-alive paths
+- answer side questions with a confined fork that may run commands
+- run macOS tests at the merge queue and let PRs keep a rust cache
+- Merge remote-tracking branch 'origin/main' into fix/1278-compaction-recall
+- Update retry cache-warmth and fork-probe marker checks for aither main
+- pin the register_shared_terminal_commands calls in tests
+- confine a read_only subagent's shell to the sandbox
+- Merge pull request #1280 from May-Agent/fix/1226-git-tools
+- Merge remote-tracking branch 'origin/main' into fix/1278-compaction-recall
+- Match the injected-tasks role in context_dump's render test
+- Merge pull request #1275 from May-Agent/fix/812-ci-e2e
+- Encode images off draw, scan on updates, materialize draft uploads
+- Verify from the fork point, read merge-group checks, and skip fenced claims
+- Merge remote-tracking branch 'origin/main' into fix/1278-compaction-recall
+- Wire post-compaction restoration and reset unchanged-read epochs
+- Point aither patches at main and match updated upstream signatures
+- broadcast daemon_shutdown so background waiters cannot steal the drain
+- Merge remote-tracking branch 'origin/main' into fix/1228-tui-webui
+- Merge remote-tracking branch 'origin/main' into fix/1226-git-tools
+- Merge remote-tracking branch 'origin/main' into fix/1224-daemon-db
+- Verify remote heel, pin shim past --, and grant signing in memory
+- Merge pull request #1279 from May-Agent/fix/1227-container-media
+- Harden TUI and web UI: config sync, images, history, SSE lifecycle
+- Harden git tools, merge flow, and sandbox task editing
+- browser, computer: rustfmt; fail closed on unresolved helper bundle path
+- container, browser, computer, video: harden CDP, IPC and encoder control; drop dead gstreamer
+- daemon, db: move disk-exhaustion notices to templates/ and ungate RunGates fault flags
+- fold merge-main adaptation and lint cleanup into the hardening pass
+- Address review: non-blocking repo tool, no statics, doc names
+- Tighten subagent authority and hold command timeouts while approvals wait
+- *(e2e)* drain the session word pool over four connections
+- Merge remote-tracking branch 'origin/main' into fix/1224-daemon-db
+- daemon, scheduler, client: harden persistence, network policy and config reload
+- Merge remote-tracking branch 'origin/main' into fix/1225-agent-ipc
+- structured IPC images, approval pause, model forwarding
+- Merge pull request #1273 from May-Agent/1256-serve
+- Merge pull request #1250 from May-Agent/tui-gui
+- Pin aither to serve-job-base: the existing baseline plus run_service
+- Match aither's json_schema compaction format in the test
+- Match the injected-tasks role in context_dump's render test
+- Restore ssh_authorizer's module doc
+- fmt
+- Add the serve command for session-scoped services
+- Merge remote-tracking branch 'origin/main' into 1262-ci-profile
+- Merge pull request #1271 from May-Agent/feat/1242-gitlab-periphery-docs
+- let the merged macOS job use the 40-minute cap on cold runners
+- Merge pull request #1266 from May-Agent/1261-container-refs
+- document ci log, native ForgeAuth PR/MR publishing and GitLab modules
+- Merge remote-tracking branch 'origin/main' into feat/1242-gitlab-periphery-docs
+- give the merged test jobs their old 30-minute headroom
+- Merge pull request #1272 from May-Agent/feat/1241-gitlab-mr-ci
+- find the e2e test binary wherever cargo put it
+- rustfmt the moved image_ref test
+- Merge branch 'main' into 1262-ci-profile
+- Merge remote-tracking branch 'origin/main' into 1261-container-refs
+- Merge remote-tracking branch 'origin/main' into feat/1242-gitlab-periphery-docs
+- gitlab, pr, ci: add GitLab merge request lifecycle, merge_watch, GitLabCi and ci log
+- Merge pull request #1263 from May-Agent/1259-e2e-parallel
+- *(e2e)* widen the first terminal dispatch wait under parallelism
+- gitlab, skill, webhook, daemon: add GitLab repository picker, X-Gitlab-Token verification, skill installation and docs
+- Merge pull request #1270 from May-Agent/feat/1240-gitlab-repo-issues
+- gitlab, trust, issue: wire LiveForgeAuth and generalize ForgeProbe trust derivation
+- Merge pull request #1253 from May-Agent/fix/orphan-ask-wait
+- *(e2e)* hoist the profile counter above the statements
+- pass LiveForgeAuth to RepoContext's default_github_api
+- Merge remote-tracking branch 'origin/main' into feat/1239-github-forge-auth
+- bound closed() on Sync+Send so its future stays Send under -D warnings
+- Merge branch 'main' into 1262-ci-profile
+- issue, daemon: box GhCliTokenSource config load future and use map_or_else in forge_auth_tests
+- Merge branch 'main' into 1261-container-refs
+- *(e2e)* name each container test's profile uniquely
+- gitlab, issue, repo_clone: generalize forge bindings and add GitLab issue backend and glab refusal
+- github, forge_auth: replace gh subprocesses with ForgeAuth HTTP/GraphQL and wire /login and web settings
+- Merge pull request #1268 from May-Agent/1243-auto-repo-trust
+- Merge pull request #1265 from May-Agent/1260-ci-gate
+- Merge pull request #1264 from May-Agent/subagent-model
+- let dist accept the hand-edited pull_request trigger in release.yml
+- check with a slim profile, link tests with mold, and retire old caches
+- compute the image refs without compiling and run the acceptance tests from the built binary
+- Merge remote-tracking branch 'origin/main' into tui-gui
+- Merge pull request #1254 from May-Agent/fix/866-refused-read
+- run the macOS suite in one job and gate release-only workflows to real changes
+- *(e2e)* prepare the shared tool cache once and run tests in parallel
+- Merge pull request #1245 from May-Agent/feat/156-terminal-language
+- Merge pull request #1257 from May-Agent/feat/1238-forge-auth
+- Merge pull request #1255 from May-Agent/fix/1247-silent-system-alerts
+- *(agent,policy)* satisfy clippy on the refused-read path
+- *(tui,agent,web)* fix ci on terminal-language highlighting
+- forge, host_git: add explicit ForgeAuth, repository coordinates and HTTPS git auth injection
+- Merge pull request #1251 from May-Agent/refactor/1237-pr-single-number
+- Merge pull request #1233 from May-Agent/gui-pinned-port
+- drop external_number and store the true upstream PR/MR number in prs.number
+- Merge pull request #1249 from May-Agent/feat/1248-new-repo-merge-queue
+- *(startup)* may ui is may gui now
+- use single-trunk main, CI result merge-queue gate and git-only release-plz
+- Merge pull request #1246 from May-Agent/feat/1236-tasks-gitlab-refs
+- support multi-segment repository paths and !iid merge request references
+- Merge pull request #1244 from May-Agent/docs/1234-may-skill-sync
+- bring SKILL.md, architecture reference and AGENTS.md sync rule in line with main
+- *(agent)* keep bounded's inner future boxed and its visibility public
+- *(tui)* deduplicate app.status reset after startup gate
+- Merge pull request #1220 from May-Agent/fix/1218-rewind-sync
+- Merge remote-tracking branch 'origin/main' into fix/1218-rewind-sync
+- Merge pull request #1222 from May-Agent/fix/1221-macos-verify-tools
+- Merge pull request #1219 from May-Agent/fix/1217-cancel-prepare
+- Merge pull request #1216 from May-Agent/fix/1215-picker-cursor
+- run macOS baseline tools check inside test-macos-integration ([#1221](https://github.com/May-Agent/may/pull/1221))
+- Merge pull request #1213 from May-Agent/fix/1211-sidebar-gap
+- Merge pull request #1214 from May-Agent/fix/1212-sandbox-slash
+- *(db)* prefilter sessions_requiring_pending_dispatch by pending state
+- Merge remote-tracking branch 'origin/main' into 1198-update-channels
+- Merge pull request #1205 from May-Agent/ci-unit-build-once
+- build the test targets the test jobs run, not the non-test libraries
+- Merge pull request #1203 from May-Agent/1202-container-tests-after-image
+- Merge pull request #1201 from May-Agent/1199-patch-matching
+- run the image-pulling container tests after their image is pushed
+- format share_and_warm_host_programs
+- Merge remote-tracking branch 'origin/main' into fix/812-e2e-time
+- Merge pull request #1197 from May-Agent/fix/1086-ubuntu-no-image-wait
+- Merge pull request #1196 from May-Agent/fix/883-ci-baseline-event
+- Merge pull request #1195 from May-Agent/fix/1112-drop-shims-before-save
+- stop waiting on container-image before test-ubuntu ([#1086](https://github.com/May-Agent/may/pull/1086))
+- Merge pull request #1194 from May-Agent/fix/1088-macos-ci-split
+- drop test-written shims before saving tools cache ([#1112](https://github.com/May-Agent/may/pull/1112))
+- split macOS test job into unit and integration runs ([#1088](https://github.com/May-Agent/may/pull/1088))
+- *(sandbox)* verify managed base commands, Python, write isolation, and Linux credentials ([#157](https://github.com/May-Agent/may/pull/157))
+- *(repo_clone)* pass -b main in test init_repo for CI git configs
+- Merge remote-tracking branch 'origin/main' into feat/991-session-workspaces
+- Merge pull request #1189 from May-Agent/feat/759-publish-review
+- Merge remote-tracking branch 'origin/main' into feat/1022-vision-ocr
+- Merge pull request #1188 from May-Agent/fix/755-responses-cache
+- *(deps)* bump waterkit to main with Vision multi-language auto-detect
+- *(cloud)* wait for resumed run to settle before recording next interaction
+- Merge pull request #1182 from May-Agent/fix/client-crash-disconnect-cleanup
+- *(sandbox)* cover .config/gh and Keychain read isolation ([#157](https://github.com/May-Agent/may/pull/157))
+- *(deps)* bump aither crates to 0.31.0
+- Merge pull request #1177 from May-Agent/fix/1176-cloud-interactions
+- *(cloud)* record each request again until the codespace's events mirror it
+- *(deps)* take aither's fix for a machine with no system bus
+- *(cloud)* hold every question on the codespace and let its events mirror it
+- Merge pull request #1174 from May-Agent/fix/1173-stdin-eof
+- share the repo-search host program across E2E test homes
+
 ## [0.1.1](https://github.com/May-Agent/may/compare/v0.1.0...v0.1.1) - 2026-11-12
 
 ### Added
