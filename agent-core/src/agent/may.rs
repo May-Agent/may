@@ -2317,8 +2317,8 @@ impl MayAgent {
 
     /// Carries out the compaction the `compact` tool asked for, if the last
     /// run ended for one: the handoff replaces the conversation and the
-    /// context is persisted as the run holding `fence`. The turn ended at the
-    /// request, so the next turn starts on the compacted context.
+    /// context is persisted as the run holding `fence`. Returns whether a
+    /// request was handled so the host can resume the turn.
     ///
     /// # Errors
     ///
@@ -2328,9 +2328,9 @@ impl MayAgent {
         db: &ChatDb,
         fence: &RunFence,
         reporter: &CompactionReporter,
-    ) -> Result<Option<CompactResult>, AgentError> {
+    ) -> Result<bool, AgentError> {
         if !self.compaction_requested.swap(false, Ordering::AcqRel) {
-            return Ok(None);
+            return Ok(false);
         }
         let compacted = self.compact_reporting(None, reporter).await;
         if let Ok(Some(_)) = &compacted
@@ -2339,7 +2339,7 @@ impl MayAgent {
         {
             tracing::warn!(session_id = %fence.session_id, %error, "failed to persist the compacted context");
         }
-        compacted
+        compacted.map(|_| true)
     }
 
     /// One-shot query.
