@@ -2248,12 +2248,16 @@ async fn drive_turn<S: ChatSink>(
     run: TurnRun<'_>,
 ) -> Result<(), turn_events::TurnStop> {
     let guard = turn.guard;
-    let stop = async {
-        turn_events::TurnStop::Cancelled(cancellation_reason_of(&guard.cancellation().recv().await))
-    };
-    let facts = agent.job_facts();
-    let driven = match kind {
-        TurnKind::Prompt if !run.continue_from_transcript => {
+    let mut prompt =
+        (matches!(kind, TurnKind::Prompt) && !run.continue_from_transcript).then_some(run);
+    loop {
+        let stop = async {
+            turn_events::TurnStop::Cancelled(cancellation_reason_of(
+                &guard.cancellation().recv().await,
+            ))
+        };
+        let facts = agent.job_facts();
+        let driven = if let Some(run) = prompt.take() {
             let run =
                 agent.run_with_hidden_context(run.prompt, run.hidden_context, run.attachments);
             let handler = TurnStep {
@@ -2262,8 +2266,7 @@ async fn drive_turn<S: ChatSink>(
                 checkpoints: run.checkpoints(),
             };
             run.drive(handler, stop, step_turn).await
-        }
-        TurnKind::Prompt | TurnKind::Resume => {
+        } else {
             let run = agent.resume();
             let handler = TurnStep {
                 turn: &mut *turn,
@@ -2271,31 +2274,46 @@ async fn drive_turn<S: ChatSink>(
                 checkpoints: run.checkpoints(),
             };
             run.drive(handler, stop, step_turn).await
-        }
-    };
-    match driven {
-        Ok(ControlFlow::Continue(_)) => Ok(()),
-        Ok(ControlFlow::Break(stop)) => Err(stop),
-        Err(error) => {
-            // The failure closes an open reasoning phase before clients see
-            // it, like any visible output.
-            if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
-                return Err(stop);
+        };
+        match driven {
+            Ok(ControlFlow::Continue(_)) => {}
+            Ok(ControlFlow::Break(stop)) => return Err(stop),
+            Err(error) => {
+                if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
+                    return Err(stop);
+                }
+                return Err(turn_events::TurnStop::Failed(error));
             }
-            Err(turn_events::TurnStop::Failed(error))
+        }
+
+        let compacted = compact_at_boundary(turn.state, turn.session_id.as_str(), guard, agent)
+            .await
+            .map_err(turn_events::TurnStop::Failed)?;
+        if !compacted {
+            return Ok(());
+        }
+        // A steer that arrived during compaction starts the next turn under
+        // the new user message, on the handoff that was just persisted.
+        let runtime = turn
+            .state
+            .db()
+            .get_session_runtime(turn.session_id.as_str())
+            .await
+            .map_err(turn_events::TurnStop::Persist)?;
+        if runtime.is_some_and(|runtime| runtime.has_pending_immediate()) {
+            return Ok(());
         }
     }
 }
 
-/// Carries out the compaction the `compact` tool asked for when the turn
-/// ended, telling the session's clients how it stands; the next turn starts
-/// on the compacted context. A failure leaves the context as it was.
-async fn compact_after_turn(
+/// Applies a requested compaction between run segments and forwards its
+/// phases while the same turn holds the session.
+async fn compact_at_boundary(
     state: &Arc<DaemonState>,
     session_id: &str,
     guard: &SessionRunGuard,
     agent: &mut MayAgent,
-) {
+) -> Result<bool, aither_agent::AgentError> {
     let (phases, phase_rx) = async_channel::unbounded();
     let reporter = crate::agent::CompactionReporter::new(phases);
     let forward = async {
@@ -2312,9 +2330,7 @@ async fn compact_after_turn(
         compacted
     };
     let (compacted, ()) = futures_lite::future::zip(compaction, forward).await;
-    if let Err(error) = compacted {
-        tracing::error!(%session_id, %error, "the requested compaction failed");
-    }
+    compacted
 }
 
 /// The turn runner: [`run_agent_loop_attempts`] behind the turn's panic
@@ -2913,9 +2929,6 @@ fn run_agent_loop_attempts<'a>(
                 },
             )
             .await;
-            if stopped.is_ok() {
-                compact_after_turn(state, session_id.as_str(), guard, &mut agent).await;
-            }
             let took_action = turn.took_action();
             let turn_events::TurnEvents {
                 sink: _,
@@ -8390,6 +8403,56 @@ mod tests {
         assert_eq!(last.role, super::MessageRole::TurnEnd);
         let record: TurnEndRecord = serde_json::from_str(&last.content).expect("end record");
         assert_eq!(record.kind, TurnEndKind::Completed);
+    }
+
+    #[tokio::test]
+    async fn the_compact_tool_continues_the_same_turn_on_the_handoff() {
+        let command = serde_json::json!({
+            "script": "printf BEFORE_COMPACT",
+            "description": "Record the first step",
+            "background": false
+        });
+        // Report the model's context usage so the compact tool accepts the
+        // next call without crossing the automatic compaction threshold.
+        let usage = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 30_000, "completion_tokens": 20, "total_tokens": 30_020}
+        });
+        let first = sse_tool_call("before", "terminal", &command.to_string()).replace(
+            "data: [DONE]",
+            &format!("{}data: [DONE]", sse_chunk(&usage.to_string())),
+        );
+        let handoff = serde_json::json!({
+            "current_task": "CONTINUE_ON_HANDOFF",
+            "key_decisions": [],
+            "context_files": [],
+            "errors_fixes": [],
+            "pending_work": [],
+            "recovery_hints": [],
+            "skills": []
+        });
+        let provider = stub_provider(vec![
+            first,
+            sse_tool_call("compact", "compact", "{}"),
+            sse_text(&handoff.to_string()),
+            sse_text("Work continued after compaction."),
+        ])
+        .await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+
+        let result = run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the turn completes");
+        assert_eq!(result.full_text, "Work continued after compaction.");
+        let request = last_body(&provider, 4).await;
+        assert!(request.contains("CONTINUE_ON_HANDOFF"), "{request}");
+        assert!(!request.contains("BEFORE_COMPACT"), "{request}");
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert_eq!(user_rows(&history), ["hello"]);
     }
 
     /// A turn the user stopped mid-stream ends with the interrupted record.
